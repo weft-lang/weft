@@ -1,0 +1,419 @@
+-- The `weft fmt` command over a scripted filesystem and formatter: argument
+-- interpretation, every per-file outcome with the exact effects it performs,
+-- and the report line each outcome and discovery problem prints.
+
+use compiler/tool/discovery.{
+  DiscoveryDirectoryEmpty,
+  DiscoveryDirectoryUnreadable,
+  DiscoveryPatternUnmatched,
+  DiscoveryPatternUnreadable
+}
+use compiler/tool/fmt.{*}
+use compiler/weft/format.{FormatterFailure, FormatterResult, FormatterSuccess}
+use compiler/weft/format/config as format_config
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes, bytes_storage}
+use stdlib/dir.{DirDirectory, DirFile, DirInspect, DirKind, DirMetadata, DirOther}
+use stdlib/file.{
+  FileAppend,
+  FileAtomicReplace,
+  FileCreateNew,
+  FileCreateOrTruncate,
+  FileRead,
+  FileWrite,
+  FileWriteMode
+}
+use stdlib/io/types.{IoError, IoNotFound, IoPermissionDenied, IoPlatform}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/path.{Path}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string/builder as builder
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push}
+
+fn texts(values: List<str>) -> Vector<str> {
+  let out: Vector<str> = vector.new<str>()
+  for value in values { vector_push<str>(out, value) }
+  out
+}
+
+fn joined(values: Vector<str>) -> str {
+  let mut out = builder.new()
+  for index in 0..vector_len<str>(values) {
+    if index > 0 { out.append("|") }
+    out.append(vector_get_in_bounds<str>(values, index))
+  }
+  out.finish()
+}
+
+fn mode_name(mode: FmtMode) -> str {
+  match mode {
+    FmtCheck -> "check"
+    FmtWrite -> "write"
+  }
+}
+
+-- A command as one comparable line.
+fn command(args: List<str>) -> str {
+  match fmt_command(texts(args)) {
+    FmtInput(config) -> i"input width {config.max_line_length()}"
+    FmtFile(target, config) -> i"file {target} width {config.max_line_length()}"
+    FmtFiles(paths, mode, config) ->
+      i"files {joined(paths)} {mode_name(mode)} width {config.max_line_length()}"
+    FmtUsage -> "usage"
+    FmtBadWidth -> "bad width"
+  }
+}
+
+fn one(a: str) -> List<str> { Cons(a, Nil<str>()) }
+
+fn two(a: str, b: str) -> List<str> { Cons(a, one(b)) }
+
+fn three(a: str, b: str, c: str) -> List<str> { Cons(a, two(b, c)) }
+
+fn four(a: str, b: str, c: str, d: str) -> List<str> { Cons(a, three(b, c, d)) }
+
+test "fmt_command_selects_input_file_or_files" {
+  Test.assert_str_eq(command(Nil<str>()), "input width 98")
+  Test.assert_str_eq(command(one("a.weft")), "file a.weft width 98")
+  Test.assert_str_eq(
+    command(three("--check", "a.weft", "dir")),
+    "files a.weft|dir check width 98"
+  )
+  Test.assert_str_eq(command(two("dir", "--write")), "files dir write width 98")
+  Test.assert_str_eq(
+    command(four("--max-line-length", "72", "--check", "src")),
+    "files src check width 72"
+  )
+  Test.assert_str_eq(
+    command(three("a.weft", "--max-line-length", "120")),
+    "file a.weft width 120"
+  )
+}
+
+test "fmt_command_ends_options_at_a_double_dash" {
+  Test.assert_str_eq(command(two("--", "-odd.weft")), "file -odd.weft width 98")
+  Test.assert_str_eq(
+    command(four("--write", "--", "--check", "-x.weft")),
+    "files --check|-x.weft write width 98"
+  )
+  -- A second `--` is an ordinary path once options have ended.
+  Test.assert_str_eq(command(two("--", "--")), "file -- width 98")
+}
+
+test "fmt_command_rejects_malformed_requests" {
+  -- Several paths need a mode; a mode needs a path.
+  Test.assert_str_eq(command(two("a.weft", "b.weft")), "usage")
+  Test.assert_str_eq(command(one("--check")), "usage")
+  Test.assert_str_eq(command(one("--write")), "usage")
+  -- One mode, stated once.
+  Test.assert_str_eq(command(three("--check", "--write", "a.weft")), "usage")
+  Test.assert_str_eq(command(three("--write", "--write", "a.weft")), "usage")
+  -- Unknown options, including ones that resemble known ones.
+  Test.assert_str_eq(command(one("-x")), "usage")
+  Test.assert_str_eq(command(two("--check=yes", "a.weft")), "usage")
+  Test.assert_str_eq(command(one("-")), "usage")
+}
+
+test "fmt_command_rejects_every_malformed_width" {
+  Test.assert_str_eq(command(one("--max-line-length")), "bad width")
+  Test.assert_str_eq(command(two("--max-line-length", "0")), "bad width")
+  Test.assert_str_eq(command(two("--max-line-length", "-4")), "bad width")
+  Test.assert_str_eq(command(two("--max-line-length", "wide")), "bad width")
+  Test.assert_str_eq(command(two("--max-line-length", "")), "bad width")
+  Test.assert_str_eq(
+    command(four("--max-line-length", "80", "--max-line-length", "80")),
+    "bad width"
+  )
+  -- The width is validated even when the rest of the request is also invalid.
+  Test.assert_str_eq(command(three("a.weft", "b.weft", "--max-line-length")), "bad width")
+}
+
+-- Files ----------------------------------------------------------------------
+-- A scripted filesystem. Every file holds one word; the formatter
+-- canonicalises every word except `broken` to `canonical`.
+fn path_text(value: Path) -> str {
+  match value.to_utf8() {
+    Ok(text) -> text
+    Err(_) -> "<bytes>"
+  }
+}
+
+fn source_of(target: str) -> Result<Bytes, IoError> {
+  if target == "missing.weft" { Err(IoNotFound) }
+  else if target == "unreadable.weft" { Err(IoPermissionDenied) }
+  else if target == "clean.weft" { Ok(bytes.from_str("canonical")) }
+  else if target == "broken.weft" { Ok(bytes.from_str("broken")) }
+  else { Ok(bytes.from_str("messy")) }
+}
+
+fn found(kind: DirKind, read_only: bool) -> Result<DirMetadata, IoError> {
+  Ok(
+    DirMetadata {
+      exists: true,
+      kind: kind,
+      read_only: read_only,
+      size: 5,
+      modified_millis: 0,
+      device: 1,
+      inode: 7
+    }
+  )
+}
+
+fn vanished() -> Result<DirMetadata, IoError> {
+  Ok(
+    DirMetadata {
+      exists: false,
+      kind: DirOther,
+      read_only: false,
+      size: 0,
+      modified_millis: 0,
+      device: 0,
+      inode: 0
+    }
+  )
+}
+
+-- Metadata through any symbolic link.
+fn stat_of(target: str) -> Result<DirMetadata, IoError> {
+  if target == "fifo.weft" { found(DirOther, false) }
+  else if target == "folder.weft" { found(DirDirectory, false) }
+  else if target == "readonly.weft" { found(DirFile, true) }
+  else if target == "vanished.weft" { vanished() }
+  else if target == "unstatable.weft" { Err(IoPermissionDenied) }
+  else { found(DirFile, false) }
+}
+
+-- Metadata of the entry itself.
+fn lstat_of(target: str) -> Result<DirMetadata, IoError> {
+  if target == "link.weft" { found(DirOther, false) }
+  else if target == "unlstatable.weft" { Err(IoPermissionDenied) }
+  else { stat_of(target) }
+}
+
+fn write_mode_name(mode: FileWriteMode) -> str {
+  match mode {
+    FileCreateNew -> "create"
+    FileCreateOrTruncate -> "truncate"
+    FileAppend -> "append"
+    FileAtomicReplace -> "replace"
+  }
+}
+
+fn written(target: str, values: Bytes) -> Result<usize, IoError> {
+  if target == "full.weft" { Err(IoPlatform(28)) } else { Ok(values.len()) }
+}
+
+-- A parse failure counts 3 errors only when the formatter is given the
+-- file's own path, which diagnostics name.
+fn formatted(text: str, source: str) -> FormatterResult {
+  if text == "broken" { FormatterFailure(if source == "broken.weft" { 3 } else { 99 }) }
+  else { FormatterSuccess("canonical") }
+}
+
+fn outcome_name(outcome: FmtOutcome) -> str {
+  match outcome {
+    FmtUnchanged -> "unchanged"
+    FmtRewritten -> "rewritten"
+    FmtWouldReformat -> "would reformat"
+    FmtUnreadable -> "unreadable"
+    FmtParseFailed(errors) -> i"parse failed {errors}"
+    FmtUninspectable -> "uninspectable"
+    FmtNotRegular -> "not regular"
+    FmtSymbolicLink -> "symbolic link"
+    FmtReadOnly -> "read-only"
+    FmtReplaceFailed(IoPlatform(code)) -> i"replace failed {code}"
+    FmtReplaceFailed(_) -> "replace failed"
+  }
+}
+
+-- One file's outcome followed by every effect it performed, in order.
+fn formatting(target: str, mode: FmtMode) -> str {
+  let log: Vector<str> = vector.new<str>()
+  let outcome = handle {
+    handle {
+      handle fmt_file(target, mode, (text: str, source: str) => formatted(text, source)) {
+        FileRead.read_all(file, limit) -> {
+          vector_push<str>(log, i"read {path_text(file)} {limit.to_u64()}")
+          resume(source_of(path_text(file)))
+        }
+      }
+    } {
+      FileWrite.write_all(file, values, write_mode) -> {
+        vector_push<str>(
+          log,
+          i"{write_mode_name(write_mode)} {path_text(file)} {bytes_storage(values)}"
+        )
+        resume(written(path_text(file), values))
+      }
+    }
+  } {
+    DirInspect.stat(file) -> {
+      vector_push<str>(log, i"stat {path_text(file)}")
+      resume(stat_of(path_text(file)))
+    }
+    DirInspect.lstat(file) -> {
+      vector_push<str>(log, i"lstat {path_text(file)}")
+      resume(lstat_of(path_text(file)))
+    }
+    DirInspect.list(file) -> resume(Err(IoNotFound))
+    DirInspect.current() -> resume(Err(IoNotFound))
+  }
+  let shown = outcome_name(outcome)
+  if vector_len<str>(log) == 0 { shown } else { i"{shown}: {joined(log)}" }
+}
+
+test "fmt_file_leaves_a_canonical_file_untouched" {
+  Test.assert_str_eq(
+    formatting("clean.weft", FmtWrite),
+    "unchanged: read clean.weft 1073741824"
+  )
+  Test.assert_str_eq(
+    formatting("clean.weft", FmtCheck),
+    "unchanged: read clean.weft 1073741824"
+  )
+}
+
+test "fmt_file_rewrites_through_one_atomic_replacement" {
+  Test.assert_str_eq(
+    formatting("messy.weft", FmtWrite),
+    "rewritten: read messy.weft 1073741824|stat messy.weft|lstat messy.weft|replace messy.weft canonical"
+  )
+  Test.assert_str_eq(
+    formatting("ünïcödé.weft", FmtWrite),
+    "rewritten: read ünïcödé.weft 1073741824|stat ünïcödé.weft|lstat ünïcödé.weft|replace ünïcödé.weft canonical"
+  )
+}
+
+test "fmt_file_checks_without_inspecting_or_writing" {
+  Test.assert_str_eq(
+    formatting("messy.weft", FmtCheck),
+    "would reformat: read messy.weft 1073741824"
+  )
+  -- Check mode never inspects metadata, so a file that could not be
+  -- rewritten is still only reported.
+  Test.assert_str_eq(
+    formatting("readonly.weft", FmtCheck),
+    "would reformat: read readonly.weft 1073741824"
+  )
+}
+
+test "fmt_file_reports_a_file_it_cannot_read_or_parse" {
+  Test.assert_str_eq(
+    formatting("missing.weft", FmtWrite),
+    "unreadable: read missing.weft 1073741824"
+  )
+  Test.assert_str_eq(
+    formatting("unreadable.weft", FmtCheck),
+    "unreadable: read unreadable.weft 1073741824"
+  )
+  Test.assert_str_eq(
+    formatting("broken.weft", FmtWrite),
+    "parse failed 3: read broken.weft 1073741824"
+  )
+  Test.assert_str_eq(
+    formatting("broken.weft", FmtCheck),
+    "parse failed 3: read broken.weft 1073741824"
+  )
+}
+
+test "fmt_file_refuses_every_unsafe_replacement_before_writing" {
+  Test.assert_str_eq(
+    formatting("fifo.weft", FmtWrite),
+    "not regular: read fifo.weft 1073741824|stat fifo.weft"
+  )
+  Test.assert_str_eq(
+    formatting("folder.weft", FmtWrite),
+    "not regular: read folder.weft 1073741824|stat folder.weft"
+  )
+  Test.assert_str_eq(
+    formatting("link.weft", FmtWrite),
+    "symbolic link: read link.weft 1073741824|stat link.weft|lstat link.weft"
+  )
+  Test.assert_str_eq(
+    formatting("readonly.weft", FmtWrite),
+    "read-only: read readonly.weft 1073741824|stat readonly.weft|lstat readonly.weft"
+  )
+}
+
+test "fmt_file_reports_metadata_it_cannot_obtain" {
+  Test.assert_str_eq(
+    formatting("vanished.weft", FmtWrite),
+    "uninspectable: read vanished.weft 1073741824|stat vanished.weft"
+  )
+  Test.assert_str_eq(
+    formatting("unstatable.weft", FmtWrite),
+    "uninspectable: read unstatable.weft 1073741824|stat unstatable.weft"
+  )
+  Test.assert_str_eq(
+    formatting("unlstatable.weft", FmtWrite),
+    "uninspectable: read unlstatable.weft 1073741824|stat unlstatable.weft|lstat unlstatable.weft"
+  )
+}
+
+test "fmt_file_reports_a_failed_replacement" {
+  Test.assert_str_eq(
+    formatting("full.weft", FmtWrite),
+    "replace failed 28: read full.weft 1073741824|stat full.weft|lstat full.weft|replace full.weft canonical"
+  )
+}
+
+-- Reports ---------------------------------------------------------------------
+fn every_outcome() -> Vector<FmtOutcome> {
+  let out: Vector<FmtOutcome> = vector.new<FmtOutcome>()
+  vector_push<FmtOutcome>(out, FmtUnchanged)
+  vector_push<FmtOutcome>(out, FmtRewritten)
+  vector_push<FmtOutcome>(out, FmtWouldReformat)
+  vector_push<FmtOutcome>(out, FmtUnreadable)
+  vector_push<FmtOutcome>(out, FmtParseFailed(2))
+  vector_push<FmtOutcome>(out, FmtUninspectable)
+  vector_push<FmtOutcome>(out, FmtNotRegular)
+  vector_push<FmtOutcome>(out, FmtSymbolicLink)
+  vector_push<FmtOutcome>(out, FmtReadOnly)
+  vector_push<FmtOutcome>(out, FmtReplaceFailed(IoPermissionDenied))
+  out
+}
+
+test "fmt_outcomes_fail_the_invocation_unless_the_file_is_canonical" {
+  let outcomes = every_outcome()
+  let mut failures = builder.new()
+  for outcome in outcomes[..] {
+    failures.append(if fmt_outcome_failed(outcome) { "1" } else { "0" })
+  }
+  Test.assert_str_eq(failures.finish(), "0011111111")
+}
+
+test "fmt_outcomes_report_in_the_command_words" {
+  let outcomes = every_outcome()
+  let mut report = builder.new()
+  for outcome in outcomes[..] { report.append(fmt_outcome_text("src/a b.weft", outcome)) }
+  Test.assert_str_eq(
+    report.finish(),
+    "fmt: would reformat: src/a b.weft\nfmt: could not read input file: src/a b.weft\nfmt: parse failed for src/a b.weft with 2 errors; source left unchanged\nfmt: could not inspect source file: src/a b.weft\nfmt: source is not a regular file: src/a b.weft\nfmt: refusing to replace symbolic link: src/a b.weft\nfmt: source file is read-only: src/a b.weft\nfmt: could not replace source file: src/a b.weft\n"
+  )
+  -- A braced name is data, not an interpolation.
+  Test.assert_str_eq(
+    fmt_outcome_text("{name}.weft", FmtWouldReformat),
+    "fmt: would reformat: {name}.weft\n"
+  )
+}
+
+test "fmt_reports_every_discovery_problem" {
+  Test.assert_str_eq(
+    fmt_problem_text(DiscoveryPatternUnreadable("src/*.weft")),
+    "fmt: could not expand pattern: src/*.weft\n"
+  )
+  Test.assert_str_eq(
+    fmt_problem_text(DiscoveryPatternUnmatched("none/*.weft")),
+    "fmt: no .weft files matched: none/*.weft\n"
+  )
+  Test.assert_str_eq(
+    fmt_problem_text(DiscoveryDirectoryUnreadable("src/locked")),
+    "fmt: could not list directory: src/locked\n"
+  )
+  Test.assert_str_eq(
+    fmt_problem_text(DiscoveryDirectoryEmpty("docs")),
+    "fmt: no .weft files in directory: docs\n"
+  )
+}

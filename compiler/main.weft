@@ -142,8 +142,19 @@ use compiler/weft/facts/semantic.{*}
 use compiler/tool/jsonrpc.{*}
 use compiler/tool/lsp.{*}
 use compiler/tool/mcp.{*}
-use compiler/tool/discovery.{Discovery, DiscoveryProblem, discover}
-use compiler/tool/pool.{PoolFinished, PoolWorker, PoolWorkerStarted}
+use compiler/tool/console.{tool_note, tool_print}
+use compiler/tool/discovery.{Discovery, discover}
+use compiler/tool/pool.{
+  PoolEvent,
+  PoolFinished,
+  PoolReaped,
+  PoolRefused,
+  PoolStarting,
+  PoolWorker,
+  PoolWorkerStarted,
+  pool_run
+}
+use compiler/tool/fmt.{*}
 use compiler/tool/test.{*}
 use compiler/tool/test/harness.{harness_source}
 use stdlib/console.{ConsoleRead, ConsoleWrite}
@@ -236,7 +247,7 @@ use stdlib/grammar/tooling/protocol.{
   encode_observed,
   parse_name
 }
-use stdlib/process.{Proc}
+use stdlib/process.{Proc, ProcExited}
 use stdlib/time as time
 use stdlib/time.{Duration}
 use stdlib/time/sleep.{Sleep}
@@ -4473,349 +4484,146 @@ fn main_fmt_result(
   result
 }
 
-fn run_fmt_source_with_path(
-  src: i64,
-  n: i64,
-  path: i64,
-  path_len: i64,
-  trusted: i64,
-  config: format_config.Config
-) -> i64 {
-  match main_fmt_result(src, n, path, path_len, trusted, config) {
-    FormatterSuccess(formatted) -> {
-      sys_write(1, __str_ptr(formatted), __str_len(formatted))
-      0
-    }
-    FormatterFailure(error_count) -> {
-      eprint("fmt: parse failed with ")
-      eprint_i(error_count)
-      eprint(" errors; no output written\n")
-      1
-    }
+-- The canonical Weft formatter over a source text; standard input has an
+-- empty path. The legacy formatter reads the text through its address.
+fn main_fmt_format(config: format_config.Config, text: str, path: str) -> FormatterResult {
+  let length = str_len(path)
+  if length == 0 { main_fmt_result(main_legacy_address(text), str_len(text), 0, 0, 0, config) }
+  else {
+    let address = main_legacy_address(path)
+    main_fmt_result(
+      main_legacy_address(text),
+      str_len(text),
+      address,
+      length,
+      cpath_is_trusted_source(address, length),
+      config
+    )
   }
 }
 
-fn run_fmt_source(src: i64, n: i64, trusted: i64, config: format_config.Config) -> i64 {
-  run_fmt_source_with_path(src, n, 0, 0, trusted, config)
-}
-
-fn run_fmt_path(path: i64, config: format_config.Config) -> i64 {
-  let len = cstr_len(path)
-  let file = read_cpath_file(path, len)
-  let src = mem_load64_at(file, 0)
-  let n = mem_load64_at(file, 8)
-  if src == 0 {
-    main_test_eprint_path_error("fmt: could not read input file: ", path)
-    1
-  } else {
-    run_fmt_source_with_path(src, n, path, len, cpath_is_trusted_source(path, len), config)
+fn main_fmt_output(text: str, path: str, config: format_config.Config) -[ConsoleWrite]> i64 {
+  match main_fmt_format(config, text, path) {
+    FormatterSuccess(formatted) -> {
+      tool_print(formatted)
+      0
+    }
+    FormatterFailure(errors) -> {
+      tool_note(i"fmt: parse failed with {errors} errors; no output written\n")
+      1
+    }
   }
 }
 
 fn run_fmt(config: format_config.Config) -> i64 {
   let input = read_stdin_all()
-  run_fmt_source(mem_load64_at(input, 0), mem_load64_at(input, 8), 0, config)
+  let text = runtime_str_from_bytes_copy(mem_load64_at(input, 0), mem_load64_at(input, 8))
+  with console_terminal() { main_fmt_output(text, "", config) }
 }
 
-fn main_fmt_bytes_equal(src: i64, n: i64, formatted: str) -> i64 {
-  if n != __str_len(formatted) { 0 }
-  else {
-    let formatted_src = __str_ptr(formatted)
-    let mut i = 0
-    let mut equal = 1
-    while i < n and equal == 1 {
-      if mem_load8_at(src, i) != mem_load8_at(formatted_src, i) { equal = 0 }
-      else { i = i + 1 }
-    }
-    equal
-  }
-}
-
-fn main_fmt_lstat_mode(path: i64) -> i64 {
-  -- The semantic leaf reports the normalised stat record, so read the mode
-  -- through its accessor rather than at a Darwin `struct stat` byte offset.
-  let stat_buf = alloc_zeroed(sys_stat_scratch_size())
-  let status = sys_stat_nofollow(path, stat_buf)
-  if status < 0 { 0 - 1 }
-  else { sys_stat_mode(stat_buf) }
-}
-
-fn main_fmt_temp_path(path: i64) -> i64 {
-  main_test_join_path(
-    path,
-    cstr_len(path),
-    __str_ptr(".weft-fmt.tmp"),
-    __str_len(".weft-fmt.tmp")
-  )
-}
-
--- Replace through an exclusive same-directory temporary. The original path
--- is untouched until every byte is written, permissions are restored, data
--- is synced, and the final rename succeeds.
-fn main_fmt_atomic_write(path: i64, formatted: str, source_mode: i64) -> i64 {
-  let temp = main_fmt_temp_path(path)
-  let fd = sys_open_write_create_new(temp, source_mode band 4095)
-  if fd < 0 {
-    main_test_eprint_path_error("fmt: could not create temporary file: ", temp)
-    1
-  } else {
-    let permission_status = sys_file_chmod(fd, source_mode band 4095)
-    let write_status = if permission_status < 0 { 0 - permission_status }
-    else { main_test_write_all(fd, __str_ptr(formatted), __str_len(formatted)) }
-    let sync_status = if write_status != 0 { 0 } else { sys_file_flush(fd) }
-    let close_status = sys_close(fd)
-    if write_status != 0 or sync_status < 0 or close_status < 0 {
-      sys_remove(temp)
-      main_test_eprint_path_error("fmt: could not write temporary file: ", temp)
-      1
-    } else {
-      let rename_status = sys_rename(temp, path)
-      if rename_status < 0 {
-        sys_remove(temp)
-        main_test_eprint_path_error("fmt: could not replace source file: ", path)
+fn run_fmt_path(path: str, config: format_config.Config) -> i64 {
+  let text = with file_read() { fmt_read(path) }
+  with console_terminal() {
+    match text {
+      Some(source) -> main_fmt_output(source, path, config)
+      None -> {
+        tool_note(i"fmt: could not read input file: {path}\n")
         1
-      } else { 0 }
+      }
     }
   }
 }
 
-fn main_fmt_write_result(path: i64, metadata: i64, formatted: str) -> i64 {
-  let mode = node_f4(metadata)
-  let lstat_mode = main_fmt_lstat_mode(path)
-  if (mode band 61440) != 32768 {
-    main_test_eprint_path_error("fmt: source is not a regular file: ", path)
-    1
-  } else {
-    if lstat_mode < 0 {
-      main_test_eprint_path_error("fmt: could not inspect source file: ", path)
-      1
-    } else {
-      if (lstat_mode band 61440) == 40960 {
-        main_test_eprint_path_error("fmt: refusing to replace symbolic link: ", path)
-        1
-      } else {
-        if (mode band 146) == 0 {
-          main_test_eprint_path_error("fmt: source file is read-only: ", path)
-          1
-        } else {
-          main_fmt_atomic_write(path, formatted, mode)
-        }
+fn main_fmt_step(roots: Vector<str>, failures: i64, event: PoolEvent) -[ConsoleWrite]> i64 {
+  match event {
+    PoolStarting(item) -> failures
+    PoolRefused(item) -> {
+      tool_note(
+        i"fmt: could not start formatter worker: {vector_get_in_bounds<str>(roots, item)}\n"
+      )
+      failures + 1
+    }
+    PoolReaped(item, exit, elapsed) -> match exit.termination {
+      -- A worker reports its own outcome; the runner only counts it.
+      SupervisedEnded(ProcExited(0)) -> failures
+      SupervisedEnded(ProcExited(_)) -> failures + 1
+      _ -> {
+        tool_note(i"fmt: formatter worker failed: {vector_get_in_bounds<str>(roots, item)}\n")
+        failures + 1
       }
     }
   }
 }
 
--- operation 1 checks without mutation; operation 2 atomically rewrites.
-fn main_fmt_process_path(path: i64, operation: i64, config: format_config.Config) -> i64 {
-  let path_len = cstr_len(path)
-  let file = read_cpath_file(path, path_len)
-  let src = mem_load64_at(file, 0)
-  let n = mem_load64_at(file, 8)
-  if src == 0 {
-    main_test_eprint_path_error("fmt: could not read input file: ", path)
-    1
-  } else {
-    match main_fmt_result(src, n, path, path_len, cpath_is_trusted_source(path, path_len), config) {
-      FormatterFailure(error_count) -> {
-        eprint("fmt: parse failed for ")
-        main_test_eprint_cpath(path)
-        eprint(" with ")
-        eprint_i(error_count)
-        eprint(" errors; source left unchanged\n")
-        1
-      }
-      FormatterSuccess(formatted) -> {
-        if main_fmt_bytes_equal(src, n, formatted) == 1 { 0 }
-        else {
-          if operation == 1 {
-            main_test_eprint_path_error("fmt: would reformat: ", path)
-            1
-          } else {
-            -- Metadata is needed only for replacement safety. Acquiring it
-            -- after parsing keeps check mode identical to the proven
-            -- single-path formatter allocation shape, including large files.
-            let metadata = main_test_path_metadata(path)
-            if metadata == 0 {
-              main_test_eprint_path_error("fmt: could not inspect source file: ", path)
-              1
-            } else { main_fmt_write_result(path, metadata, formatted) }
-          }
-        }
+fn main_fmt_worker(target: str, mode: FmtMode, config: format_config.Config) -> i64 {
+  let outcome = with file_read() {
+    with file_write() {
+      with dir_inspect() {
+        fmt_file(target, mode, (text: str, path: str) => main_fmt_format(config, text, path))
       }
     }
   }
+  with console_terminal() { tool_note(fmt_outcome_text(target, outcome)) }
+  if fmt_outcome_failed(outcome) { 1 } else { 0 }
 }
 
-fn main_fmt_expand_arg(paths: i64, arg: i64) -> i64 {
-  let metadata = main_test_path_metadata(arg)
-  if metadata != 0 and node_f1(metadata) == 1 {
-    let status = main_test_collect_directory_recursive(
-      paths,
-      arg,
-      metadata,
-      "fmt: could not list directory: "
-    )
-    if status < 0 { 1 }
-    else {
-      if status == 0 {
-        main_test_eprint_path_error("fmt: no .weft files in directory: ", arg)
-        1
-      } else { 0 }
-    }
-  } else {
-    main_test_paths_add_sorted(paths, arg)
-    0
-  }
-}
-
-fn main_fmt_process_path_isolated(
-  path: i64,
-  operation: i64,
-  worker_argv: i64,
-  envp: i64,
-  status_ptr: i64
-) -> i64 {
-  let operation_name = if operation == 1 { "--internal-check-one" } else {
-    "--internal-write-one"
-  }
-  mem_store64_at(worker_argv, 16, runtime_str_cstring(operation_name))
-  mem_store64_at(worker_argv, 48, path)
-  let fork_result = sys_proc_fork()
-  if fork_result < 0 {
-    main_test_eprint_path_error("fmt: could not start formatter worker: ", path)
-    1
-  } else {
-    if fork_result == 0 {
-      sys_proc_exec(mem_load64_at(worker_argv, 0), worker_argv, envp)
-      sys_exit(127)
-    } else {
-      mem_store64_at(status_ptr, 0, 0)
-      let waited = main_test_wait_blocking(fork_result, status_ptr)
-      if waited != fork_result {
-        main_test_eprint_path_error("fmt: formatter worker failed: ", path)
-        1
-      } else {
-        let result = main_test_decode_wait_status(status_ptr)
-        if result == 0 { 0 } else { 1 }
-      }
-    }
-  }
-}
-
+-- Each file is checked or rewritten in its own worker, one at a time. Its
+-- parse and render state dies with the worker, which keeps corpus-sized
+-- invocations bounded, and waiting in turn keeps diagnostics in path order.
+-- A worker returns its status out of `main`.
 fn run_fmt_paths(
   argc: i64,
   argv: i64,
-  requested: i64,
-  operation: i64,
+  inputs: Vector<str>,
+  mode: FmtMode,
   config: format_config.Config
 ) -> i64 {
-  let paths = nlist_new()
-  let status_ptr = alloc_zeroed(8)
-  let worker_argv = alloc_zeroed(64)
-  let envp = argv + (argc + 1) * 8
-  let worker_executable = match main_executable_location(argv, envp) {
-    MainExecutableLocated(executable) -> runtime_str_cstring(executable)
-    MainExecutableUnresolved -> mem_load64_at(argv, 0)
+  let discovery = with dir_inspect() { discover(inputs) }
+  let problems = discovery.problems
+  with console_terminal() {
+    for problem in problems[..] { tool_note(fmt_problem_text(problem)) }
   }
-  mem_store64_at(worker_argv, 0, worker_executable)
-  mem_store64_at(worker_argv, 8, runtime_str_cstring("fmt"))
-  mem_store64_at(worker_argv, 24, runtime_str_cstring("--max-line-length"))
-  mem_store64_at(
-    worker_argv,
-    32,
-    runtime_str_cstring(runtime_int_to_str(config.max_line_length()))
-  )
-  mem_store64_at(worker_argv, 40, runtime_str_cstring("--"))
-  let mut failures = 0
-  for i in 0..nlist_len(requested) {
-    failures = failures + main_fmt_expand_arg(paths, nlist_get(requested, i))
-  }
-  for i in 0..nlist_len(paths) {
-    -- A path's parse/render state dies with its short-lived worker. This
-    -- keeps corpus-sized invocations bounded without rewinding allocations
-    -- that managed cleanup or process-global compiler state may still own.
-    -- Waiting immediately retains deterministic path/diagnostic order.
-    failures = failures + main_fmt_process_path_isolated(
-      nlist_get(paths, i),
-      operation,
-      worker_argv,
-      envp,
-      status_ptr
+  let roots = discovery.roots
+  let limits: Vector<Option<Duration>> = vector.new<Option<Duration>>()
+  for index in 0..vector_len<str>(roots) { vector_push<Option<Duration>>(limits, None) }
+  let run = with console_terminal() {
+    platform_time.with_platform(
+      () =>
+        runtime_supervise(
+          argc,
+          argv,
+          () => pool_run(
+            limits,
+            1,
+            0,
+            (failures: i64, event: PoolEvent) => main_fmt_step(roots, failures, event)
+          )
+        )
     )
   }
-  if failures == 0 { 0 } else { 1 }
-}
-
-type FormatterCommandMode { FormatOutput, FormatCheck, FormatWrite }
-
-fn main_fmt_usage() -> i64 {
-  eprint("usage: weft fmt [--max-line-length N] [path]\n")
-  eprint("usage: weft fmt [--max-line-length N] (--check | --write) <path...>\n")
-  1
+  match run {
+    PoolWorkerStarted(worker) -> main_fmt_worker(
+      vector_get_in_bounds<str>(roots, worker.item),
+      mode,
+      config
+    )
+    PoolFinished(failures) -> if failures + discovery.failed_inputs == 0 { 0 } else { 1 }
+  }
 }
 
 fn run_fmt_command(argc: i64, argv: i64) -> i64 {
-  let requested = nlist_new()
-  let mut config = format_config.defaults()
-  let mut mode = FormatOutput
-  let mut saw_width = false
-  let mut internal_worker = false
-  let mut options = true
-  let mut i = 2
-  -- Validate the complete request before starting workers or writing a file.
-  while i < argc {
-    let arg = mem_load64_at(argv, i * 8)
-    if options and cstr_eq(arg, "--") == 1 {
-      options = false
-    } else if options and cstr_eq(arg, "--max-line-length") == 1 {
-      if saw_width or i + 1 >= argc {
-        eprint("fmt: --max-line-length requires one positive integer\n")
-        return 1
-      } else { 0 }
-      i = i + 1
-      let raw = mem_load64_at(argv, i * 8)
-      match format_config.from_text(runtime_str_from_bytes_copy(raw, cstr_len(raw))) {
-        Some(value) -> { config = value }
-        None -> {
-          eprint("fmt: --max-line-length requires one positive integer\n")
-          return 1
-        }
-      }
-      saw_width = true
-    } else if options and (
-      cstr_eq(arg, "--check") == 1 or cstr_eq(arg, "--internal-check-one") == 1
-    ) {
-      match mode { FormatOutput -> nil, _ -> { return main_fmt_usage() } }
-      mode = FormatCheck
-      internal_worker = cstr_eq(arg, "--internal-check-one") == 1
-    } else if options and (
-      cstr_eq(arg, "--write") == 1 or cstr_eq(arg, "--internal-write-one") == 1
-    ) {
-      match mode { FormatOutput -> nil, _ -> { return main_fmt_usage() } }
-      mode = FormatWrite
-      internal_worker = cstr_eq(arg, "--internal-write-one") == 1
-    } else if options and cstr_len(arg) > 0 and mem_load8_at(arg, 0) == 45 {
-      return main_fmt_usage()
-    } else {
-      nlist_add(requested, arg)
+  match fmt_command(main_command_arguments(argc, argv)) {
+    FmtUsage -> with console_terminal() {
+      tool_note(fmt_usage())
+      1
     }
-    i = i + 1
-  }
-  let count = nlist_len(requested)
-  match mode {
-    FormatOutput -> {
-      if count == 0 { run_fmt(config) }
-      else if count == 1 { run_fmt_path(nlist_get(requested, 0), config) }
-      else { main_fmt_usage() }
+    FmtBadWidth -> with console_terminal() {
+      tool_note("fmt: --max-line-length requires one positive integer\n")
+      1
     }
-    _ -> {
-      let operation = match mode { FormatCheck -> 1, _ -> 2 }
-      if count == 0 or (internal_worker and count != 1) { main_fmt_usage() }
-      else if internal_worker {
-        main_fmt_process_path(nlist_get(requested, 0), operation, config)
-      }
-      else { run_fmt_paths(argc, argv, requested, operation, config) }
-    }
+    FmtInput(config) -> run_fmt(config)
+    FmtFile(path, config) -> run_fmt_path(path, config)
+    FmtFiles(inputs, mode, config) -> run_fmt_paths(argc, argv, inputs, mode, config)
   }
 }
 
@@ -8855,7 +8663,7 @@ fn main_test_consume_result(
       Some(counts) -> {
         let expected = if counts.failed == 0 { 0 } else { 1 }
         if status != expected { TestResultInvalid } else {
-          test_note(test_counts_render(counts))
+          tool_note(test_counts_render(counts))
           test_outcome_from_status(status)
         }
       }
@@ -8875,7 +8683,7 @@ fn main_test_judge(
       let status = test_exit_status(ended)
       match expectation {
         MainTestExits(expected) -> if status == expected { TestPassed } else {
-          test_note(i"test: legacy main exited {status}, expected {expected}\n")
+          tool_note(i"test: legacy main exited {status}, expected {expected}\n")
           TestExitMismatch
         }
         MainTestStructured -> if status == 0 or status == 1 {
@@ -8896,14 +8704,14 @@ fn main_test_execute(
   compile_millis: i64
 ) -[FileRead, DirMutate, ConsoleWrite, MonotonicClock, Supervise]> TestMeasure {
   if pipeline_binary_kind(binary) != main_host_executable_kind() {
-    test_note("test: native runner cannot execute this binary format\n")
+    tool_note("test: native runner cannot execute this binary format\n")
     return main_test_measure(TestForeignExecutable, compile_millis, 0, 0, main_test_no_usage())
   }
   let contents = pipeline_binary_bytes(binary)
   if contents.is_empty() {
     -- Emission refused to produce an executable; the errors were already
     -- reported. Executing an empty file would only add a misleading 127.
-    test_note("test: emission produced no executable\n")
+    tool_note("test: emission produced no executable\n")
     return main_test_measure(TestNoExecutable, compile_millis, 0, 0, main_test_no_usage())
   }
   let process = Supervise.process_id()
@@ -9385,7 +9193,7 @@ fn main_test_plan_group(
   let pair_count = main_test_root_plan_pair_count(leader)
   let optimise = test_group_optimises(thresholds, group_roots)
   if settings.plan_trace and group_roots > 1 {
-    test_note(test_plan_group_trace(group_roots, pair_count, optimise))
+    tool_note(test_plan_group_trace(group_roots, pair_count, optimise))
   }
   if not test_group_shares(thresholds, group_roots, pair_count) {
     vector_set<bool>(claimed, leader_index, true)
@@ -9453,7 +9261,7 @@ fn main_test_plan(
         )
       }
     }
-    if settings.plan_trace { test_note(test_plan_trace(totals)) }
+    if settings.plan_trace { tool_note(test_plan_trace(totals)) }
   }
   let db = project_session_database(session)
   MainTestPlan {
@@ -9512,9 +9320,9 @@ fn main_test_report(
   let summary = test_summary(roots, pool.failures, input_failures)
   let wall = main_test_now().duration_since(started)
   with console_terminal() {
-    test_note(summary.text)
+    tool_note(summary.text)
     if settings.report_metrics {
-      test_note(
+      tool_note(
         test_measures_report(
           TestRunMeasures {
             roots: roots,
@@ -9532,7 +9340,7 @@ fn main_test_report(
 }
 
 -- Entry ---------------------------------------------------------------------
-fn main_test_arguments(argc: i64, argv: i64) -> Vector<str> {
+fn main_command_arguments(argc: i64, argv: i64) -> Vector<str> {
   with runtime_env(argc, argv) {
     let args: Vector<str> = vector.new<str>()
     for index in 2..Env.arg_count() {
@@ -9567,9 +9375,7 @@ fn run_test_paths(
   let discovery = with dir_inspect() { discover(inputs) }
   let problems = discovery.problems
   with console_terminal() {
-    for index in 0..vector_len<DiscoveryProblem>(problems) {
-      test_note(test_problem_text(vector_get_in_bounds<DiscoveryProblem>(problems, index)))
-    }
+    for problem in problems[..] { tool_note(test_problem_text(problem)) }
   }
   let discovered = main_test_now()
   let roots = discovery.roots
@@ -9626,7 +9432,7 @@ fn run_test_paths(
 
 fn run_test_command(argc: i64, argv: i64) -[SourceAcquire]> i64 {
   let host = main_grammar_host(argc, argv)
-  match test_command(main_test_arguments(argc, argv)) {
+  match test_command(main_command_arguments(argc, argv)) {
     TestEmitInput -> run_test(host)
     TestEmitPath(path) -> run_test_path(path, host)
     TestRunInputs(inputs, jobs) -> run_test_paths(argc, argv, inputs, jobs, host)

@@ -1,0 +1,238 @@
+-- compiler/tool/fmt.weft -- the `weft fmt` command's policy and file handling
+--
+-- Arguments, per-file outcomes and their wording are values here, and one
+-- file is checked or rewritten over `FileRead`, `FileWrite` and
+-- `DirInspect` alone. The formatter arrives as a function, so the command's
+-- safety rules are testable without a filesystem; the CLI supplies the
+-- canonical Weft formatter and runs each file in its own worker.
+
+use compiler/tool/discovery.{
+  DiscoveryDirectoryEmpty,
+  DiscoveryDirectoryUnreadable,
+  DiscoveryPatternUnmatched,
+  DiscoveryPatternUnreadable,
+  DiscoveryProblem
+}
+use compiler/weft/format.{FormatterFailure, FormatterResult, FormatterSuccess}
+use compiler/weft/format/config as format_config
+use stdlib/bytes as bytes
+use stdlib/bytes.{bytes_storage}
+use stdlib/dir as dir
+use stdlib/dir.{DirFile, DirInspect, DirKind}
+use stdlib/file as file
+use stdlib/file.{FileRead, FileWrite}
+use stdlib/io/types.{IoError}
+use stdlib/option.{None, Option, Some}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/result.{Err, Ok}
+use stdlib/string.{str_len}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, vector_get_in_bounds, vector_len, vector_push}
+
+-- Command -------------------------------------------------------------------
+--- Whether `weft fmt` over files only checks them or rewrites them.
+pub(package) type FmtMode {
+  --- Report files that are not canonical; change nothing.
+  FmtCheck,
+  --- Atomically replace files that are not canonical.
+  FmtWrite
+}
+
+--- What one `weft fmt` invocation asks for.
+pub(package) type FmtCommand {
+  --- Format standard input to standard output.
+  FmtInput(format_config.Config),
+  --- Format one file to standard output.
+  FmtFile(str, format_config.Config),
+  --- Check or rewrite every file the inputs name.
+  FmtFiles(Vector<str>, FmtMode, format_config.Config),
+  --- The arguments do not form a command.
+  FmtUsage,
+  --- `--max-line-length` is missing, repeated or not a positive integer.
+  FmtBadWidth
+}
+
+pub(package) fn fmt_usage() -> str {
+  "usage: weft fmt [--max-line-length N] [path]\nusage: weft fmt [--max-line-length N] (--check | --write) <path...>\n"
+}
+
+--- Interpret the arguments that follow `fmt`. The whole request is
+--- validated before any file is read or written.
+pub(package) fn fmt_command(args: Vector<str>) -> FmtCommand {
+  let count = vector_len<str>(args)
+  let paths: Vector<str> = vector.new<str>()
+  let mut config = format_config.defaults()
+  let mut mode = None<FmtMode>()
+  let mut saw_width = false
+  let mut options = true
+  let mut index = 0
+  while index < count {
+    let arg = vector_get_in_bounds<str>(args, index)
+    if options and arg == "--" { options = false }
+    else if options and arg == "--max-line-length" {
+      if saw_width or index + 1 >= count { return FmtBadWidth }
+      index = index + 1
+      match format_config.from_text(vector_get_in_bounds<str>(args, index)) {
+        Some(value) -> { config = value }
+        None -> return FmtBadWidth
+      }
+      saw_width = true
+    } else if options and (arg == "--check" or arg == "--write") {
+      match mode {
+        Some(_) -> return FmtUsage
+        None -> { mode = Some(if arg == "--check" { FmtCheck } else { FmtWrite }) }
+      }
+    } else if options and arg.starts_with("-") { return FmtUsage }
+    else { vector_push<str>(paths, arg) }
+    index = index + 1
+  }
+  let named = vector_len<str>(paths)
+  match mode {
+    None -> if named == 0 { FmtInput(config) }
+    else if named == 1 { FmtFile(vector_get_in_bounds<str>(paths, 0), config) }
+    else { FmtUsage }
+    Some(requested) -> if named == 0 { FmtUsage } else { FmtFiles(paths, requested, config) }
+  }
+}
+
+--- A discovery problem in the fmt command's words.
+pub(package) fn fmt_problem_text(problem: DiscoveryProblem) -> str {
+  match problem {
+    DiscoveryPatternUnreadable(input) -> i"fmt: could not expand pattern: {input}\n"
+    DiscoveryPatternUnmatched(input) -> i"fmt: no .weft files matched: {input}\n"
+    DiscoveryDirectoryUnreadable(directory) -> i"fmt: could not list directory: {directory}\n"
+    DiscoveryDirectoryEmpty(input) -> i"fmt: no .weft files in directory: {input}\n"
+  }
+}
+
+-- Files ---------------------------------------------------------------------
+--- How checking or rewriting one file ended.
+pub(package) type FmtOutcome {
+  --- The file is already canonical.
+  FmtUnchanged,
+  --- The file was atomically replaced with its canonical form.
+  FmtRewritten,
+  --- Check mode found the file is not canonical.
+  FmtWouldReformat,
+  --- The file could not be read.
+  FmtUnreadable,
+  --- The file does not parse, with this many errors; it is left unchanged.
+  FmtParseFailed(i64),
+  --- Its metadata could not be read before replacing it.
+  FmtUninspectable,
+  --- It is a directory or another non-file entry.
+  FmtNotRegular,
+  --- It is a symbolic link, which a replacement would sever.
+  FmtSymbolicLink,
+  --- It grants no write permission.
+  FmtReadOnly,
+  --- The atomic replacement failed; the file is unchanged.
+  FmtReplaceFailed(IoError)
+}
+
+--- Whether an outcome fails the invocation.
+pub(package) fn fmt_outcome_failed(outcome: FmtOutcome) -> bool {
+  match outcome {
+    FmtUnchanged -> false
+    FmtRewritten -> false
+    _ -> true
+  }
+}
+
+--- An outcome's report line, empty for the ones that report nothing.
+pub(package) fn fmt_outcome_text(target: str, outcome: FmtOutcome) -> str {
+  match outcome {
+    FmtUnchanged -> ""
+    FmtRewritten -> ""
+    FmtWouldReformat -> i"fmt: would reformat: {target}\n"
+    FmtUnreadable -> i"fmt: could not read input file: {target}\n"
+    FmtParseFailed(errors) ->
+      i"fmt: parse failed for {target} with {errors} errors; source left unchanged\n"
+    FmtUninspectable -> i"fmt: could not inspect source file: {target}\n"
+    FmtNotRegular -> i"fmt: source is not a regular file: {target}\n"
+    FmtSymbolicLink -> i"fmt: refusing to replace symbolic link: {target}\n"
+    FmtReadOnly -> i"fmt: source file is read-only: {target}\n"
+    FmtReplaceFailed(_) -> i"fmt: could not replace source file: {target}\n"
+  }
+}
+
+fn fmt_native(text: str) -> Option<Path> {
+  match path.from_bytes(bytes.from_str(text)) {
+    Ok(native) -> Some(native)
+    Err(_) -> None
+  }
+}
+
+-- Source files are read whole; the bound only refuses absurd inputs.
+fn fmt_read_limit() -> usize {
+  let limit: usize = 1073741824
+  limit
+}
+
+--- A file's exact bytes as source text, malformed UTF-8 included: the
+--- formatter's lexer diagnoses it rather than acquisition rejecting it.
+pub(package) fn fmt_read(target: str) -[FileRead]> Option<str> {
+  match fmt_native(target) {
+    None -> None
+    Some(native) -> match file.read_all(native, fmt_read_limit()) {
+      Ok(contents) -> Some(bytes_storage(contents))
+      Err(_) -> None
+    }
+  }
+}
+
+fn fmt_is_file(kind: DirKind) -> bool {
+  match kind {
+    DirFile -> true
+    _ -> false
+  }
+}
+
+-- Replace a file with its canonical form. The file must be a regular file
+-- reached without a symbolic link, and must grant write permission; the
+-- replacement itself keeps the file's permissions and is atomic.
+fn fmt_replace(target: str, formatted: str) -[FileWrite, DirInspect]> FmtOutcome {
+  let native = match fmt_native(target) {
+    Some(value) -> value
+    None -> return FmtUninspectable
+  }
+  let followed = match dir.metadata(native) {
+    Ok(metadata) -> metadata
+    Err(_) -> return FmtUninspectable
+  }
+  if not followed.exists { return FmtUninspectable }
+  if not fmt_is_file(followed.kind) { return FmtNotRegular }
+  let direct = match dir.symlink_metadata(native) {
+    Ok(metadata) -> metadata
+    Err(_) -> return FmtUninspectable
+  }
+  if not fmt_is_file(direct.kind) { return FmtSymbolicLink }
+  if followed.read_only { return FmtReadOnly }
+  match file.atomic_replace(native, bytes.from_str(formatted)) {
+    Ok(_) -> FmtRewritten
+    Err(error) -> FmtReplaceFailed(error)
+  }
+}
+
+--- Check or rewrite one file with `format`, which renders a source text
+--- given its path. Metadata is read only when a rewrite is needed.
+pub(package) fn fmt_file(
+  target: str,
+  mode: FmtMode,
+  format: (str, str) -> FormatterResult
+) -[FileRead, FileWrite, DirInspect]> FmtOutcome {
+  match fmt_read(target) {
+    None -> FmtUnreadable
+    Some(text) -> match format(text, target) {
+      FormatterFailure(errors) -> FmtParseFailed(errors)
+      FormatterSuccess(formatted) -> if formatted == text { FmtUnchanged }
+      else {
+        match mode {
+          FmtCheck -> FmtWouldReformat
+          FmtWrite -> fmt_replace(target, formatted)
+        }
+      }
+    }
+  }
+}

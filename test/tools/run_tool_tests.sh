@@ -2325,7 +2325,7 @@ assert_equals "fmt_write_dirty_stdout_empty" "$(wc -c < "$tmp_out" | tr -d ' ')"
 assert_equals "fmt_write_dirty_stderr_empty" "$(<"$tmp_err")" ""
 assert_equals "fmt_write_dirty_replaces_canonically" "$(<"$fmt_dirty")" "fn dirty() -> i64 { 2 }"
 assert_equals "fmt_write_preserves_permissions" "$(file_mode "$fmt_dirty")" "$fmt_dirty_mode_before"
-assert_equals "fmt_write_removes_temporary" "$(test -e "$fmt_dirty.weft-fmt.tmp"; echo $?)" "1"
+assert_equals "fmt_write_removes_temporary" "$(ls "$fmt_dirty".weft-tmp-* 2>/dev/null | wc -l | tr -d ' ')" "0"
 set +e
 "$WEFT" fmt --check "$fmt_dirty" > "$tmp_out" 2>"$tmp_err"
 fmt_write_idempotent_exit=$?
@@ -2392,7 +2392,7 @@ assert_equals "fmt_write_parse_error_stdout_empty" "$(wc -c < "$tmp_out" | tr -d
 assert_contains "fmt_write_parse_error_preserves_eof_coordinate" "$(<"$tmp_err")" "line 2, col 1: error[E0002]: expected '}' before end of file"
 assert_contains "fmt_write_parse_error_summary" "$(<"$tmp_err")" "fmt: parse failed for $fmt_broken"
 assert_files_equal "fmt_write_parse_error_leaves_source_unchanged" "$fmt_broken" "$tmp_bin"
-assert_equals "fmt_write_parse_error_creates_no_temporary" "$(test -e "$fmt_broken.weft-fmt.tmp"; echo $?)" "1"
+assert_equals "fmt_write_parse_error_creates_no_temporary" "$(ls "$fmt_broken".weft-tmp-* 2>/dev/null | wc -l | tr -d ' ')" "0"
 
 fmt_readonly="$tmp_fmt_dir/readonly.weft"
 printf 'fn readonly()  ->  i64 { 5 }\n' > "$fmt_readonly"
@@ -2405,22 +2405,24 @@ set -e
 assert_equals "fmt_write_readonly_exits_one" "$fmt_readonly_exit" "1"
 assert_contains "fmt_write_readonly_is_explicit" "$(<"$tmp_err")" "fmt: source file is read-only: $fmt_readonly"
 assert_files_equal "fmt_write_readonly_leaves_source_unchanged" "$fmt_readonly" "$tmp_bin"
-assert_equals "fmt_write_readonly_creates_no_temporary" "$(test -e "$fmt_readonly.weft-fmt.tmp"; echo $?)" "1"
+assert_equals "fmt_write_readonly_creates_no_temporary" "$(ls "$fmt_readonly".weft-tmp-* 2>/dev/null | wc -l | tr -d ' ')" "0"
 chmod 644 "$fmt_readonly"
 
+# A temporary left by an interrupted replacement, possibly another process's
+# in-flight one, neither blocks formatting nor is touched: the atomic
+# replacement takes the next free temporary name.
 fmt_interrupted="$tmp_fmt_dir/interrupted.weft"
-fmt_interrupted_temp="$fmt_interrupted.weft-fmt.tmp"
+fmt_interrupted_temp="$fmt_interrupted.weft-tmp-0"
 printf 'fn interrupted()  ->  i64 { 6 }\n' > "$fmt_interrupted"
 printf 'previous temporary bytes\n' > "$fmt_interrupted_temp"
-cp "$fmt_interrupted" "$tmp_bin"
 set +e
 "$WEFT" fmt --write "$fmt_interrupted" > "$tmp_out" 2>"$tmp_err"
 fmt_interrupted_exit=$?
 set -e
-assert_equals "fmt_write_interrupted_exits_one" "$fmt_interrupted_exit" "1"
-assert_contains "fmt_write_interrupted_reports_temporary" "$(<"$tmp_err")" "fmt: could not create temporary file: $fmt_interrupted_temp"
-assert_files_equal "fmt_write_interrupted_leaves_source_unchanged" "$fmt_interrupted" "$tmp_bin"
+assert_equals "fmt_write_interrupted_temporary_does_not_block" "$fmt_interrupted_exit" "0"
+assert_equals "fmt_write_interrupted_formats_source" "$(<"$fmt_interrupted")" "fn interrupted() -> i64 { 6 }"
 assert_equals "fmt_write_interrupted_preserves_existing_temporary" "$(<"$fmt_interrupted_temp")" "previous temporary bytes"
+assert_equals "fmt_write_interrupted_leaves_no_new_temporary" "$(ls "$fmt_interrupted".weft-tmp-* 2>/dev/null | wc -l | tr -d ' ')" "1"
 rm -f "$fmt_interrupted_temp"
 
 fmt_symlink_target="$tmp_fmt_dir/symlink_target.weft"
