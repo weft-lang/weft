@@ -10,11 +10,18 @@ use runtime/descriptor_io.{
   DescriptorCreateNew,
   DescriptorCreateOrTruncate,
   DescriptorOpenRead,
+  DescriptorTargetAbsent,
+  DescriptorTargetFailed,
+  DescriptorTargetFile,
+  DescriptorTargetOther,
   descriptor_close,
+  descriptor_flush,
   descriptor_open,
   descriptor_read_append,
   descriptor_remove,
-  descriptor_rename
+  descriptor_rename,
+  descriptor_set_permissions,
+  descriptor_target
 }
 use runtime/string.{runtime_str_byte_at, runtime_str_len, runtime_str_storage_from_vector}
 use runtime/safe_write_core.{runtime_safe_write_fd}
@@ -33,6 +40,7 @@ use stdlib/io/types.{
   IoInterrupted,
   IoInvalidProgress,
   IoLimitExceeded,
+  IoPermissionDenied,
   io_error_from_errno
 }
 use stdlib/num
@@ -165,50 +173,63 @@ fn runtime_safe_file_write_direct(
   else { runtime_safe_file_write_opened(fd, values) }
 }
 
+-- Replacing a file's contents keeps what the file is: its permission bits
+-- carry over, and a file that grants no write permission is refused exactly
+-- as truncation refuses it. The replacement is durable before it becomes
+-- visible: the temporary is synced, then renamed over the target in the same
+-- directory, so readers see either the old bytes or the new ones.
 fn runtime_safe_file_write_atomic(path: Path, values: Bytes) -> Result<usize, IoError> {
-  -- The same-directory rename makes replacement namespace-atomic. Durability
-  -- needs a future typed sync primitive; this bridge does not promise it.
   let target = runtime_safe_path_string(path)
+  let permissions = match descriptor_target(target) {
+    DescriptorTargetFailed(status) -> return Err(io_error_from_errno(status))
+    DescriptorTargetFile(bits) -> {
+      if (bits band 146) == 0 { return Err(IoPermissionDenied) }
+      bits
+    }
+    DescriptorTargetAbsent -> -1
+    DescriptorTargetOther -> -1
+  }
   let mut attempt = 0
-  let mut fd = 0 - 1
+  let mut fd = -1
   let mut temp = ""
-  let mut failed = false
   let mut failure = IoAlreadyExists
-  while fd < 0 and attempt < 64 and not failed {
+  while fd < 0 and attempt < 64 {
     temp = runtime_safe_file_temp_path_string(path, attempt)
     let opened = runtime_safe_file_open_write(temp, FileAtomicReplace)
-    if opened >= 0 {
-      fd = opened
-    } else {
+    if opened >= 0 { fd = opened }
+    else {
       match io_error_from_errno(opened) {
-        IoAlreadyExists -> {
-          attempt = attempt + 1
-          0
-        }
+        IoAlreadyExists -> { attempt = attempt + 1 }
         error -> {
           failure = error
-          failed = true
-          0
+          attempt = 64
         }
       }
     }
   }
-  if failed or fd < 0 {
-    Err<usize, IoError>(failure)
-  } else {
-    match runtime_safe_file_write_opened(fd, values) {
-      Err(error) -> {
+  if fd < 0 { return Err(failure) }
+  let kept = if permissions < 0 { 0 } else { descriptor_set_permissions(fd, permissions) }
+  let written = if kept < 0 { Err<usize, IoError>(io_error_from_errno(kept)) }
+  else { runtime_safe_write_fd(fd, values) }
+  let synced = match written {
+    Ok(_) -> descriptor_flush(fd)
+    Err(_) -> 0
+  }
+  let closed = descriptor_close(fd)
+  match written {
+    Err(error) -> {
+      descriptor_remove(temp)
+      Err(error)
+    }
+    Ok(count) -> if synced < 0 or closed < 0 {
+      descriptor_remove(temp)
+      Err(io_error_from_errno(if synced < 0 { synced } else { closed }))
+    } else {
+      let renamed = descriptor_rename(temp, target)
+      if renamed == 0 { Ok(count) }
+      else {
         descriptor_remove(temp)
-        Err<usize, IoError>(error)
-      }
-      Ok(count) -> {
-        let renamed = descriptor_rename(temp, target)
-        if renamed == 0 {
-          Ok<usize, IoError>(count)
-        } else {
-          descriptor_remove(temp)
-          Err<usize, IoError>(io_error_from_errno(renamed))
-        }
+        Err(io_error_from_errno(renamed))
       }
     }
   }
