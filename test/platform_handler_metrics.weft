@@ -1,0 +1,148 @@
+-- Platform capability handlers wrap whole programs, so they must resume on
+-- every path. While a handler that may abandon its continuation is active,
+-- every function beneath it links and unlinks abort-cleanup records for its
+-- owning bindings; a platform handler that could abort would tax the entire
+-- program. A clock failure traps inside the leaf that reads the clock, and
+-- process exit stays in the narrow Supervise scope that needs it.
+
+use module_fixtures/compiler_probe.{require_checked}
+use compiler/ir/data.{*}
+use compiler/pipeline.{*}
+use compiler/types/names.{str_hash}
+use stdlib/list.{Cons, Nil}
+
+-- Which clauses a census counts: those whose operation the predicate
+-- accepts. Operations are keyed by their spelling; handled effects carry
+-- declaration identities, so the census selects by operation.
+type ClauseCensus { counts: (i64) -> bool }
+
+fn name_hash(name: str) -> i64 { str_hash(__str_ptr(name), 0, __str_len(name)) }
+
+fn may_abort_in_clauses(clauses: IrHandlerClauseBodyList, census: ClauseCensus) -> i64 {
+  match clauses {
+    IrHandlerClauseBodyNil -> 0
+    IrHandlerClauseBodyCons(body, rest) -> match body {
+      IrHandlerClauseBody(op_hash, _, _, _, completion, _, _, _, _, _, blocks) -> {
+        let predicate = census.counts
+        let here = if predicate(op_hash) and handler_completion_may_abort(completion) {
+          1
+        } else { 0 }
+        here + may_abort_in_blocks(blocks, census) + may_abort_in_clauses(rest, census)
+      }
+      IrHandlerClauseBodyInvalid(reason) -> may_abort_in_clauses(rest, census)
+    }
+  }
+}
+
+fn may_abort_in_insts(insts: IrInstList, census: ClauseCensus) -> i64 {
+  match insts {
+    IrInstNil -> 0
+    IrInstCons(inst, rest) -> match inst {
+      IrHandleI64(dst, src, effect_hash, clauses, nclauses, abort_block) ->
+        may_abort_in_clauses(clauses, census) +
+        may_abort_in_insts(rest, census)
+      -- A handled block or lambda lowers to a closure carrying its own body.
+      IrClosureI64(dst, function, captures, facts) -> match function {
+        IrFunction(hash, nparams, blocks, src) -> may_abort_in_blocks(blocks, census) +
+          may_abort_in_insts(rest, census)
+      }
+      _ -> may_abort_in_insts(rest, census)
+    }
+  }
+}
+
+fn may_abort_in_blocks(blocks: IrBlockList, census: ClauseCensus) -> i64 {
+  match blocks {
+    IrBlockListNil -> 0
+    IrBlockListCons(block, rest) -> match block {
+      IrBlock(id, params, insts, term) -> may_abort_in_insts(insts, census) +
+        may_abort_in_blocks(rest, census)
+    }
+  }
+}
+
+fn may_abort_in_functions(functions: IrFunctionList, census: ClauseCensus) -> i64 {
+  match functions {
+    IrFunctionNil -> 0
+    IrFunctionCons(function, rest) -> match function {
+      IrFunction(hash, nparams, blocks, src) -> may_abort_in_blocks(blocks, census) +
+        may_abort_in_functions(rest, census)
+    }
+  }
+}
+
+-- Handler clauses for `operations` that may abandon their continuation
+-- anywhere in a program's optimised IR, where generic handlers such as
+-- `with_platform` exist as specialised instances.
+fn may_abort_clauses(src: str, operations: List<str>) -> i64 {
+  let typed = require_checked(pipeline_check_source_standalone(__str_ptr(src), __str_len(src)))
+  let census = ClauseCensus { counts: (op: i64) => names_include(operations, op) }
+  may_abort_in_functions(
+    pipeline_ir_functions(pipeline_optimise_typed_ir(typed, pipeline_lower_ir(typed))),
+    census
+  )
+}
+
+fn names_include(operations: List<str>, op: i64) -> bool {
+  for name in operations {
+    if name_hash(name) == op { return true }
+  }
+  false
+}
+
+fn names(first: str, rest: List<str>) -> List<str> { Cons(first, rest) }
+
+fn timing_program() -> str {
+  "use runtime/time as platform_time use stdlib/time/monotonic as monotonic use stdlib/time as time use stdlib/time/sleep as sleep use stdlib/time/wall as wall fn main() -> i64 { platform_time.with_platform(() => { let start = monotonic.now() sleep.wait(time.milliseconds(0)) wall.now() monotonic.now().duration_since(start).milliseconds() }) }"
+}
+
+fn tool_program() -> str {
+  "use runtime/tool_platform.{runtime_platform_tool} use stdlib/time/monotonic as monotonic fn main(argc: i64, argv: i64) -> i64 { runtime_platform_tool(argc, argv, () => { let start = monotonic.now() 0 }) }"
+}
+
+fn supervised_program() -> str {
+  "use runtime/tool_platform.{Supervise, runtime_supervise} fn main(argc: i64, argv: i64) -> i64 { runtime_supervise(argc, argv, () => Supervise.process_id()) }"
+}
+
+test "the_clause_census_sees_an_abortive_handler" {
+  let stopped = may_abort_clauses(
+    "effect Stop { fn stop() -> i64 } fn body() -[Stop]> i64 { Stop.stop() } fn main() -> i64 { handle body() { Stop.stop() -> 7 } }",
+    names("stop", Nil<str>())
+  )
+  Test.assert_eq(stopped, 1)
+}
+
+test "the_platform_clock_and_sleep_handlers_always_resume" {
+  Test.assert_eq(may_abort_clauses(timing_program(), names("now", names("wait", Nil<str>()))), 0)
+}
+
+test "the_native_tool_platform_handlers_always_resume" {
+  let operations = names(
+    "now",
+    names(
+      "arg_count",
+      names(
+        "arg",
+        names(
+          "var",
+          names("run", names("spawn", names("wait", names("list", names("stat", Nil<str>())))))
+        )
+      )
+    )
+  )
+  Test.assert_eq(may_abort_clauses(tool_program(), operations), 0)
+}
+
+test "supervision_may_abort_only_to_exit_a_worker" {
+  -- Process exit is the one abortive clause; the test runner keeps the scope
+  -- that installs it free of compilation.
+  let others = names(
+    "fork",
+    names(
+      "poll",
+      names("stop", names("run", names("write_executable", names("process_id", Nil<str>()))))
+    )
+  )
+  Test.assert_eq(may_abort_clauses(supervised_program(), others), 0)
+  Test.assert_true(may_abort_clauses(supervised_program(), names("exit", Nil<str>())) > 0)
+}
