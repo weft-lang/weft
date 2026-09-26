@@ -1492,6 +1492,72 @@ run_weft_compile_guarded "$WEFT" run "$tmp_run_args_source" -- alpha "two words"
 assert_equals "run_forwards_exact_product_arguments_stdout" "$(<"$tmp_out")" ""
 assert_equals "run_forwards_exact_product_arguments_stderr" "$(<"$tmp_err")" ""
 
+# The product reads the runner's standard input.
+tmp_run_stdin_source="$tmp_scratch_dir/run_stdin.weft"
+printf '%s\n' \
+  'use stdlib/console as console' \
+  'use stdlib/console/input as console_input' \
+  'use stdlib/num' \
+  'use stdlib/result.{Err, Ok, Result}' \
+  '' \
+  'fn main() -> i64 {' \
+  '  with console_input() {' \
+  '    match console.read_bytes(1024) {' \
+  '      Ok(values) -> values.len().to_u64().to_i64_checked().unwrap_or(99)' \
+  '      Err(_) -> 98' \
+  '    }' \
+  '  }' \
+  '}' > "$tmp_run_stdin_source"
+set +e
+printf 'abcde' | run_weft_compile_guarded "$WEFT" run "$tmp_run_stdin_source" > "$tmp_out" 2> "$tmp_err"
+run_stdin_exit=$?
+set -e
+assert_equals "run_product_reads_inherited_stdin" "$run_stdin_exit" "5"
+assert_equals "run_product_stdin_stderr_empty" "$(<"$tmp_err")" ""
+
+# A product ended by a signal reports 128 plus its number.
+tmp_run_signal_source="$tmp_scratch_dir/run_signal.weft"
+printf '%s\n' \
+  'use runtime/process as process_handler' \
+  'use stdlib/list.{Cons, Nil}' \
+  'use stdlib/process.{Proc}' \
+  '' \
+  'fn main(argc: i64, argv: i64) -> i64 {' \
+  '  with process_handler(argc, argv) {' \
+  '    Proc.run("/bin/sh", Cons("-c", Cons("kill -9 $PPID", Nil<str>())))' \
+  '  }' \
+  '  0' \
+  '}' > "$tmp_run_signal_source"
+set +e
+run_weft_compile_guarded "$WEFT" run "$tmp_run_signal_source" < /dev/null > "$tmp_out" 2> "$tmp_err"
+run_signal_exit=$?
+set -e
+assert_equals "run_signalled_product_exits_128_plus_signal" "$run_signal_exit" "137"
+
+# The product runs from a private temporary executable that is gone once
+# the run ends.
+tmp_run_self_source="$tmp_scratch_dir/run_self.weft"
+printf '%s\n' \
+  'use runtime/env as env_handler' \
+  'use stdlib/console as console' \
+  'use stdlib/console/terminal as console_terminal' \
+  'use stdlib/env.{Env}' \
+  '' \
+  'fn main(argc: i64, argv: i64) -> i64 {' \
+  '  let name = with env_handler(argc, argv) { Env.arg(0) }' \
+  '  match name {' \
+  '    nil -> 1' \
+  '    text: str -> {' \
+  '      with console_terminal() { console.print(text) }' \
+  '      0' \
+  '    }' \
+  '  }' \
+  '}' > "$tmp_run_self_source"
+run_weft_compile_guarded "$WEFT" run "$tmp_run_self_source" < /dev/null > "$tmp_out" 2> "$tmp_err"
+run_self_path=$(<"$tmp_out")
+assert_contains "run_product_runs_from_private_temporary" "$run_self_path" "/tmp/weft-exec-"
+assert_equals "run_removes_temporary_executable" "$(test -e "$run_self_path"; echo $?)" "1"
+
 project_init_out=$(cd "$tmp_project_target_dir" && "$WEFT_ABS" pkg init project 2>&1)
 assert_contains "project_target_init_writes_manifest" "$project_init_out" "pkg: wrote weft.pkg"
 cp "$tmp_run_source" "$tmp_project_target_dir/project.weft"

@@ -1,0 +1,210 @@
+-- Executable installation over the real filesystem: owner-only and shared
+-- access, atomic replacement by a new file, symbolic links and directories
+-- at the target, missing parents, and private temporary executables.
+
+use runtime/tool_platform.{
+  ExecutableInstall,
+  ExecutableOwnerOnly,
+  ExecutableShared,
+  Supervise,
+  SupervisedEnded,
+  SupervisedExit,
+  runtime_executable_install,
+  runtime_supervise
+}
+use stdlib/bytes as bytes
+use stdlib/bytes.{Bytes, bytes_storage}
+use stdlib/io/types.{IoError, IoNotFound, IoWrongKind}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/panic.{panic}
+use stdlib/path as path
+use stdlib/path.{Path}
+use stdlib/process.{ProcExited}
+use stdlib/result.{Err, Ok, Result}
+use stdlib/string.{str_concat}
+use stdlib/time as time
+
+fn native(text: str) -> Path {
+  match path.from_utf8(text) {
+    Ok(value) -> value
+    Err(_) -> panic("test paths are valid native paths")
+  }
+}
+
+fn text_of(value: Path) -> str { bytes_storage(value.bytes()) }
+
+-- A shell script's status, with the fixture directory as $0 and `arg` as $1.
+fn shell(script: str, arg: str) -[Supervise]> i64 {
+  let exit = Supervise.run(
+    native("/bin/sh"),
+    Cons("-c", Cons(script, Cons(fixture(), Cons(arg, Nil<str>())))),
+    time.seconds(10)
+  )
+  match exit.termination {
+    SupervisedEnded(ProcExited(status)) -> status
+    _ -> 1000
+  }
+}
+
+fn fixture() -> str { "/tmp/weft-executable-install-fixture" }
+
+fn installed(body: () -[ExecutableInstall, Supervise]> str) -> str {
+  runtime_executable_install(() => runtime_supervise(0, 0, body))
+}
+
+fn script(status: i64) -> Bytes { bytes.from_str(i"#!/bin/sh\nexit {status}\n") }
+
+fn error_code(result: Result<nil, IoError>) -> i64 {
+  match result {
+    Ok(_) -> 0
+    Err(IoNotFound) -> 1
+    Err(IoWrongKind) -> 2
+    Err(other) -> 3
+  }
+}
+
+-- Each case starts from an empty fixture directory.
+fn fresh() -[Supervise]> nil {
+  shell("rm -rf \"$0\" && mkdir \"$0\"", "")
+  nil
+}
+
+-- 0 when a file's permission bits are exactly 700.
+fn owner_only_bits(target: str) -[Supervise]> i64 {
+  shell("test \"$(stat -c %a \"$1\" 2>/dev/null || stat -f %Lp \"$1\")\" = 700", target)
+}
+
+-- 0 when a file's permission bits are 777 less the creation mask.
+fn masked_bits(target: str) -[Supervise]> i64 {
+  shell(
+    "test \"$(stat -c %a \"$1\" 2>/dev/null || stat -f %Lp \"$1\")\" = \"$(printf '%o' $((0777 & ~0$(umask))))\"",
+    target
+  )
+}
+
+fn owner_only() -[ExecutableInstall, Supervise]> str {
+  fresh()
+  let target = str_concat(fixture(), "/tool")
+  let status = error_code(
+    ExecutableInstall.install(native(target), script(4), ExecutableOwnerOnly)
+  )
+  let ran = shell("\"$1\"", target)
+  i"{status} {owner_only_bits(target)} {ran}"
+}
+
+fn shared() -[ExecutableInstall, Supervise]> str {
+  fresh()
+  let target = str_concat(fixture(), "/tool")
+  let status = error_code(ExecutableInstall.install(native(target), script(5), ExecutableShared))
+  let ran = shell("\"$1\"", target)
+  i"{status} {masked_bits(target)} {ran}"
+}
+
+-- A replacement is a new file with the new contents and the requested
+-- access, even over a read-only file, and leaves no temporary behind.
+fn replaced() -[ExecutableInstall, Supervise]> str {
+  fresh()
+  let target = str_concat(fixture(), "/tool")
+  shell(
+    "printf old > \"$1\"; chmod 444 \"$1\"; ls -i \"$1\" | awk '{print $1}' > \"$0/inode\"",
+    target
+  )
+  let status = error_code(
+    ExecutableInstall.install(native(target), script(6), ExecutableOwnerOnly)
+  )
+  let renewed = shell(
+    "test \"$(ls -i \"$1\" | awk '{print $1}')\" != \"$(cat \"$0/inode\")\"",
+    target
+  )
+  let ran = shell("\"$1\"", target)
+  let leftovers = shell("test -z \"$(ls \"$0\" | grep weft-tmp)\"", target)
+  i"{status} {renewed} {owner_only_bits(target)} {ran} {leftovers}"
+}
+
+-- A symbolic link at the target is replaced itself; what it named is kept.
+fn over_link() -[ExecutableInstall, Supervise]> str {
+  fresh()
+  let target = str_concat(fixture(), "/tool")
+  shell("printf kept > \"$0/victim\"; ln -s \"$0/victim\" \"$1\"", target)
+  let status = error_code(
+    ExecutableInstall.install(native(target), script(7), ExecutableOwnerOnly)
+  )
+  let link_gone = shell("test ! -L \"$1\"", target)
+  let kept = shell("test \"$(cat \"$0/victim\")\" = kept", target)
+  let ran = shell("\"$1\"", target)
+  i"{status} {link_gone} {kept} {ran}"
+}
+
+fn refused() -[ExecutableInstall, Supervise]> str {
+  fresh()
+  let directory = str_concat(fixture(), "/dir")
+  shell("mkdir \"$1\" && : > \"$1/inside\"", directory)
+  let over_directory = error_code(
+    ExecutableInstall.install(native(directory), script(0), ExecutableOwnerOnly)
+  )
+  let intact = shell("test -d \"$1\" -a -e \"$1/inside\"", directory)
+  let missing_parent = error_code(
+    ExecutableInstall.install(
+      native(str_concat(fixture(), "/none/tool")),
+      script(0),
+      ExecutableShared
+    )
+  )
+  let leftovers = shell("test -z \"$(ls \"$0\" | grep weft-tmp)\"", directory)
+  i"{over_directory} {intact} {missing_parent} {leftovers}"
+}
+
+-- Temporaries are fresh, owner-only and distinct; a name already taken,
+-- by a file or by a planted symbolic link, is skipped and left untouched.
+fn temporaries() -[ExecutableInstall, Supervise]> str {
+  fresh()
+  let process = Supervise.process_id()
+  let first_name = i"/tmp/weft-exec-{process}-0"
+  let second_name = i"/tmp/weft-exec-{process}-1"
+  shell("printf kept > \"$0/victim\"; rm -f \"$1\"; ln -s \"$0/victim\" \"$1\"", first_name)
+  shell("rm -f \"$1\"; printf taken > \"$1\"", second_name)
+  let first = match ExecutableInstall.install_temporary(script(8)) {
+    Ok(created) -> text_of(created)
+    Err(_) -> "failed"
+  }
+  let second = match ExecutableInstall.install_temporary(script(9)) {
+    Ok(created) -> text_of(created)
+    Err(_) -> "failed"
+  }
+  let expected_first = i"/tmp/weft-exec-{process}-2"
+  let expected_second = i"/tmp/weft-exec-{process}-3"
+  let named = if first == expected_first and second == expected_second { 0 } else { 1 }
+  let ran = shell("\"$1\"", first) * 100 + shell("\"$1\"", second)
+  let mode = owner_only_bits(first)
+  let victim = shell("test \"$(cat \"$0/victim\")\" = kept", first_name)
+  let taken = shell("test \"$(cat \"$1\")\" = taken", second_name)
+  shell("rm -f \"$1\" \"$0/victim\"", first_name)
+  shell("rm -f \"$1\"", second_name)
+  shell("rm -f \"$1\"", first)
+  shell("rm -f \"$1\"", second)
+  i"{named} {ran} {mode} {victim} {taken}"
+}
+
+test "an_owner_only_executable_runs_and_is_private" {
+  Test.assert_str_eq(installed(() => owner_only()), "0 0 4")
+}
+
+test "a_shared_executable_follows_the_creation_mask" {
+  Test.assert_str_eq(installed(() => shared()), "0 0 5")
+}
+
+test "installing_replaces_a_file_with_a_new_one" {
+  Test.assert_str_eq(installed(() => replaced()), "0 0 0 6 0")
+}
+
+test "installing_replaces_a_symbolic_link_without_following_it" {
+  Test.assert_str_eq(installed(() => over_link()), "0 0 0 7")
+}
+
+test "installing_refuses_a_directory_and_a_missing_parent" {
+  Test.assert_str_eq(installed(() => refused()), "2 0 1 0")
+}
+
+test "temporary_executables_are_fresh_private_and_never_follow_a_name" {
+  Test.assert_str_eq(installed(() => temporaries()), "0 809 0 0 0")
+}

@@ -10,7 +10,12 @@ use runtime/dir.{*}
 use runtime/env.{*}
 use runtime/memory.{mem_load64_at, mem_store64_at}
 use runtime/process.{*}
-use runtime/safe_file_core.{runtime_safe_path_string}
+use runtime/safe_file_core.{
+  AtomicExactly,
+  AtomicMasked,
+  runtime_safe_file_replace_atomic,
+  runtime_safe_path_string
+}
 use runtime/safe_write_core.{runtime_safe_write_fd}
 use runtime/time.{*}
 use runtime/string.{runtime_str_cstring}
@@ -34,9 +39,10 @@ use runtime/unsafe.{*}
 use stdlib/bytes.{Bytes}
 use stdlib/dir.{*}
 use stdlib/env.{Env}
-use stdlib/io/types.{IoError, IoPermissionDenied, io_error_from_errno}
+use stdlib/io/types.{IoAlreadyExists, IoError, IoPermissionDenied, io_error_from_errno}
 use stdlib/list.{Cons, List, Nil}
 use stdlib/panic.{panic}
+use stdlib/path as path
 use stdlib/path.{Path}
 use stdlib/process.{*}
 use stdlib/result.{Err, Ok, Result}
@@ -193,8 +199,6 @@ pub(package) effect Supervise {
   --- Run an executable, with `args` after its path, until it ends or
   --- `limit` of wall time passes.
   fn run(path: Path, args: List<str>, limit: Duration) -> SupervisedExit
-  --- Replace `path` with an executable only its owner may run.
-  fn write_executable(path: Path, contents: Bytes) -> Result<nil, IoError>
   --- Send this process's standard error, and that of everything it runs,
   --- to a new file at `path` only its owner may read. An existing entry,
   --- a symbolic link included, is refused rather than followed.
@@ -324,24 +328,6 @@ fn runtime_supervise_run(
   runtime_supervise_reap_stopped(pid)
 }
 
-fn runtime_supervise_write_executable(path: Path, contents: Bytes) -> Result<nil, IoError> {
-  let cpath = runtime_str_cstring(runtime_safe_path_string(path))
-  sys_remove(cpath)
-  let fd = sys_open_write_create_truncate(cpath, 448)
-  if fd < 0 { return Err(io_error_from_errno(fd)) }
-  let written = runtime_safe_write_fd(fd, contents)
-  let permission = match written {
-    Ok(_) -> sys_file_chmod(fd, 448)
-    Err(_) -> 0
-  }
-  sys_close(fd)
-  match written {
-    Err(error) -> Err(error)
-    Ok(_) -> if permission < 0 { Err(io_error_from_errno(permission)) }
-    else { Ok(nil) }
-  }
-}
-
 fn runtime_supervise_capture_errors(path: Path) -> Result<nil, IoError> {
   let fd = sys_open_write_create_new(runtime_str_cstring(runtime_safe_path_string(path)), 384)
   if fd < 0 { return Err(io_error_from_errno(fd)) }
@@ -383,9 +369,6 @@ pub(package) fn runtime_supervise<T, E>(
       }
     }
     Supervise.run(path, args, limit) -> resume(runtime_supervise_run(envp, path, args, limit))
-    Supervise.write_executable(path, contents) -> resume(
-      runtime_supervise_write_executable(path, contents)
-    )
     Supervise.capture_errors(path) -> resume(runtime_supervise_capture_errors(path))
     Supervise.process_id() -> resume(sys_proc_id())
   }
@@ -404,8 +387,8 @@ fn runtime_supervise_scripted_poll(script: SupervisedScript, seen: i64) -> Super
 --- tested exactly. Each fork starts the next scripted worker and continues
 --- as its parent; no worker side runs. A worker ends once polled `polls`
 --- times, and `stop` ends it as stopped with its scripted usage. A fork past
---- the script fails, executables can be neither written nor run, errors
---- cannot be captured, and the process identifier is 1.
+--- the script fails, executables cannot be run, errors cannot be captured,
+--- and the process identifier is 1.
 pub(package) fn runtime_supervise_scripted<T, E>(
   script: Vector<SupervisedScript>,
   body: () -[Supervise, E]> T
@@ -443,8 +426,90 @@ pub(package) fn runtime_supervise_scripted<T, E>(
       )
     }
     Supervise.run(path, args, limit) -> resume(runtime_supervise_failed(ProcSpawnFailed(1)))
-    Supervise.write_executable(path, contents) -> resume(Err(IoPermissionDenied))
     Supervise.capture_errors(path) -> resume(Err(IoPermissionDenied))
     Supervise.process_id() -> resume(1)
+  }
+}
+
+-- Executable installation -------------------------------------------------
+--- Who may run an installed executable.
+pub(package) type ExecutableAccess {
+  --- Only its owner may read, write or run it.
+  ExecutableOwnerOnly,
+  --- Everyone the process's file-creation mask allows.
+  ExecutableShared
+}
+
+--- Authority to install native executables: files the platform will run.
+--- Writing data does not grant it. An installation is atomic and always
+--- makes a new file, so a program the platform has run or cached is never
+--- rewritten in place.
+pub(package) effect ExecutableInstall {
+  --- Replace `path` with an executable holding `contents`, readable and
+  --- runnable as `access` allows. A symbolic link at `path` is replaced,
+  --- not followed.
+  fn install(path: Path, contents: Bytes, access: ExecutableAccess) -> Result<nil, IoError>
+  --- Create an owner-only executable holding `contents` at a new path in
+  --- the temporary directory, and return it. The caller removes it.
+  fn install_temporary(contents: Bytes) -> Result<Path, IoError>
+}
+
+fn runtime_executable_install_at(
+  path: Path,
+  contents: Bytes,
+  access: ExecutableAccess
+) -> Result<nil, IoError> {
+  let policy = match access {
+    ExecutableOwnerOnly -> AtomicExactly(448)
+    ExecutableShared -> AtomicMasked(511)
+  }
+  match runtime_safe_file_replace_atomic(path, contents, policy) {
+    Ok(_) -> Ok(nil)
+    Err(error) -> Err(error)
+  }
+}
+
+-- A fresh name is claimed by exclusive creation, so nothing already at it,
+-- a symbolic link included, is ever opened.
+fn runtime_executable_install_temporary(contents: Bytes) -> Result<Path, IoError> {
+  let process = sys_proc_id()
+  for attempt in 0..64 {
+    let text = i"/tmp/weft-exec-{process}-{attempt}"
+    let fd = sys_open_write_create_new(runtime_str_cstring(text), 448)
+    if fd >= 0 {
+      let permission = sys_file_chmod(fd, 448)
+      let written = if permission < 0 { Err<usize, IoError>(io_error_from_errno(permission)) }
+      else { runtime_safe_write_fd(fd, contents) }
+      sys_close(fd)
+      match written {
+        Err(error) -> {
+          sys_remove(runtime_str_cstring(text))
+          return Err(error)
+        }
+        Ok(_) -> return match path.from_utf8(text) {
+          Ok(installed) -> Ok(installed)
+          Err(_) -> panic("temporary executable paths are text without NUL")
+        }
+      }
+    }
+    match io_error_from_errno(fd) {
+      IoAlreadyExists -> nil
+      error -> return Err(error)
+    }
+  }
+  Err(IoAlreadyExists)
+}
+
+--- Interpret `ExecutableInstall` over the host filesystem.
+pub(package) fn runtime_executable_install<T, E>(
+  body: () -[ExecutableInstall, E]> T
+) -[E]> T {
+  handle body() {
+    ExecutableInstall.install(target, contents, access) -> resume(
+      runtime_executable_install_at(target, contents, access)
+    )
+    ExecutableInstall.install_temporary(contents) -> resume(
+      runtime_executable_install_temporary(contents)
+    )
   }
 }
