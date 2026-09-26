@@ -14,38 +14,28 @@ use compiler/package/manifest.{*}
 use compiler/pipeline.{*}
 use compiler/sdk/identity.{weft_product_identity_json_render_with_sdk}
 use compiler/sdk/source.{sdk_source_load_required}
-use compiler/storage.{nlist_get, nlist_len, read_fd_all}
+use compiler/storage.{nlist_get, nlist_len}
 use compiler/weft/check/host_types as host_types
 use compiler/weft/check/host_types.{HostTypeIdentity}
 use compiler/weft/check/registration/scope.{RegistrationScope}
 use compiler/weft/products.{TypedModule}
 use compiler/weft/check/table.{ttable_sources}
-use runtime/alloc.{alloc_zeroed}
-use runtime/buffer.{buf_len, buf_ptr}
-use runtime/memory.{mem_load8_at, mem_load64_at, mem_store8_at}
-use runtime/sha256.{sha256}
+use runtime/memory.{mem_load64_at}
 use runtime/source_acquire.{SdkOrigin, SourceAcquire, EmbeddedSdk, CheckoutSdk, NoSdk}
-use runtime/string.{runtime_str_byte_at, runtime_str_cstring, runtime_str_from_bytes_copy}
-use runtime/dir_inspect as dir_inspect_handler
-use runtime/file_read as file_read_handler
-use runtime/syscall.{
-  sys_close,
-  sys_dir_mkdir,
-  sys_dir_remove_directory,
-  sys_open_read,
-  sys_open_write_create_new,
-  sys_proc_id,
-  sys_remove,
-  sys_rename,
-  sys_write
-}
+use runtime/string.{runtime_str_from_bytes_copy}
+use runtime/tool_platform.{ExecutableInstall, ExecutableOwnerOnly}
 use stdlib/bytes as bytes
-use stdlib/bytes.{Bytes, bytes_concat}
+use stdlib/bytes.{Bytes, bytes_concat, bytes_from_storage, bytes_storage}
+use stdlib/dir as dir
+use stdlib/dir.{DirInspect, DirMutate}
 use stdlib/diagnostic/schema.{*}
 use stdlib/file as file
+use stdlib/file.{FileRead, FileWrite}
+use stdlib/io/types.{IoAlreadyExists, IoError, IoInvalidPath}
 use stdlib/grammar.{CheckResult, Checked, CheckRejected}
 use stdlib/grammar/tooling.{ToolTypeIdentity, tool_type_identity, tool_type_identity_token}
 use stdlib/grammar/tooling/digest.{content_digest}
+use stdlib/grammar/tooling/driver.{io_error_name}
 use stdlib/grammar/tooling/protocol.{*}
 use stdlib/grammar/tooling/staging.{
   StagingArtifactMissing,
@@ -71,7 +61,7 @@ use stdlib/list.{List, Cons, Nil}
 use stdlib/option.{Option, Some, None}
 use stdlib/process.{*}
 use stdlib/result.{Result, Ok, Err}
-use stdlib/string.{str_concat, str_eq}
+use stdlib/string.{str_concat, str_eq, str_len, str_slice_bytes}
 use stdlib/time/monotonic.{Instant}
 use stdlib/typecheck.{*}
 use stdlib/vector as vector
@@ -158,16 +148,20 @@ fn root_manifest() -> i64 {
 
 --- The workspace lock, when present, so remote dependencies resolve to their
 --- cached roots exactly as the checker resolves them.
-fn root_lock() -> i64 {
-  let (ptr, len) = read_path("weft.lock")
-  if ptr == 0 or len == 0 { 0 } else { pkg_lock_parse(runtime_str_from_bytes_copy(ptr, len)) }
+fn root_lock() -[FileRead]> i64 {
+  match read_file("weft.lock") {
+    contents: Bytes -> if contents.is_empty() { 0 } else {
+      pkg_lock_parse(bytes_storage(contents))
+    }
+    nil -> 0
+  }
 }
 
 --- The manifests of the workspace's direct dependencies, each with the
 --- import prefix its modules are reached through. Only direct dependencies
 --- are importable by a root module, so they are the whole set a driver can
 --- name; a dependency whose root cannot be resolved contributes nothing.
-fn dependency_manifests(root: i64) -> List<(i64, str)> {
+fn dependency_manifests(root: i64) -[FileRead]> List<(i64, str)> {
   if root == 0 { Nil<(i64, str)>() } else {
     let lock = root_lock()
     let deps = pkg_manifest_deps(root)
@@ -193,14 +187,12 @@ fn split_qualified(name: str) -> (Option<str>, str) {
     None -> (None<str>(), name)
     Some(index) -> {
       let split = __u64_to_i64(__usize_to_u64(index))
-      (Some<str>(str_slice(name, 0, split)), str_slice(name, split + 1, __str_len(name)))
+      (Some<str>(str_slice(name, 0, split)), str_slice(name, split + 1, str_len(name)))
     }
   }
 }
 
-fn str_slice(text: str, start: i64, end: i64) -> str {
-  runtime_str_from_bytes_copy(__str_ptr(text) + start, end - start)
-}
+fn str_slice(text: str, start: i64, end: i64) -> str { str_slice_bytes(text, start, end - start) }
 
 fn find_in_manifest(m: i64, export: str, import_prefix: str) -> Option<GrammarToolExport> {
   if m == 0 { None<GrammarToolExport>() } else {
@@ -242,7 +234,8 @@ fn find_in_dependencies(
 --- dependencies (path dependencies directly, remote ones through the lock
 --- and cache). A bare name that more than one package exports is ambiguous
 --- and must be qualified as `package/export`.
-pub(package) fn grammar_tool_resolve(name: str) -[SourceAcquire]> GrammarToolResolution {
+pub(package) fn grammar_tool_resolve(name: str) -[SourceAcquire, FileRead]> GrammarToolResolution
+{
   let (qualifier, export) = split_qualified(name)
   let sdk = sdk_manifest()
   let root = root_manifest()
@@ -752,8 +745,7 @@ fn product_identity(compiler_digest: str) -[SourceAcquire]> str {
 }
 
 fn identity_tag(identity: str) -> str {
-  let digest = digest_raw(__str_ptr(identity), __str_len(identity))
-  str_slice(digest, 7, 19)
+  str_slice(content_digest(bytes.from_str(identity)), 7, 19)
 }
 
 --- Products are keyed by the identity that built them, so compilers that
@@ -777,71 +769,35 @@ pub(package) fn grammar_tool_product_path(
   product_stem(export, target, product_identity(compiler_digest))
 }
 
-fn ensure_directories(target: NativeLinkTarget) -> nil {
-  sys_dir_mkdir(runtime_str_cstring("target"), 493)
-  sys_dir_mkdir(runtime_str_cstring(str_concat("target/", native_link_target_name(target))), 493)
-  sys_dir_mkdir(runtime_str_cstring(grammar_tool_product_directory(target)), 493)
-  nil
+-- Create a directory unless it exists; creation that fails shows up when
+-- the first file inside it cannot be written.
+fn ensure_directory(directory: str) -[DirMutate]> nil {
+  match path.from_utf8(directory) {
+    Ok(native) -> {
+      dir.create(native)
+      nil
+    }
+    Err(_) -> nil
+  }
 }
 
-fn write_all(fd: i64, ptr: i64, len: i64) -> i64 {
-  let mut written = 0
-  let mut failed = 0
-  while written < len and failed == 0 {
-    let count = sys_write(fd, ptr + written, len - written)
-    if count <= 0 { failed = if count == 0 { 5 } else { 0 - count } } else {
-      written = written + count
+fn ensure_directories(target: NativeLinkTarget) -[DirMutate]> nil {
+  ensure_directory("target")
+  ensure_directory(str_concat("target/", native_link_target_name(target)))
+  ensure_directory(grammar_tool_product_directory(target))
+}
+
+--- Replace a file with text atomically, so a reader or a running driver
+--- never observes a partial file; concurrent builders of one product each
+--- publish a complete one.
+fn publish_text(target: str, text: str) -[FileWrite]> Result<nil, IoError> {
+  match path.from_utf8(target) {
+    Err(_) -> Err<nil, IoError>(IoInvalidPath)
+    Ok(native) -> match file.atomic_replace_text(native, text) {
+      Ok(_) -> Ok<nil, IoError>(nil)
+      Err(error) -> Err<nil, IoError>(error)
     }
   }
-  failed
-}
-
---- Claim a scratch file beside the final path that no other builder holds.
---- Returns the descriptor and the scratch path, or a negative descriptor
---- with the last error when no name could be claimed.
-fn claim_scratch(path: str, mode: i64, attempt: i64) -> (i64, str) {
-  let scratch = str_concat(path, str_concat(".tmp-", attempt.to_str()))
-  let fd = sys_open_write_create_new(runtime_str_cstring(scratch), mode)
-  if fd >= 0 or attempt >= 64 { (fd, scratch) } else {
-    claim_scratch(path, mode, attempt + 1)
-  }
-}
-
---- Write a file beside its final path and rename it into place, so a reader
---- or a running driver never observes a partial product; concurrent
---- builders of one product each publish a complete file.
-fn publish_file(path: str, ptr: i64, len: i64, mode: i64) -> i64 {
-  let (fd, scratch) = claim_scratch(path, mode, 0)
-  if fd < 0 { 0 - fd } else {
-    let status = write_all(fd, ptr, len)
-    sys_close(fd)
-    if status != 0 {
-      sys_remove(runtime_str_cstring(scratch))
-      status
-    } else {
-      let renamed = sys_rename(runtime_str_cstring(scratch), runtime_str_cstring(path))
-      if renamed < 0 {
-        sys_remove(runtime_str_cstring(scratch))
-        0 - renamed
-      } else { 0 }
-    }
-  }
-}
-
-fn hex_digit(value: i64) -> i64 { if value < 10 { 48 + value } else { 87 + value } }
-
-fn digest_raw(ptr: i64, len: i64) -> str {
-  let raw = alloc_zeroed(32)
-  sha256(ptr, len, raw)
-  let text = alloc_zeroed(71)
-  let prefix = "sha256:"
-  for index in 0..7 { mem_store8_at(text, index, runtime_str_byte_at(prefix, index)) }
-  for index in 0..32 {
-    let byte = mem_load8_at(raw, index)
-    mem_store8_at(text, 7 + index * 2, hex_digit(byte / 16))
-    mem_store8_at(text, 8 + index * 2, hex_digit(byte - byte / 16 * 16))
-  }
-  runtime_str_from_bytes_copy(text, 71)
 }
 
 fn sdk_owned_path(path: str) -> bool {
@@ -860,7 +816,12 @@ fn stamp_render(identity: str, driver_digest: str, product_digest: str, tt: i64)
     let path_len = mem_load64_at(entry + 24, 0)
     if path_len > 0 {
       let path = pkg_str_view(mem_load64_at(entry + 16, 0), path_len)
-      let content = digest_raw(mem_load64_at(entry, 0), mem_load64_at(entry + 8, 0))
+      -- Loaded sources are still read out of the legacy table's storage.
+      let content = content_digest(
+        bytes_from_storage(
+          runtime_str_from_bytes_copy(mem_load64_at(entry, 0), mem_load64_at(entry + 8, 0))
+        )
+      )
       items = Cons(
         json_object(
           Cons(
@@ -891,23 +852,34 @@ fn stamp_render(identity: str, driver_digest: str, product_digest: str, tt: i64)
   match json_stringify(document) { Ok(text) -> text, Err(_) -> "" }
 }
 
--- Read a whole file by path: (pointer, length), or a zero pointer when the
--- file cannot be opened.
-fn read_path(path: str) -> (i64, i64) {
-  let fd = sys_open_read(runtime_str_cstring(path))
-  if fd < 0 { (0, 0) } else {
-    let file = read_fd_all(fd)
-    sys_close(fd)
-    (mem_load64_at(file, 0), mem_load64_at(file, 8))
+-- Products, stamps and sources are read whole; the bound only refuses
+-- absurd files.
+fn file_limit() -> usize {
+  let limit: usize = 1073741824
+  limit
+}
+
+-- A whole file's bytes, or nil when it cannot be read.
+fn read_file(target: str) -[FileRead]> Bytes? {
+  let native = match path.from_utf8(target) {
+    Ok(value) -> value
+    Err(_) -> return nil
+  }
+  match file.read_all(native, file_limit()) {
+    Ok(contents) -> return contents
+    Err(_) -> return nil
+  }
+  nil
+}
+
+fn file_digest(target: str) -[FileRead]> Option<str> {
+  match read_file(target) {
+    contents: Bytes -> Some<str>(content_digest(contents))
+    nil -> None<str>()
   }
 }
 
-fn file_digest(path: str) -> Option<str> {
-  let (ptr, len) = read_path(path)
-  if ptr == 0 { None<str>() } else { Some<str>(digest_raw(ptr, len)) }
-}
-
-fn sources_current(items: List<Json>, embedded_sdk: bool) -> bool {
+fn sources_current(items: List<Json>, embedded_sdk: bool) -[FileRead]> bool {
   match items {
     Nil -> true
     Cons(item, rest) -> {
@@ -935,24 +907,25 @@ fn stamp_current(
   identity: str,
   driver_digest: str,
   embedded_sdk: bool
-) -> bool {
-  let (ptr, len) = read_path(stamp_path)
-  if ptr == 0 { false } else {
-    match json_parse(runtime_str_from_bytes_copy(ptr, len)) {
-      Err(_) -> false
-      Ok(document) ->
-        str_eq(json_object_get_str(document, "protocol", ""), protocol_name()) == 1 and
-        str_eq(json_object_get_str(document, "compiler", ""), identity) == 1 and
-        str_eq(json_object_get_str(document, "driver", ""), driver_digest) == 1 and
-        match file_digest(product_path) {
-          Some(actual) -> str_eq(actual, json_object_get_str(document, "product", "")) == 1
-          None -> false
-        } and
-        match json_object_get(document, "sources") {
-          Some(JsonArray(items)) -> sources_current(items, embedded_sdk)
-          _ -> false
-        }
-    }
+) -[FileRead]> bool {
+  let stamp = match read_file(stamp_path) {
+    contents: Bytes -> contents
+    nil -> return false
+  }
+  match json_parse(bytes_storage(stamp)) {
+    Err(_) -> false
+    Ok(document) ->
+      str_eq(json_object_get_str(document, "protocol", ""), protocol_name()) == 1 and
+      str_eq(json_object_get_str(document, "compiler", ""), identity) == 1 and
+      str_eq(json_object_get_str(document, "driver", ""), driver_digest) == 1 and
+      match file_digest(product_path) {
+        Some(actual) -> str_eq(actual, json_object_get_str(document, "product", "")) == 1
+        None -> false
+      } and
+      match json_object_get(document, "sources") {
+        Some(JsonArray(items)) -> sources_current(items, embedded_sdk)
+        _ -> false
+      }
   }
 }
 
@@ -978,10 +951,11 @@ fn executable_kind(target: NativeLinkTarget) -> i64 {
 --- built by a checkout compiler whose SDK identity carries no digest. An
 --- empty path yields an empty digest and the stamp relies on the SDK
 --- identity alone.
-pub(package) fn grammar_tool_compiler_digest(executable: str) -> str {
-  if __str_len(executable) == 0 { "" } else {
-    let (ptr, len) = read_path(executable)
-    if ptr == 0 { "" } else { digest_raw(ptr, len) }
+pub(package) fn grammar_tool_compiler_digest(executable: str) -[FileRead]> str {
+  if str_len(executable) == 0 { return "" }
+  match file_digest(executable) {
+    Some(digest) -> digest
+    None -> ""
   }
 }
 
@@ -992,11 +966,11 @@ pub(package) fn grammar_tool_ensure_product(
   export: GrammarToolExport,
   target: NativeLinkTarget,
   compiler_digest: str
-) -[SourceAcquire]> GrammarToolProduct {
+) -[SourceAcquire, FileRead, FileWrite, DirMutate, ExecutableInstall]> GrammarToolProduct {
   let identity = product_identity(compiler_digest)
   let embedded_sdk = match SourceAcquire.sdk_origin() { EmbeddedSdk(_) -> true, _ -> false }
   let source = grammar_tool_driver_source(export)
-  let driver_digest = digest_raw(__str_ptr(source), __str_len(source))
+  let driver_digest = content_digest(bytes.from_str(source))
   let stem = product_stem(export, target, identity)
   let stamp_path = str_concat(stem, ".stamp.json")
   let source_path = str_concat(stem, ".weft")
@@ -1004,7 +978,7 @@ pub(package) fn grammar_tool_ensure_product(
     GrammarToolProductReady(stem)
   } else {
     ensure_directories(target)
-    publish_file(source_path, __str_ptr(source), __str_len(source), 420)
+    publish_text(source_path, source)
     let messages = vector.new<str>()
     let checked = handle pipeline_check_source_with_diagnostics(
       __str_ptr(source),
@@ -1033,23 +1007,29 @@ pub(package) fn grammar_tool_ensure_product(
             "grammar tool driver did not link"
           )
           PipelineNativeProductReady(binary, facts) -> {
-            let output = pipeline_binary_buf(binary)
-            if pipeline_binary_kind(binary) != executable_kind(target) or buf_len(output) == 0 {
+            let output = pipeline_binary_bytes(binary)
+            if pipeline_binary_kind(binary) != executable_kind(target) or output.is_empty() {
               GrammarToolProductFailed("grammar tool driver is not a host executable")
             } else {
-              let product_digest = digest_raw(buf_ptr(output), buf_len(output))
-              let status = publish_file(stem, buf_ptr(output), buf_len(output), 448)
-              if status != 0 {
-                GrammarToolProductFailed("grammar tool driver product could not be written")
-              } else {
-                let stamp = stamp_render(
-                  identity,
-                  driver_digest,
-                  product_digest,
-                  typed_module_table(typed)
+              let product_digest = content_digest(output)
+              let installed = match path.from_utf8(stem) {
+                Ok(native) -> ExecutableInstall.install(native, output, ExecutableOwnerOnly)
+                Err(_) -> Err<nil, IoError>(IoInvalidPath)
+              }
+              match installed {
+                Err(_) -> GrammarToolProductFailed(
+                  "grammar tool driver product could not be written"
                 )
-                publish_file(stamp_path, __str_ptr(stamp), __str_len(stamp), 420)
-                GrammarToolProductReady(stem)
+                Ok(_) -> {
+                  let stamp = stamp_render(
+                    identity,
+                    driver_digest,
+                    product_digest,
+                    typed_module_table(typed)
+                  )
+                  publish_text(stamp_path, stamp)
+                  GrammarToolProductReady(stem)
+                }
               }
             }
           }
@@ -1607,7 +1587,7 @@ pub(package) fn grammar_tool_failure_message(failure: GrammarToolFailure) -> str
       str_concat(int_text(code), ")")
     )
     GrammarToolTimedOut -> "grammar tool driver did not answer before its deadline"
-    GrammarToolDriverEnded(text) -> if __str_len(text) == 0 {
+    GrammarToolDriverEnded(text) -> if str_len(text) == 0 {
       "grammar tool driver ended without a response"
     } else { str_concat("grammar tool driver ended without a response: ", text) }
     GrammarToolProtocol(error) -> error_message(error)
@@ -1625,7 +1605,7 @@ pub(package) fn grammar_tool_failure_message(failure: GrammarToolFailure) -> str
         ProcSignaled(signal) -> str_concat("was terminated by signal ", int_text(signal))
       }
       let head = str_concat("grammar tool driver answered but ", ending)
-      if __str_len(text) == 0 { head } else { str_concat(head, str_concat(": ", text)) }
+      if str_len(text) == 0 { head } else { str_concat(head, str_concat(": ", text)) }
     }
     GrammarToolStreamFailed(code) -> str_concat(
       "grammar tool session failed (error ",
@@ -1822,9 +1802,9 @@ pub(package) type GrammarStageOutcome {
   --- The driver reported an artifact the sink directory does not hold.
   GrammarStageVerifyFailed(StagingVerifyFailure),
   --- The private sink directory could not be created; the error follows.
-  GrammarStageSinkUnavailable(i64),
+  GrammarStageSinkUnavailable(IoError),
   --- The verified bytes could not be stored; the error follows.
-  GrammarStageStoreFailed(i64)
+  GrammarStageStoreFailed(IoError)
 }
 
 --- Where staged artifacts live for a target, content-addressed per export.
@@ -1842,37 +1822,50 @@ pub(package) fn grammar_tool_artifact_directory(
 
 fn stage_sink_root() -> str { ".weft/staging" }
 
--- One private directory per request: the process id and a build sequence
--- number, so concurrent builds and sequential sites never share one.
-fn stage_sink_directory(sequence: i64) -> Result<str, i64> {
-  sys_dir_mkdir(runtime_str_cstring(".weft"), 493)
-  sys_dir_mkdir(runtime_str_cstring(stage_sink_root()), 448)
-  let directory = stage_sink_root()
-    |> str_concat("/")
-    |> str_concat(sys_proc_id().to_str())
-    |> str_concat("-")
-    |> str_concat(sequence.to_str())
-  let status = sys_dir_mkdir(runtime_str_cstring(directory), 448)
-  if status < 0 { Err<str, i64>(0 - status) } else { Ok<str, i64>(directory) }
+-- One directory per request, claimed by exclusive creation: a name another
+-- build or an interrupted one already holds is skipped, so concurrent builds
+-- and sequential sites never share one.
+fn stage_sink_directory(sequence: i64) -[DirMutate]> Result<str, IoError> {
+  ensure_directory(".weft")
+  ensure_directory(stage_sink_root())
+  for attempt in 0..64 {
+    let directory = i"{stage_sink_root()}/{sequence}-{attempt}"
+    match path.from_utf8(directory) {
+      Err(_) -> return Err<str, IoError>(IoInvalidPath)
+      Ok(native) -> match dir.create(native) {
+        Ok(_) -> return Ok<str, IoError>(directory)
+        Err(IoAlreadyExists) -> nil
+        Err(error) -> return Err<str, IoError>(error)
+      }
+    }
+  }
+  Err<str, IoError>(IoAlreadyExists)
 }
 
-fn stage_sink_cleanup(directory: str) -> nil {
-  sys_remove(runtime_str_cstring(str_concat(directory, "/artifact")))
-  sys_dir_remove_directory(runtime_str_cstring(directory))
-  nil
+fn stage_sink_cleanup(directory: str) -[DirMutate]> nil {
+  match path.from_utf8(str_concat(directory, "/artifact")) {
+    Ok(artifact) -> {
+      dir.remove(artifact)
+      nil
+    }
+    Err(_) -> nil
+  }
+  match path.from_utf8(directory) {
+    Ok(sink) -> {
+      dir.remove(sink)
+      nil
+    }
+    Err(_) -> nil
+  }
 }
 
 fn stage_verify(
   directory: str,
   artifact: ToolStagedArtifact
-) -> Result<Bytes, StagingVerifyFailure> {
+) -[DirInspect, FileRead]> Result<Bytes, StagingVerifyFailure> {
   match path.from_utf8(directory) {
     Err(_) -> Err<Bytes, StagingVerifyFailure>(StagingArtifactMissing)
-    Ok(sink) -> with dir_inspect_handler() {
-      with file_read_handler() {
-        verify_artifact(sink, artifact.size, artifact.content, artifact.budget)
-      }
-    }
+    Ok(sink) -> verify_artifact(sink, artifact.size, artifact.content, artifact.budget)
   }
 }
 
@@ -1889,30 +1882,35 @@ fn stage_store(
   directory: str,
   target: NativeLinkTarget,
   export: GrammarToolExport,
-  artifact: ToolStagedArtifact
-) -> Result<str, i64> {
+  artifact: ToolStagedArtifact,
+  verified: Bytes
+) -[DirInspect, DirMutate, FileWrite]> Result<str, IoError> {
   ensure_directories(target)
-  sys_dir_mkdir(
-    runtime_str_cstring(
-      str_concat("target/", str_concat(native_link_target_name(target), "/grammar-artifacts"))
-    ),
-    493
+  ensure_directory(
+    str_concat("target/", str_concat(native_link_target_name(target), "/grammar-artifacts"))
   )
   let store_directory = grammar_tool_artifact_directory(target, export)
-  sys_dir_mkdir(runtime_str_cstring(store_directory), 493)
+  ensure_directory(store_directory)
   let store = str_concat(store_directory, str_concat("/", digest_hex(artifact.content)))
-  let (existing_ptr, existing_len) = read_path(store)
-  if existing_ptr != 0 { Ok<str, i64>(store) } else {
-    let sink_artifact = str_concat(directory, "/artifact")
-    let renamed = sys_rename(runtime_str_cstring(sink_artifact), runtime_str_cstring(store))
-    if renamed >= 0 { Ok<str, i64>(store) } else {
-      -- A store on another filesystem cannot take the rename; publish the
-      -- verified file's bytes beside the final path instead.
-      let (ptr, len) = read_path(sink_artifact)
-      if ptr == 0 { Err<str, i64>(0 - renamed) } else {
-        let status = publish_file(store, ptr, len, 420)
-        if status == 0 { Ok<str, i64>(store) } else { Err<str, i64>(status) }
-      }
+  let (sink_artifact, stored) = match (
+    path.from_utf8(str_concat(directory, "/artifact")),
+    path.from_utf8(store)
+  ) {
+    (Ok(from), Ok(to)) -> (from, to)
+    _ -> return Err<str, IoError>(IoInvalidPath)
+  }
+  let present = match dir.metadata(stored) {
+    Ok(metadata) -> metadata.exists
+    Err(_) -> false
+  }
+  if present { return Ok<str, IoError>(store) }
+  match dir.rename(sink_artifact, stored) {
+    Ok(_) -> Ok<str, IoError>(store)
+    -- A store on another filesystem cannot take the rename; publish the
+    -- verified bytes atomically in place instead.
+    Err(_) -> match file.atomic_replace(stored, verified) {
+      Ok(_) -> Ok<str, IoError>(store)
+      Err(error) -> Err<str, IoError>(error)
     }
   }
 }
@@ -1943,16 +1941,15 @@ fn stage_cache_directory(target: NativeLinkTarget, export: GrammarToolExport) ->
     |> str_concat(export.export)
 }
 
-fn stage_cache_ensure_directory(target: NativeLinkTarget, export: GrammarToolExport) -> nil {
+fn stage_cache_ensure_directory(
+  target: NativeLinkTarget,
+  export: GrammarToolExport
+) -[DirMutate]> nil {
   ensure_directories(target)
-  sys_dir_mkdir(
-    runtime_str_cstring(
-      str_concat("target/", str_concat(native_link_target_name(target), "/grammar-stage-cache"))
-    ),
-    493
+  ensure_directory(
+    str_concat("target/", str_concat(native_link_target_name(target), "/grammar-stage-cache"))
   )
-  sys_dir_mkdir(runtime_str_cstring(stage_cache_directory(target, export)), 493)
-  nil
+  ensure_directory(stage_cache_directory(target, export))
 }
 
 fn stage_cache_identity(
@@ -1960,7 +1957,7 @@ fn stage_cache_identity(
   export: GrammarToolExport,
   target: NativeLinkTarget,
   request: ToolRequest
-) -> GrammarStageCacheIdentity {
+) -[FileRead]> GrammarStageCacheIdentity {
   match (file_digest(product), encode_request(request)) {
     (Some(driver), Ok(request_document)) -> {
       let request_line = render_line(request_document)
@@ -1975,7 +1972,7 @@ fn stage_cache_identity(
       match json_stringify(identity_document) {
         Err(_) -> GrammarStageCacheIdentity { key: "", driver: "", request: "", path: "" }
         Ok(identity) -> {
-          let key = digest_raw(__str_ptr(identity), __str_len(identity))
+          let key = content_digest(bytes.from_str(identity))
           let directory = stage_cache_directory(target, export)
           GrammarStageCacheIdentity {
             key: key,
@@ -2001,8 +1998,7 @@ fn transcript_text(transcript: GrammarToolTranscript) -> str {
 
 fn transcript_digest(transcript: GrammarToolTranscript) -> str {
   if not transcript.complete { "" } else {
-    let text = transcript_text(transcript)
-    digest_raw(__str_ptr(text), __str_len(text))
+    content_digest(bytes.from_str(transcript_text(transcript)))
   }
 }
 
@@ -2158,40 +2154,40 @@ fn stage_cache_replays(
   )
 }
 
-fn stage_cache_observed_current(inputs: List<ToolObservedInput>) -> bool {
-  with file_read_handler() {
-    let mut remaining = inputs
-    let mut current = true
-    while current and not remaining.is_empty() {
-      match remaining {
-        Nil -> nil
-        Cons(input, rest) -> {
-          remaining = rest
-          current = match input.outcome {
-            ToolObservedFailure(_) -> false
-            ToolObservedContent(size, digest) -> match file.read_all(input.path, input.limit) {
-              Err(_) -> false
-              Ok(content) -> content.len() == size and str_eq(content_digest(content), digest) ==
-                1
-            }
+fn stage_cache_observed_current(inputs: List<ToolObservedInput>) -[FileRead]> bool {
+  let mut remaining = inputs
+  let mut current = true
+  while current and not remaining.is_empty() {
+    match remaining {
+      Nil -> nil
+      Cons(input, rest) -> {
+        remaining = rest
+        current = match input.outcome {
+          ToolObservedFailure(_) -> false
+          ToolObservedContent(size, digest) -> match file.read_all(input.path, input.limit) {
+            Err(_) -> false
+            Ok(content) -> content.len() == size and str_eq(content_digest(content), digest) ==
+              1
           }
-          nil
         }
+        nil
       }
     }
-    current
   }
+  current
 }
 
 fn stage_cache_artifact(
   artifact: ToolStagedArtifact,
   record: GrammarStageCacheRecord
-) -> Option<GrammarStagedArtifact> {
-  if artifact.budget > byte_ceiling() or record.store == "" { None<GrammarStagedArtifact>() }
+) -[FileRead]> Option<GrammarStagedArtifact> {
+  if artifact.budget > byte_ceiling() or str_len(record.store) == 0 {
+    None<GrammarStagedArtifact>()
+  }
   else {
     match path.from_utf8(record.store) {
       Err(_) -> None<GrammarStagedArtifact>()
-      Ok(store_path) -> with file_read_handler() {
+      Ok(store_path) -> {
         match file.read_all(store_path, artifact.budget) {
           Err(_) -> None<GrammarStagedArtifact>()
           Ok(content) -> if content.len() != artifact.size or
@@ -2224,7 +2220,7 @@ fn stage_cache_outcome(
   table: i64,
   source: i64,
   registrations: RegistrationScope
-) -> Option<GrammarStageOutcome> {
+) -[FileRead]> Option<GrammarStageOutcome> {
   if str_eq(record.transcript.request, identity.request) == 0 or
     not same_grammar(record.response.grammar, request.grammar) or
     not stage_cache_observed_current(record.response.observed_inputs) or
@@ -2269,12 +2265,12 @@ fn stage_cache_lookup(
   table: i64,
   source: i64,
   registrations: RegistrationScope
-) -> Option<GrammarStageOutcome> {
+) -[FileRead]> Option<GrammarStageOutcome> {
   if identity.path.len() == __i64_to_usize(0) { None<GrammarStageOutcome>() }
   else {
     match path.from_utf8(identity.path) {
       Err(_) -> None<GrammarStageOutcome>()
-      Ok(record_path) -> with file_read_handler() {
+      Ok(record_path) -> {
         match file.read_all(record_path, transcript_ceiling() * __i64_to_usize(3)) {
           Err(_) -> None<GrammarStageOutcome>()
           Ok(content) -> match content.to_utf8() {
@@ -2302,14 +2298,14 @@ fn stage_cache_publish(
   export: GrammarToolExport,
   target: NativeLinkTarget,
   record: GrammarStageCacheRecord
-) -> nil {
+) -[FileRead, FileWrite, DirMutate]> nil {
   if identity.path.len() > __i64_to_usize(0) and record.transcript.complete and
     stage_cache_observed_current(record.response.observed_inputs) {
       match stage_cache_render(identity, record) {
         None -> nil
         Some(text) -> {
           stage_cache_ensure_directory(target, export)
-          publish_file(identity.path, __str_ptr(text), __str_len(text), 420)
+          publish_text(identity.path, text)
           nil
         }
       }
@@ -2333,7 +2329,7 @@ pub(package) fn grammar_tool_stage(
   registrations: RegistrationScope,
   sequence: i64,
   deadline: Instant
-) -[Proc]> GrammarStageOutcome {
+) -[Proc, FileRead, FileWrite, DirInspect, DirMutate]> GrammarStageOutcome {
   let grammar = grammar_tool_identity(export)
   match export.capability {
     StagingValidateOnly -> {
@@ -2408,7 +2404,7 @@ pub(package) fn grammar_tool_stage(
           Err(code) -> GrammarStageSinkUnavailable(code)
           Ok(directory) -> {
             let outcome = match path.from_utf8(directory) {
-              Err(_) -> GrammarStageSinkUnavailable(22)
+              Err(_) -> GrammarStageSinkUnavailable(IoInvalidPath)
               Ok(sink) -> {
                 let request = semantic_request.{
                   operation: ToolOperationStage(
@@ -2435,7 +2431,7 @@ pub(package) fn grammar_tool_stage(
                     } else {
                       match stage_verify(directory, artifact) {
                         Err(failure) -> GrammarStageVerifyFailed(failure)
-                        Ok(bytes) -> match stage_store(directory, target, export, artifact) {
+                        Ok(bytes) -> match stage_store(directory, target, export, artifact, bytes) {
                           Err(code) -> GrammarStageStoreFailed(code)
                           Ok(store) -> {
                             let record = GrammarStageCacheRecord {
@@ -2525,13 +2521,8 @@ pub(package) fn grammar_stage_failure_message(outcome: GrammarStageOutcome) -> s
       StagingSizeMismatch(_, _) -> "the artifact's size is not the size the driver reported"
       StagingDigestMismatch(_, _) -> "the artifact's digest is not the digest the driver reported"
     }
-    GrammarStageSinkUnavailable(code) -> str_concat(
-      "the staging directory could not be created (error ",
-      str_concat(int_text(code), ")")
-    )
-    GrammarStageStoreFailed(code) -> str_concat(
-      "the artifact could not be stored (error ",
-      str_concat(int_text(code), ")")
-    )
+    GrammarStageSinkUnavailable(error) ->
+      i"the staging directory could not be created ({io_error_name(error)})"
+    GrammarStageStoreFailed(error) -> i"the artifact could not be stored ({io_error_name(error)})"
   }
 }
