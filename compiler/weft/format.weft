@@ -10,11 +10,13 @@ use compiler/weft/format/config as format_config
 use stdlib/grammar.{Grammar, Parsed, Recovered, Rejected}
 use stdlib/source.{Source}
 use compiler/weft/lex.{*}
-use compiler/storage.{src_eq_at}
 use compiler/weft/check/table.{ttable_register_source}
-use runtime/buffer.{*}
-use runtime/memory.{mem_load8_at}
 use runtime/string.{runtime_str_from_bytes_copy}
+use stdlib/num
+use stdlib/option.{None, Some}
+use stdlib/string.{str_byte_at, str_len}
+use stdlib/string/builder as builder
+use stdlib/string/builder.{Builder}
 use stdlib/diagnostic/schema.{*}
 use stdlib/vector as vector
 use stdlib/vector.{*}
@@ -71,24 +73,48 @@ fn formatter_token_ranges_are_lossless(tokens: i64, source_len: i64) -> bool {
   valid
 }
 
-fn formatter_gap_is_attached_trivia(src: i64, start: i64, end: i64) -> bool {
-  let mut i = start
-  let mut attached = false
-  while i < end and not attached {
-    -- Line terminators are compared as bytes: a source-literal escape would
-    -- make this predicate depend on the very lexer stage it inspects.
-    let byte = mem_load8_at(src, i)
-    if byte == 10 or byte == 13 {
-      attached = true
-    } else {
-      if i + 1 < end and src_eq_at(src, i, __str_ptr("--"), 0, 2) == 1 {
-        attached = true
-      } else {
-        i = i + 1
-      }
-    }
+-- Whether a gap holds a line break or a comment. Line terminators are
+-- compared as bytes: a source-literal escape would make this predicate depend
+-- on the very lexer stage it inspects.
+fn formatter_gap_is_attached_trivia(text: str, start: i64, end: i64) -> bool {
+  for i in start..end {
+    let byte = str_byte_at(text, i)
+    if byte == 10 or byte == 13 { return true }
+    if byte == 45 and i + 1 < end and str_byte_at(text, i + 1) == 45 { return true }
   }
-  attached
+  false
+}
+
+fn formatter_output_byte(out: borrow Builder, index: i64) -> i64 {
+  match out.byte_at(index.to_usize_checked().unwrap_or(0)) {
+    Some(byte) -> byte.to_u64().to_i64_checked().unwrap_or(0)
+    None -> 0
+  }
+}
+
+fn formatter_output_length(out: borrow Builder) -> i64 {
+  out.len().to_u64().to_i64_checked().unwrap_or(0)
+}
+
+-- The same test over what the renderer wrote since `start`.
+fn formatter_output_is_attached_trivia(out: borrow Builder, start: i64) -> bool {
+  let end = formatter_output_length(out)
+  for i in start..end {
+    let byte = formatter_output_byte(out, i)
+    if byte == 10 or byte == 13 { return true }
+    if byte == 45 and i + 1 < end and formatter_output_byte(out, i + 1) == 45 { return true }
+  }
+  false
+}
+
+-- Append source bytes `[start, start + length)`, which lie on scalar
+-- boundaries: token edges and ASCII trivia delimiters.
+fn formatter_copy(out: borrow mut Builder, text: str, start: i64, length: i64) -> nil {
+  out.append_range(
+    text,
+    start.to_usize_checked().expect("source offsets are nonnegative"),
+    (start + length).to_usize_checked().expect("source offsets are nonnegative")
+  )
 }
 
 fn formatter_next_source_token(tokens: i64, current: i64) -> i64 {
@@ -129,42 +155,33 @@ fn formatter_gap_indent_depth(tokens: i64, previous: i64, current: i64, depth: i
   base + 1
 }
 
-fn formatter_append_indent(out: i64, depth: i64) -> i64 {
-  let mut i = 0
-  while i < depth * 2 {
-    bu8(out, 32)
-    i = i + 1
-  }
-  out
+fn formatter_append_indent(out: borrow mut Builder, depth: i64) -> nil {
+  for i in 0..depth { out.append("  ") }
 }
 
-fn formatter_gap_is_hspace(src: i64, index: i64) -> bool {
-  let byte = mem_load8_at(src, index)
+fn formatter_gap_is_hspace(text: str, index: i64) -> bool {
+  let byte = str_byte_at(text, index)
   byte == 32 or byte == 9
 }
 
-fn formatter_gap_is_newline(src: i64, index: i64) -> bool {
-  let byte = mem_load8_at(src, index)
+fn formatter_gap_is_newline(text: str, index: i64) -> bool {
+  let byte = str_byte_at(text, index)
   byte == 10 or byte == 13
 }
 
-fn formatter_comment_end(src: i64, start: i64, end: i64) -> i64 {
+fn formatter_comment_end(text: str, start: i64, end: i64) -> i64 {
   let mut i = start
-  while i < end and not formatter_gap_is_newline(src, i) { i = i + 1 }
+  while i < end and not formatter_gap_is_newline(text, i) { i = i + 1 }
   i
 }
 
-fn formatter_gap_has_comment(src: i64, start: i64, end: i64) -> bool {
-  let mut i = start
-  let mut found = false
-  while i < end and not found {
-    if formatter_gap_is_hspace(src, i) or formatter_gap_is_newline(src, i) {
-      i = i + 1
-    } else {
-      found = true
+fn formatter_gap_has_comment(text: str, start: i64, end: i64) -> bool {
+  for i in start..end {
+    if not formatter_gap_is_hspace(text, i) and not formatter_gap_is_newline(text, i) {
+      return true
     }
   }
-  found
+  false
 }
 
 fn formatter_top_level_role(tokens: i64, current: i64) -> i64 {
@@ -184,21 +201,21 @@ fn formatter_gap_follows_synthetic_semicolon(tokens: i64, previous: i64, current
     tok_span(tokens, previous) == tok_span(tokens, current)
 }
 
-fn formatter_append_source_newline(out: i64, src: i64, start: i64, end: i64) -> i64 {
+-- Append the gap's first line break in its source spelling, or `\n` when
+-- the gap has none.
+fn formatter_append_source_newline(
+  out: borrow mut Builder,
+  text: str,
+  start: i64,
+  end: i64
+) -> nil {
   let mut i = start
-  while i < end and not formatter_gap_is_newline(src, i) { i = i + 1 }
-  if i >= end {
-    bstr(out, "\n")
-  } else {
-    if mem_load8_at(src, i) == 13 {
-      bscopy(out, src + i, 1, 0)
-      if i + 1 < end and mem_load8_at(src, i + 1) == 10 { bscopy(out, src + i + 1, 1, 0) } else {
-        out
-      }
-    } else {
-      bscopy(out, src + i, 1, 0)
-    }
-  }
+  while i < end and not formatter_gap_is_newline(text, i) { i = i + 1 }
+  if i >= end { out.append("\n") }
+  else if str_byte_at(text, i) == 13 {
+    out.append("\r")
+    if i + 1 < end and str_byte_at(text, i + 1) == 10 { out.append("\n") }
+  } else { out.append("\n") }
 }
 
 fn formatter_top_level_newline_count(current_role: i64, previous_role: i64) -> i64 {
@@ -206,46 +223,47 @@ fn formatter_top_level_newline_count(current_role: i64, previous_role: i64) -> i
     tok_syntax_role_top_level_import() { 1 } else { 2 }
 }
 
-fn formatter_append_newlines(out: i64, src: i64, start: i64, end: i64, count: i64) -> i64 {
-  let mut i = 0
-  while i < count {
-    formatter_append_source_newline(out, src, start, end)
-    i = i + 1
-  }
-  out
+fn formatter_append_newlines(
+  out: borrow mut Builder,
+  text: str,
+  start: i64,
+  end: i64,
+  count: i64
+) -> nil {
+  for i in 0..count { formatter_append_source_newline(out, text, start, end) }
 }
 
 fn formatter_append_top_level_gap(
-  out: i64,
-  src: i64,
+  out: borrow mut Builder,
+  text: str,
   start: i64,
   end: i64,
   current_role: i64,
   previous_role: i64
-) -> i64 {
-  if previous_role == 0 { return out } else { 0 }
+) -> nil {
+  if previous_role == 0 { return nil }
   formatter_append_newlines(
     out,
-    src,
+    text,
     start,
     end,
     formatter_top_level_newline_count(current_role, previous_role)
   )
 }
 
-fn formatter_comment_is_doc(src: i64, start: i64, end: i64) -> bool {
-  start + 2 < end and mem_load8_at(src, start) == 45 and mem_load8_at(src, start + 1) == 45 and
-    mem_load8_at(src, start + 2) == 45
+fn formatter_comment_is_doc(text: str, start: i64, end: i64) -> bool {
+  start + 2 < end and str_byte_at(text, start) == 45 and str_byte_at(text, start + 1) == 45 and
+    str_byte_at(text, start + 2) == 45
 }
 
 fn formatter_append_top_level_comment_gap(
-  out: i64,
-  src: i64,
+  out: borrow mut Builder,
+  text: str,
   start: i64,
   end: i64,
   current_role: i64,
   previous_role: i64
-) -> i64 {
+) -> nil {
   let separation = formatter_top_level_newline_count(current_role, previous_role)
   let mut i = start
   let mut saw_source_newline = false
@@ -253,41 +271,41 @@ fn formatter_append_top_level_comment_gap(
   let mut first_inline = false
   let mut last_leading_is_doc = true
   while i < end {
-    if formatter_gap_is_hspace(src, i) {
+    if formatter_gap_is_hspace(text, i) {
       i = i + 1
     } else {
-      if formatter_gap_is_newline(src, i) {
-        if mem_load8_at(src, i) == 13 and i + 1 < end and mem_load8_at(src, i + 1) == 10 {
+      if formatter_gap_is_newline(text, i) {
+        if str_byte_at(text, i) == 13 and i + 1 < end and str_byte_at(text, i + 1) == 10 {
           i = i + 2
         } else { i = i + 1 }
         saw_source_newline = true
       } else {
-        let comment_is_doc = formatter_comment_is_doc(src, i, end)
+        let comment_is_doc = formatter_comment_is_doc(text, i, end)
         if not saw_comment {
           first_inline = previous_role != 0 and not saw_source_newline
           if first_inline {
-            bstr(out, " ")
+            out.append(" ")
           } else {
             if previous_role != 0 {
-              formatter_append_newlines(out, src, start, end, separation)
-            } else { 0 }
+              formatter_append_newlines(out, text, start, end, separation)
+            } else { nil }
           }
         } else {
           -- A leading ordinary-comment run is the module header. Separate a
           -- following doc-comment run here, before it, so the docs remain
           -- adjacent to the declaration they describe.
           if previous_role == 0 and comment_is_doc and not last_leading_is_doc {
-            formatter_append_source_newline(out, src, start, end)
-          } else { 0 }
+            formatter_append_source_newline(out, text, start, end)
+          } else { nil }
         }
-        if previous_role == 0 { last_leading_is_doc = comment_is_doc } else { 0 }
-        let comment_end = formatter_comment_end(src, i, end)
-        bscopy(out, src + i, comment_end - i, 0)
-        formatter_append_source_newline(out, src, start, end)
+        if previous_role == 0 { last_leading_is_doc = comment_is_doc } else { nil }
+        let comment_end = formatter_comment_end(text, i, end)
+        formatter_copy(out, text, i, comment_end - i)
+        formatter_append_source_newline(out, text, start, end)
         i = comment_end
         if not saw_comment and first_inline and separation > 1 {
-          formatter_append_newlines(out, src, start, end, separation - 1)
-        } else { 0 }
+          formatter_append_newlines(out, text, start, end, separation - 1)
+        } else { nil }
         saw_comment = true
         saw_source_newline = true
       }
@@ -296,13 +314,13 @@ fn formatter_append_top_level_comment_gap(
   -- Ordinary leading comments form a module header; doc comments attach
   -- directly to the first declaration/import.
   if previous_role == 0 and not last_leading_is_doc {
-    formatter_append_source_newline(out, src, start, end)
-  } else { out }
+    formatter_append_source_newline(out, text, start, end)
+  } else { nil }
 }
 
 fn formatter_append_trivia_gap(
-  out: i64,
-  src: i64,
+  out: borrow mut Builder,
+  text: str,
   start: i64,
   end: i64,
   tokens: i64,
@@ -310,7 +328,7 @@ fn formatter_append_trivia_gap(
   current: i64,
   depth: i64,
   target_depth: i64
-) -> i64 {
+) -> nil {
   let next = formatter_next_source_token(tokens, current)
   let comment_depth = if next < tok_count(tokens) and tok_tag(tokens, next) == 5 and tok_v1(
     tokens,
@@ -319,39 +337,39 @@ fn formatter_append_trivia_gap(
   let mut i = start
   let mut line_start = previous < 0
   while i < end {
-    if formatter_gap_is_hspace(src, i) {
+    if formatter_gap_is_hspace(text, i) {
       -- Horizontal trivia is reconstructed at the next comment/token edge.
       i = i + 1
     } else {
-      if not formatter_gap_is_newline(src, i) {
+      if not formatter_gap_is_newline(text, i) {
         -- The lexer has already proved this gap is trivia. Treat every
         -- non-whitespace run as opaque comment text so future trivia forms and
         -- arbitrary comment bytes can never be rewritten destructively.
-        if line_start { formatter_append_indent(out, comment_depth) } else { bstr(out, " ") }
-        let comment_end = formatter_comment_end(src, i, end)
-        bscopy(out, src + i, comment_end - i, 0)
+        if line_start { formatter_append_indent(out, comment_depth) } else { out.append(" ") }
+        let comment_end = formatter_comment_end(text, i, end)
+        formatter_copy(out, text, i, comment_end - i)
         i = comment_end
         line_start = false
       } else {
-        if mem_load8_at(src, i) == 13 {
-          bscopy(out, src + i, 1, 0)
+        if str_byte_at(text, i) == 13 {
+          formatter_copy(out, text, i, 1)
           i = i + 1
-          if i < end and mem_load8_at(src, i) == 10 {
-            bscopy(out, src + i, 1, 0)
+          if i < end and str_byte_at(text, i) == 10 {
+            formatter_copy(out, text, i, 1)
             i = i + 1
-          } else { 0 }
+          } else { nil }
           line_start = true
         } else {
-          if mem_load8_at(src, i) == 10 {
-            bscopy(out, src + i, 1, 0)
+          if str_byte_at(text, i) == 10 {
+            formatter_copy(out, text, i, 1)
             i = i + 1
             line_start = true
-          } else { 0 }
+          } else { nil }
         }
       }
     }
   }
-  if line_start { formatter_append_indent(out, target_depth) } else { out }
+  if line_start { formatter_append_indent(out, target_depth) } else { nil }
 }
 
 fn formatter_punct_attaches_left(value: i64) -> bool {
@@ -416,8 +434,8 @@ fn formatter_gap_wants_space(tokens: i64, previous: i64, current: i64) -> bool {
 }
 
 fn formatter_append_gap(
-  out: i64,
-  src: i64,
+  out: borrow mut Builder,
+  text: str,
   start: i64,
   end: i64,
   tokens: i64,
@@ -428,17 +446,17 @@ fn formatter_append_gap(
   target_depth: i64,
   line_break: bool,
   newline: str
-) -> i64 {
+) -> nil {
   let top_level_role = if depth == 0 { formatter_top_level_role(tokens, current) } else { 0 }
   if top_level_role != 0 and not formatter_gap_follows_synthetic_semicolon(
     tokens,
     previous,
     current
   ) {
-    if formatter_gap_has_comment(src, start, end) {
+    if formatter_gap_has_comment(text, start, end) {
       return formatter_append_top_level_comment_gap(
         out,
-        src,
+        text,
         start,
         end,
         top_level_role,
@@ -447,35 +465,33 @@ fn formatter_append_gap(
     } else {
       return formatter_append_top_level_gap(
         out,
-        src,
+        text,
         start,
         end,
         top_level_role,
         previous_top_level_role
       )
     }
-  } else { 0 }
-  if formatter_gap_follows_synthetic_semicolon(tokens, previous, current) { return out } else {
-    0
-  }
-  if line_break and not formatter_gap_is_attached_trivia(src, start, end) {
-    bstr(out, newline)
+  } else { nil }
+  if formatter_gap_follows_synthetic_semicolon(tokens, previous, current) { return nil }
+  if line_break and not formatter_gap_is_attached_trivia(text, start, end) {
+    out.append(newline)
     return formatter_append_indent(out, target_depth)
-  } else { 0 }
+  } else { nil }
   -- Adjacent source tokens still need the canonical gap selected by their
   -- grammar roles. Returning early here preserved missing whitespace
   -- (`name:Type=value`, `fn main()->T`) and made formatting depend on whether
   -- the author had already inserted a byte for us to replace.
   if end <= start {
-    if formatter_gap_wants_space(tokens, previous, current) { bstr(out, " ") } else { out }
-    return out
-  } else { 0 }
-  if formatter_gap_is_attached_trivia(src, start, end) {
+    if formatter_gap_wants_space(tokens, previous, current) { out.append(" ") } else { nil }
+    return nil
+  } else { nil }
+  if formatter_gap_is_attached_trivia(text, start, end) {
     -- Rebuild only whitespace around comments; comment bytes and newline
     -- spelling/count retain exact source order.
     return formatter_append_trivia_gap(
       out,
-      src,
+      text,
       start,
       end,
       tokens,
@@ -484,10 +500,10 @@ fn formatter_append_gap(
       depth,
       target_depth
     )
-  } else { 0 }
+  } else { nil }
   if formatter_gap_wants_space(tokens, previous, current) {
-    bstr(out, " ")
-  } else { out }
+    out.append(" ")
+  } else { nil }
 }
 
 type FormatterLayout {
@@ -508,44 +524,53 @@ type FormatterFrame {
   depth: i64
 }
 
-fn formatter_newline(src: i64, length: i64) -> str {
-  let mut i = 0
-  while i < length {
-    let byte = mem_load8_at(src, i)
+fn formatter_newline(text: str, length: i64) -> str {
+  for i in 0..length {
+    let byte = str_byte_at(text, i)
     if byte == 10 { return "\n" }
-    else if byte == 13 {
-      if i + 1 < length and mem_load8_at(src, i + 1) == 10 { return "\r\n" }
-      else { return "\r" }
-    } else { i = i + 1 }
+    if byte == 13 {
+      return if i + 1 < length and str_byte_at(text, i + 1) == 10 { "\r\n" } else { "\r" }
+    }
   }
   "\n"
 }
 
 -- Width counts Unicode scalars, not UTF-8 bytes. Literal/comment payloads
 -- remain indivisible; a newline inside such a token resets the actual column.
-fn formatter_column_after(src: i64, start: i64, end: i64, initial: i64) -> i64 {
+-- This reads what the renderer wrote since `start`.
+fn formatter_column_after(out: borrow Builder, start: i64, initial: i64) -> i64 {
   let mut column = initial
-  for i in start..end {
-    let byte = mem_load8_at(src, i)
+  for i in start..formatter_output_length(out) {
+    let byte = formatter_output_byte(out, i)
     if byte == 10 or byte == 13 { column = 0 }
     else if byte < 128 or byte >= 192 { column = column + 1 }
-    else { 0 }
   }
   column
 }
 
-fn formatter_scalar_width(src: i64, start: i64, end: i64) -> i64 {
+-- The same column over source bytes `[start, end)`.
+fn formatter_source_column_after(text: str, start: i64, end: i64, initial: i64) -> i64 {
+  let mut column = initial
+  for i in start..end {
+    let byte = str_byte_at(text, i)
+    if byte == 10 or byte == 13 { column = 0 }
+    else if byte < 128 or byte >= 192 { column = column + 1 }
+  }
+  column
+}
+
+fn formatter_scalar_width(text: str, start: i64, end: i64) -> i64 {
   let mut width = 0
   for i in start..end {
-    let byte = mem_load8_at(src, i)
-    if byte < 128 or byte >= 192 { width = width + 1 } else { 0 }
+    let byte = str_byte_at(text, i)
+    if byte < 128 or byte >= 192 { width = width + 1 }
   }
   width
 }
 
 -- Match only parser-published groups. Prefix widths and next-break indices
 -- make every rendering decision constant-time, including deeply nested heads.
-fn formatter_layout(src: i64, source_len: i64, tokens: i64) -> FormatterLayout {
+fn formatter_layout(text: str, source_len: i64, tokens: i64) -> FormatterLayout {
   let count = tok_count(tokens)
   let capacity = __i64_to_usize(count)
   let group_ends = vector.with_capacity<i64>(capacity)
@@ -569,14 +594,14 @@ fn formatter_layout(src: i64, source_len: i64, tokens: i64) -> FormatterLayout {
     let start = tok_span(tokens, i)
     let end = tok_end(tokens, i)
     while offset < start {
-      let byte = mem_load8_at(src, offset)
+      let byte = str_byte_at(text, offset)
       if byte == 10 or byte == 13 { line = line + 1 } else { 0 }
       offset = offset + 1
     }
     vector_push(lines, line)
     if end > start {
       if formatter_gap_wants_space(tokens, previous, i) { width = width + 1 } else { 0 }
-      width = width + formatter_scalar_width(src, start, end)
+      width = width + formatter_scalar_width(text, start, end)
       previous = i
     } else { 0 }
     vector_push(prefix, width)
@@ -607,24 +632,24 @@ fn formatter_layout(src: i64, source_len: i64, tokens: i64) -> FormatterLayout {
     prefix: prefix,
     lines: lines,
     next_break: next_break,
-    newline: formatter_newline(src, source_len)
+    newline: formatter_newline(text, source_len)
   }
 }
 
-pub(package) fn formatter_render_tokens(src: i64, source_len: i64, tokens: i64) -> str {
-  formatter_render_tokens_with_config(src, source_len, tokens, format_config.defaults())
+pub(package) fn formatter_render_tokens(text: str, tokens: i64) -> str {
+  formatter_render_tokens_with_config(text, tokens, format_config.defaults())
 }
 
 pub(package) fn formatter_render_tokens_with_config(
-  src: i64,
-  source_len: i64,
+  text: str,
   tokens: i64,
   config: format_config.Config
 ) -> str {
-  let out = buf_new(source_len + 32)
+  let source_len = str_len(text)
+  let mut out = builder.with_capacity((source_len + 32).to_usize_checked().expect("lengths fit"))
   let count = tok_count(tokens)
   let { group_ends, signature_ends, prefix, lines, next_break, newline } = formatter_layout(
-    src,
+    text,
     source_len,
     tokens
   )
@@ -684,10 +709,10 @@ pub(package) fn formatter_render_tokens_with_config(
         else { layout_depth + 1 }
       } else { 0 }
     } else { 0 }
-    let before_gap = buf_len(out)
+    let before_gap = formatter_output_length(out)
     formatter_append_gap(
       out,
-      src,
+      text,
       previous_end,
       start,
       tokens,
@@ -699,13 +724,14 @@ pub(package) fn formatter_render_tokens_with_config(
       line_break,
       newline
     )
-    if formatter_gap_is_attached_trivia(buf_ptr(out), before_gap, buf_len(out)) {
-      line_indent = target_depth
-    } else { 0 }
+    if formatter_output_is_attached_trivia(out, before_gap) { line_indent = target_depth }
+    -- Only the synthesized gap is read back; the token's width comes from
+    -- the source bytes it copies.
+    column = formatter_column_after(out, before_gap, column)
     if end > start {
-      bscopy(out, src + start, end - start, 0)
-    } else { 0 }
-    column = formatter_column_after(buf_ptr(out), before_gap, buf_len(out), column)
+      formatter_copy(out, text, start, end - start)
+      column = formatter_source_column_after(text, start, end, column)
+    }
     if vector_len(frames) > 0 and vector_get_in_bounds(frames, vector_len(frames) - 1).close ==
       i {
         vector_pop(frames)
@@ -749,24 +775,27 @@ pub(package) fn formatter_render_tokens_with_config(
     } else { 0 }
     previous = i
   }
-  runtime_str_from_bytes_copy(buf_ptr(out), buf_len(out))
+  out.finish()
 }
 
 fn formatter_token_text_equal(
-  left_src: i64,
+  left: str,
   left_tokens: i64,
   left_index: i64,
-  right_src: i64,
+  right: str,
   right_tokens: i64,
   right_index: i64
 ) -> bool {
   let left_start = tok_span(left_tokens, left_index)
   let left_len = tok_end(left_tokens, left_index) - left_start
   let right_start = tok_span(right_tokens, right_index)
-  let right_len = tok_end(right_tokens, right_index) - right_start
-  left_len == right_len and (
-    left_len == 0 or src_eq_at(left_src, left_start, right_src + right_start, 0, left_len) == 1
-  )
+  if tok_end(right_tokens, right_index) - right_start != left_len { return false }
+  for offset in 0..left_len {
+    if str_byte_at(left, left_start + offset) != str_byte_at(right, right_start + offset) {
+      return false
+    }
+  }
+  true
 }
 
 fn formatter_token_payload_equal(
@@ -785,9 +814,9 @@ fn formatter_token_payload_equal(
 }
 
 pub(package) fn formatter_tokens_equivalent(
-  left_src: i64,
+  left: str,
   left_tokens: i64,
-  right_src: i64,
+  right: str,
   right_tokens: i64
 ) -> bool {
   let left_count = tok_count(left_tokens)
@@ -830,10 +859,10 @@ pub(package) fn formatter_tokens_equivalent(
           same = false
         } else {
           if not formatter_token_text_equal(
-            left_src,
+            left,
             left_tokens,
             left_i,
-            right_src,
+            right,
             right_tokens,
             right_i
           ) {
@@ -847,6 +876,10 @@ pub(package) fn formatter_tokens_equivalent(
   }
   same
 }
+
+-- The legacy lexer and diagnostic spans still address retained text by its
+-- storage; the text itself stays alive for the whole formatting call.
+fn formatter_source_address(text: str) -> i64 { __str_ptr(text) }
 
 -- Parse under an audit handler that forwards every structured diagnostic to
 -- the caller while retaining only the fatal count needed for fail-closed
@@ -908,8 +941,9 @@ pub(package) fn formatter_format_text_with_config(
     Recovered(_) -> FormatterFailure(if count > 0 { count } else { 1 })
     Rejected -> FormatterFailure(if count > 0 { count } else { 1 })
     Parsed(syntax) -> {
-      let src = __str_ptr(source.text)
-      let n = __str_len(source.text)
+      let text = source.text
+      let src = formatter_source_address(text)
+      let n = str_len(text)
       let tokens = syntax.tokens
       if count > 0 {
         FormatterFailure(count)
@@ -918,11 +952,9 @@ pub(package) fn formatter_format_text_with_config(
           Diagnose.error("formatter: invalid lossless token range", src)
           FormatterFailure(1)
         } else {
-          let formatted = formatter_render_tokens_with_config(src, n, tokens, config)
-          let formatted_src = __str_ptr(formatted)
-          let formatted_len = __str_len(formatted)
-          let formatted_tokens = lex(formatted_src, formatted_len)
-          if formatter_tokens_equivalent(src, tokens, formatted_src, formatted_tokens) {
+          let formatted = formatter_render_tokens_with_config(text, tokens, config)
+          let formatted_tokens = lex(formatter_source_address(formatted), str_len(formatted))
+          if formatter_tokens_equivalent(text, tokens, formatted, formatted_tokens) {
             FormatterSuccess(formatted)
           } else {
             Diagnose.error("formatter: token-preservation check failed", src)
