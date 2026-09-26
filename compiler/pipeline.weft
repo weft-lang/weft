@@ -13090,6 +13090,100 @@ pub(package) fn pipeline_array_literal_leaf_kind(tt: i64, array_ty: i64) -> i64 
   else { cg_layout_array_leaf_drop_kind(tt, array_ty) }
 }
 
+-- A structural value carries each fixed-array field as one owner-handle lane,
+-- but inline storage holds the array's bytes. Whether `lane` of `ty` is such
+-- a handle.
+pub(package) fn pipeline_type_lane_is_embedded_array(ty: i64, lane: i64) -> bool {
+  if ty == 0 or lane < 0 { false }
+  else if ty_tag(ty) == 9 and ty_named_is_opaque(ty) {
+    pipeline_type_lane_is_embedded_array(ty_named_opaque_representation(ty), lane)
+  } else if ty_is_array(ty) { lane == 0 }
+  else if ty_is_record(ty) and ty_record_open(ty) == 0 {
+    let fields = ty_record_fields(ty)
+    let count = if fields == 0 { 0 } else { nlist_len(fields) }
+    let mut offset = 0
+    for i in 0..count {
+      -- Count words exactly as lane release kinds do.
+      let field_ty = ty_record_field_type(ty_record_field_at_layout_index(ty, i))
+      let words = ty_value_storage_word_count(field_ty)
+      if lane >= offset and lane < offset + words {
+        return pipeline_type_lane_is_embedded_array(field_ty, lane - offset)
+      }
+      offset = offset + words
+    }
+    false
+  } else { false }
+}
+
+-- Whether holding `ty` inline gives the storage any managed stake: a managed
+-- scalar lane, or a managed leaf of an embedded array.
+pub(package) fn pipeline_type_has_inline_cleanup(ty: i64) -> bool {
+  if ty == 0 { false }
+  else if ty_tag(ty) == 9 and ty_named_is_opaque(ty) {
+    pipeline_type_has_inline_cleanup(ty_named_opaque_representation(ty))
+  } else if ty_is_array(ty) {
+    ty_array_length(ty) > 0 and pipeline_type_has_inline_cleanup(
+      cg_layout_element_representation(ty_array_inner(ty))
+    )
+  } else if ty_is_record(ty) and ty_record_open(ty) == 0 {
+    let fields = ty_record_fields(ty)
+    let count = if fields == 0 { 0 } else { nlist_len(fields) }
+    for i in 0..count {
+      if pipeline_type_has_inline_cleanup(
+        ty_record_field_type(ty_record_field_at_layout_index(ty, i))
+      ) { return true }
+    }
+    false
+  } else { pipeline_type_managed_release_lane_count(ty) > 0 }
+}
+
+-- The stake a lane of a structural value gives inline storage. Embedded
+-- arrays are held as bytes whose leaves the copy retains, so their handle
+-- lanes give none.
+pub(package) fn pipeline_type_inline_lane_release_kind(ty: i64, lane: i64) -> i64 {
+  if pipeline_type_lane_is_embedded_array(ty, lane) { continuation_cleanup_kind_none() }
+  else { pipeline_type_value_lane_release_kind(ty, lane) }
+}
+
+-- Retain the lanes of `value` that inline storage holds directly.
+pub(package) fn pipeline_inline_storage_retain_inst_list(
+  value: i64,
+  ty: i64,
+  lane: i64,
+  dst: i64,
+  origin: i64
+) -> IrInstList {
+  if value < 0 or lane >= pipeline_type_value_lane_count_or_one(ty) { ir_inst_list_empty() }
+  else {
+    let kind = pipeline_type_inline_lane_release_kind(ty, lane)
+    if pipeline_managed_retain_hash_for_kind(kind) == 0 {
+      pipeline_inline_storage_retain_inst_list(value, ty, lane + 1, dst, origin)
+    } else {
+      ir_inst_list_prepend(
+        pipeline_managed_retain_inst_with_origin(dst, value + lane, kind, origin),
+        pipeline_inline_storage_retain_inst_list(value, ty, lane + 1, dst + 1, origin)
+      )
+    }
+  }
+}
+
+-- Commit the stakes that `pipeline_inline_storage_retain_inst_list` took.
+pub(package) fn pipeline_inline_storage_commit_inst_list(
+  value: i64,
+  ty: i64,
+  lane: i64
+) -> IrInstList {
+  if lane >= pipeline_type_value_lane_count_or_one(ty) { ir_inst_list_empty() }
+  else {
+    let kind = pipeline_type_inline_lane_release_kind(ty, lane)
+    let rest = pipeline_inline_storage_commit_inst_list(value, ty, lane + 1)
+    if pipeline_managed_release_hash_for_kind(kind) == 0 { rest }
+    else {
+      ir_inst_list_prepend(pipeline_managed_aggregate_commit_inst(value + lane, kind), rest)
+    }
+  }
+}
+
 -- The flat array cleanup tuple (count, stride, kind) cannot describe managed
 -- lanes nested at structural-record field offsets. Describe one element and
 -- carry repetition as a typed layout fact. Arrays and generator transport then
@@ -13136,6 +13230,21 @@ pub(package) fn pipeline_structural_array_descriptor_value_fields(
       nlist_len(ty_record_fields(ty)) - 1,
       tail
     )
+  } else if ty_is_array(ty) {
+    -- Descriptors repeat one element shape, so an embedded array contributes
+    -- each managed leaf of each of its elements; unmanaged arrays contribute
+    -- nothing.
+    if not pipeline_type_has_inline_cleanup(ty) { tail }
+    else {
+      pipeline_structural_array_descriptor_embedded_fields(
+        ty,
+        byte_offset,
+        zero_value,
+        tt,
+        ty_array_length(ty) - 1,
+        tail
+      )
+    }
   } else {
     if ty_is_slice(ty) {
       pipeline_structural_array_descriptor_lane_fields(ty, byte_offset, zero_value, 1, tail)
@@ -13156,6 +13265,35 @@ pub(package) fn pipeline_structural_array_descriptor_value_fields(
         )
       }
     }
+  }
+}
+
+pub(package) fn pipeline_structural_array_descriptor_embedded_fields(
+  array_ty: i64,
+  byte_offset: i64,
+  zero_value: i64,
+  tt: i64,
+  index: i64,
+  tail: IrRecordLayoutFieldList
+) -> IrRecordLayoutFieldList {
+  if index < 0 { tail }
+  else {
+    let stride = cg_layout_array_stride(tt, array_ty)
+    let current = pipeline_structural_array_descriptor_value_fields(
+      cg_layout_element_representation(ty_array_inner(array_ty)),
+      byte_offset + index * stride,
+      zero_value,
+      tt,
+      tail
+    )
+    pipeline_structural_array_descriptor_embedded_fields(
+      array_ty,
+      byte_offset,
+      zero_value,
+      tt,
+      index - 1,
+      current
+    )
   }
 }
 
@@ -13498,9 +13636,10 @@ pub(package) fn pipeline_lower_array_literal_store_value_typed(
       }
     } else {
       if ty_is_record(element_ty) {
-        let retain = pipeline_managed_retain_inst_list_with_origin(
+        let retain = pipeline_inline_storage_retain_inst_list(
           value,
           element_ty,
+          0,
           addr + 1,
           ir_managed_stake_origin_aggregate()
         )
@@ -13517,12 +13656,7 @@ pub(package) fn pipeline_lower_array_literal_store_value_typed(
           pipeline_lowered_args_invalid(next_value)
         }
         else {
-          let commit = pipeline_managed_aggregate_commit_inst_list(
-            value,
-            element_ty,
-            0,
-            pipeline_type_value_lane_count_or_one(element_ty)
-          )
+          let commit = pipeline_inline_storage_commit_inst_list(value, element_ty, 0)
           let release = if borrowed == 0 {
             pipeline_managed_release_inst_list_with_origin(
               value,
@@ -52075,13 +52209,121 @@ pub(package) fn pipeline_lower_indexed_structural_load_lane(
   }
 }
 
+-- How a structural load treats an embedded array's managed leaves. A read
+-- copies the bytes into fresh storage with new leaf stakes. A take moves the
+-- storage's own stakes into that copy because the slot is about to be
+-- overwritten; releasing the copy then drops the replaced leaves once.
+pub(package) type PipelineEmbeddedArrayLoad {
+  PipelineEmbeddedArrayRead,
+  PipelineEmbeddedArrayTake
+}
+
+-- Inline storage holds an array field's bytes, not its owner handle. The
+-- field's lane receives fresh storage holding a copy, materialized through a
+-- frame slot so the value keeps its contiguous lanes.
+pub(package) fn pipeline_lower_indexed_embedded_array_load(
+  address: i64,
+  dst: i64,
+  byte_offset: i64,
+  array_ty: i64,
+  next_value: i64,
+  tt: i64,
+  mode: PipelineEmbeddedArrayLoad
+) -> PipelineLoweredArgs {
+  let storage = pipeline_lower_array_literal_storage(
+    array_ty,
+    ty_array_length(array_ty),
+    next_value,
+    tt
+  )
+  if byte_offset < 0 or ir_lowered_expr_is_valid(storage) == 0 {
+    return pipeline_lowered_args_invalid(next_value)
+  }
+  let data = ir_lowered_expr_next_value(storage) - 1
+  let offset_value = ir_lowered_expr_next_value(storage)
+  let source = offset_value + 1
+  let slot = source + 1
+  let copy = match mode {
+    PipelineEmbeddedArrayRead -> pipeline_array_copy_inst_for_type(data, source, array_ty, tt)
+    PipelineEmbeddedArrayTake -> ir_inst_array_copy_i64(
+      data,
+      source,
+      cg_layout_array_size(tt, array_ty),
+      0,
+      0,
+      continuation_cleanup_kind_none()
+    )
+  }
+  let insts = ir_lowered_expr_insts(storage)
+    |> ir_inst_list_append(
+      IrInstCons(
+        IrConstI64(offset_value, byte_offset),
+        IrInstCons(
+          IrBinaryI64(source, IrAdd, address, offset_value),
+          IrInstCons(
+            copy,
+            IrInstCons(
+              ir_inst_slot_i64(slot),
+              IrInstCons(
+                ir_inst_store_i64(slot, ir_lowered_expr_value(storage)),
+                IrInstCons(ir_inst_load_i64(dst, slot), IrInstNil)
+              )
+            )
+          )
+        )
+      )
+    )
+  pipeline_lowered_args(IrValueNil, slot + 1, insts, 1)
+}
+
+-- Copy an array field's bytes from its owner handle into inline storage. The
+-- copy takes the storage's stakes in managed leaves; the handle is not stored.
+pub(package) fn pipeline_lower_indexed_embedded_array_store(
+  address: i64,
+  value: i64,
+  byte_offset: i64,
+  array_ty: i64,
+  next_value: i64,
+  tt: i64
+) -> PipelineLoweredArgs {
+  if byte_offset < 0 or pipeline_array_literal_layout_is_valid(
+    tt,
+    array_ty,
+    ty_array_length(array_ty)
+  ) == 0 {
+    return pipeline_lowered_args_invalid(next_value)
+  }
+  let source = next_value
+  let offset_value = source + 1
+  let destination = offset_value + 1
+  let insts = IrInstCons(
+    ir_inst_call_i64(
+      source,
+      pipeline_rc_array_storage_data_hash(),
+      ir_value_list_prepend(value, ir_value_list_empty())
+    ),
+    IrInstCons(
+      IrConstI64(offset_value, byte_offset),
+      IrInstCons(
+        IrBinaryI64(destination, IrAdd, address, offset_value),
+        IrInstCons(
+          pipeline_array_copy_inst_for_type(destination, source, array_ty, tt),
+          IrInstNil
+        )
+      )
+    )
+  )
+  pipeline_lowered_args(IrValueNil, destination + 1, insts, 1)
+}
+
 pub(package) fn pipeline_lower_indexed_structural_load_value(
   address: i64,
   dst: i64,
   byte_offset: i64,
   ty: i64,
   next_value: i64,
-  tt: i64
+  tt: i64,
+  mode: PipelineEmbeddedArrayLoad
 ) -> PipelineLoweredArgs {
   if ty_is_record(ty) {
     pipeline_lower_indexed_structural_load_fields(
@@ -52091,7 +52333,18 @@ pub(package) fn pipeline_lower_indexed_structural_load_value(
       ty,
       0,
       next_value,
-      tt
+      tt,
+      mode
+    )
+  } else if ty_is_array(ty) {
+    pipeline_lower_indexed_embedded_array_load(
+      address,
+      dst,
+      byte_offset,
+      ty,
+      next_value,
+      tt,
+      mode
     )
   } else {
     if ty_is_slice(ty) {
@@ -52151,7 +52404,8 @@ pub(package) fn pipeline_lower_indexed_structural_load_fields(
   record_ty: i64,
   field_index: i64,
   next_value: i64,
-  tt: i64
+  tt: i64,
+  mode: PipelineEmbeddedArrayLoad
 ) -> PipelineLoweredArgs {
   let fields = ty_record_fields(record_ty)
   let count = if fields == 0 { 0 } else { nlist_len(fields) }
@@ -52170,7 +52424,8 @@ pub(package) fn pipeline_lower_indexed_structural_load_fields(
       byte_offset + field_byte_offset,
       field_ty,
       next_value,
-      tt
+      tt,
+      mode
     )
     if pipeline_lowered_args_is_valid(current) == 0 { current }
     else {
@@ -52181,7 +52436,8 @@ pub(package) fn pipeline_lower_indexed_structural_load_fields(
         record_ty,
         field_index + 1,
         pipeline_lowered_args_next_value(current),
-        tt
+        tt,
+        mode
       )
       if pipeline_lowered_args_is_valid(rest) == 0 { rest }
       else {
@@ -52243,6 +52499,8 @@ pub(package) fn pipeline_lower_indexed_structural_store_value(
       next_value,
       tt
     )
+  } else if ty_is_array(ty) {
+    pipeline_lower_indexed_embedded_array_store(address, value, byte_offset, ty, next_value, tt)
   } else {
     if ty_is_slice(ty) {
       let first = pipeline_lower_indexed_structural_store_lane(
@@ -52676,16 +52934,19 @@ pub(package) fn pipeline_lower_indexed_structural_record_value(
       0,
       element_ty,
       next_value + lanes,
-      tt
+      tt,
+      PipelineEmbeddedArrayRead
     )
     if pipeline_lowered_args_is_valid(plan) == 0 { ir_lowered_expr_invalid(next_value) }
     else {
       -- Indexed storage keeps its own deep-cleanup stakes. A structural read
       -- therefore owns a fresh stake for each managed result lane, just as a
-      -- scalar indexed read does for its one lane.
-      let retain = pipeline_managed_retain_inst_list_with_origin(
+      -- scalar indexed read does for its one lane. Embedded arrays were
+      -- copied into fresh storage that the result already owns.
+      let retain = pipeline_inline_storage_retain_inst_list(
         next_value,
         element_ty,
+        0,
         pipeline_lowered_args_next_value(plan),
         ir_managed_stake_origin_aggregate()
       )
@@ -53413,21 +53674,25 @@ pub(package) fn pipeline_lower_indexed_structural_overwrite(
 ) -> IrLoweredExpr {
   let tt = pipeline_handler_lower_ctx_tt(lower_ctx)
   let lanes = pipeline_type_value_lane_count_or_one(element_ty)
+  -- The old element's stakes move out with it, embedded array leaves
+  -- included, and are released once the replacement is stored.
   let old = pipeline_lower_indexed_structural_load_value(
     address,
     next_value,
     0,
     element_ty,
     next_value + lanes,
-    tt
+    tt,
+    PipelineEmbeddedArrayTake
   )
   if pipeline_lowered_args_is_valid(old) == 0 { ir_lowered_expr_invalid(next_value) }
   else {
     -- Acquire the replacement before releasing old leaves: self-assignment
     -- and shared fields must remain alive throughout the overwrite.
-    let retain = pipeline_managed_retain_inst_list_with_origin(
+    let retain = pipeline_inline_storage_retain_inst_list(
       value,
       element_ty,
+      0,
       pipeline_lowered_args_next_value(old),
       ir_managed_stake_origin_aggregate()
     )
@@ -53466,7 +53731,7 @@ pub(package) fn pipeline_lower_indexed_structural_overwrite(
         )
       } else { ir_inst_list_empty() }
       let result = after_old + ir_inst_list_len(release_new)
-      let commit = pipeline_managed_aggregate_commit_inst_list(value, element_ty, 0, lanes)
+      let commit = pipeline_inline_storage_commit_inst_list(value, element_ty, 0)
       let insts = pipeline_lowered_args_insts(old)
         |> ir_inst_list_append(retain)
         |> ir_inst_list_append(pipeline_lowered_args_insts(stored))
