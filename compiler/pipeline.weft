@@ -20650,11 +20650,11 @@ pub(package) fn pipeline_lower_vector_to_array_typed_to_target_blocks(
         }
         else {
           let byte_size = cg_layout_array_size(tt, array_ty)
-          let leaf_count = cg_layout_array_leaf_count(array_ty)
-          let leaf_stride = pipeline_array_literal_leaf_stride(tt, array_ty)
-          let leaf_kind = pipeline_array_literal_leaf_kind(tt, array_ty)
-          if pipeline_array_copy_plan_is_valid(byte_size, leaf_count, leaf_stride, leaf_kind) ==
-            0 { pipeline_lowered_blocks_invalid(start_block, next_value) }
+          -- Structural elements with managed lanes copy through their
+          -- described layout rather than one flat leaf plan.
+          if pipeline_array_literal_layout_is_valid(tt, array_ty, length) == 0 {
+            pipeline_lowered_blocks_invalid(start_block, next_value)
+          }
           else {
             let dest_data = ir_lowered_expr_next_value(storage) - 1
             let source_data = ir_lowered_expr_next_value(storage)
@@ -20673,14 +20673,7 @@ pub(package) fn pipeline_lower_vector_to_array_typed_to_target_blocks(
               if byte_size == 0 { ir_inst_list_empty() }
               else {
                 ir_inst_list_prepend(
-                  ir_inst_array_copy_i64(
-                    dest_data,
-                    source_data,
-                    byte_size,
-                    leaf_count,
-                    leaf_stride,
-                    leaf_kind
-                  ),
+                  pipeline_array_copy_inst_for_type(dest_data, source_data, array_ty, tt),
                   ir_inst_list_empty()
                 )
               }
@@ -50431,6 +50424,12 @@ pub(package) fn pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(
                 dst,
                 tt
               )
+              if ir_lowered_expr_is_valid(structural_storage) == 0 and
+                pipeline_vector_storage_call_requires_placement(
+                  str_hash(src, ns, nl),
+                  storage_ty,
+                  logical_args
+                ) { return ir_lowered_expr_invalid(next_value) }
               let abi_args = if variant_payloads != 0 {
                 pipeline_call_abi_args(logical_args, 0, variant_payloads, expected_subst, 0, 0)
               } else {
@@ -52769,6 +52768,31 @@ pub(package) fn pipeline_lower_plain_record_store(
   }
 }
 
+-- Whether a vector storage load or store names an element the word-shaped
+-- runtime shim cannot carry: a fixed array, a closed structural value, or
+-- any value wider than one word. Such a call must be placed by type; falling
+-- back to the shim would erase every lane but the first.
+pub(package) fn pipeline_vector_storage_call_requires_placement(
+  callee_hash: i64,
+  element: i64,
+  values: IrValueList
+) -> bool {
+  let element_ty = cg_layout_element_representation(element)
+  let nargs = ir_value_list_len(values)
+  let storage_call = if nargs == 4 {
+    callee_hash == pipeline_ir_native_vector_storage_store_value_hash() or callee_hash ==
+      pipeline_ir_native_vector_store_value_hash() or
+      callee_hash == pipeline_ir_native_vector_storage_load_value_hash() or callee_hash ==
+      pipeline_ir_native_vector_load_value_hash()
+  } else {
+    nargs == 3 and callee_hash == pipeline_ir_native_vector_storage_load_value_in_bounds_hash()
+  }
+  let lanes = if element_ty == 0 { 0 } else { pipeline_type_value_lane_count_or_one(element_ty) }
+  storage_call and element_ty != 0 and (
+    ty_is_array(element_ty) or ty_is_record(element_ty) or lanes != 1
+  )
+}
+
 pub(package) fn pipeline_lower_structural_vector_storage_call(
   callee_hash: i64,
   element: i64,
@@ -52872,48 +52896,57 @@ pub(package) fn pipeline_lower_structural_vector_storage_call(
           )
         }
       } else {
-        if not ty_is_record(element_ty) or pipeline_type_managed_release_lane_count(element_ty) >
-          0 {
-            ir_lowered_expr_invalid(next_value)
+        if not ty_is_record(element_ty) or ty_record_open(element_ty) == 1 {
+          ir_lowered_expr_invalid(next_value)
+        } else {
+          if store == 1 {
+            -- The storage takes its own stakes in the lanes it holds; the
+            -- caller keeps the value. The element's layout descriptor
+            -- names those stakes for release.
+            let value = pipeline_ir_value_list_get_or(values, 3, 0 - 1)
+            let retain = pipeline_inline_storage_retain_inst_list(
+              value,
+              element_ty,
+              0,
+              next_value,
+              ir_managed_stake_origin_aggregate()
+            )
+            let stored = pipeline_lower_indexed_structural_store_value(
+              address,
+              value,
+              0,
+              element_ty,
+              next_value + ir_inst_list_len(retain),
+              tt
+            )
+            if pipeline_lowered_args_is_valid(stored) == 0 {
+              ir_lowered_expr_invalid(next_value)
+            }
+            else {
+              let result = pipeline_lowered_args_next_value(stored)
+              let insts = retain
+                |> ir_inst_list_append(pipeline_lowered_args_insts(stored))
+                |> ir_inst_list_append(
+                  pipeline_inline_storage_commit_inst_list(value, element_ty, 0)
+                )
+                |> ir_inst_list_append(
+                  ir_inst_list_prepend(ir_inst_const_i64(result, 0), ir_inst_list_empty())
+                )
+              ir_lowered_expr(result, result + 1, insts)
+            }
           } else {
-            if store == 1 {
-              let value = pipeline_ir_value_list_get_or(values, 3, 0 - 1)
-              let stored = pipeline_lower_indexed_structural_store_value(
+            if load == 1 {
+              pipeline_lower_indexed_structural_record_value(
                 address,
-                value,
-                0,
                 element_ty,
                 next_value,
                 tt
               )
-              if pipeline_lowered_args_is_valid(stored) == 0 {
-                ir_lowered_expr_invalid(next_value)
-              }
-              else {
-                let result = pipeline_lowered_args_next_value(stored)
-                let zero_insts = ir_inst_list_prepend(
-                  ir_inst_const_i64(result, 0),
-                  ir_inst_list_empty()
-                )
-                ir_lowered_expr(
-                  result,
-                  result + 1,
-                  ir_inst_list_append(pipeline_lowered_args_insts(stored), zero_insts)
-                )
-              }
             } else {
-              if load == 1 {
-                pipeline_lower_indexed_structural_record_value(
-                  address,
-                  element_ty,
-                  next_value,
-                  tt
-                )
-              } else {
-                ir_lowered_expr_invalid(next_value)
-              }
+              ir_lowered_expr_invalid(next_value)
             }
           }
+        }
       }
     }
   }
@@ -56737,6 +56770,12 @@ pub(package) fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(
               dst,
               tt
             )
+            if ir_lowered_expr_is_valid(structural_storage) == 0 and
+              pipeline_vector_storage_call_requires_placement(
+                str_hash(src, ns, nl),
+                storage_ty,
+                logical_args
+              ) { return ir_lowered_expr_invalid(next_value) }
             let abi_args = if variant_payloads != 0 {
               pipeline_call_abi_args(logical_args, 0, variant_payloads, expected_subst, 0, 0)
             } else {
@@ -77033,6 +77072,10 @@ pub(package) fn pipeline_ir_native_vector_element_leaf_kind_of_hash() -> i64 {
   layout_query_native_key(VectorLeafKind)
 }
 
+pub(package) fn pipeline_ir_native_vector_element_layout_of_hash() -> i64 {
+  layout_query_native_key(VectorElementLayout)
+}
+
 pub(package) fn pipeline_ir_native_map_storage_cleanup_kind_of_hash() -> i64 {
   layout_query_native_key(MapCleanupKind)
 }
@@ -77079,7 +77122,8 @@ pub(package) fn pipeline_ir_native_generic_call_constant_intrinsic(
       callee_hash == pipeline_ir_native_vector_element_leaf_count_of_hash() or callee_hash ==
       pipeline_ir_native_vector_element_leaf_stride_of_hash() or
       callee_hash == pipeline_ir_native_vector_element_leaf_kind_of_hash() or callee_hash ==
-      pipeline_ir_native_map_storage_cleanup_kind_of_hash() { 1 } else { 0 }
+      pipeline_ir_native_vector_element_layout_of_hash() or
+      callee_hash == pipeline_ir_native_map_storage_cleanup_kind_of_hash() { 1 } else { 0 }
   }
 }
 
@@ -77167,12 +77211,73 @@ pub(package) fn pipeline_ir_native_emit_layout_query(
   pinned: PipelineIrNativeValueHomeFacts
 ) -> i64 {
   let ty = pipeline_ir_native_vector_type_arg_node(type_args)
-  pipeline_ir_native_emit_const_i64(
-    code,
-    dst,
-    layout_query_value(query, ty, fmap_get_tt(fm)),
-    pinned
-  )
+  match query {
+    VectorElementLayout -> pipeline_ir_native_emit_vector_element_layout(
+      code,
+      dst,
+      ty,
+      fm,
+      pinned
+    )
+    _ -> pipeline_ir_native_emit_const_i64(
+      code,
+      dst,
+      layout_query_value(query, ty, fmap_get_tt(fm)),
+      pinned
+    )
+  }
+}
+
+-- One element's cleanup words when the leaf plan and element mode cannot
+-- describe them: a closed structural value whose inline form owns managed
+-- stakes. Empty for every other element.
+pub(package) fn pipeline_vector_element_layout_fields(
+  tt: i64,
+  element: i64
+) -> IrRecordLayoutFieldList {
+  if element == 0 or not ty_is_record(element) or ty_record_open(element) == 1 or
+    not pipeline_type_has_inline_cleanup(element) { ir_record_layout_field_list_empty() }
+  else {
+    pipeline_structural_array_descriptor_value_fields(
+      element,
+      0,
+      0,
+      tt,
+      ir_record_layout_field_list_empty()
+    )
+  }
+}
+
+-- The immutable descriptor address of one element's cleanup words, or zero.
+pub(package) fn pipeline_ir_native_emit_vector_element_layout(
+  code: i64,
+  dst: i64,
+  ty: i64,
+  fm: i64,
+  pinned: PipelineIrNativeValueHomeFacts
+) -> i64 {
+  let tt = fmap_get_tt(fm)
+  let element = cg_layout_element_representation(ty)
+  let fields = pipeline_vector_element_layout_fields(tt, element)
+  match fields {
+    IrRecordLayoutFieldNil -> pipeline_ir_native_emit_const_i64(code, dst, 0, pinned)
+    _ -> {
+      let size = cg_layout_vector_element_size(tt, element)
+      if pipeline_array_layout_is_valid(size, IrArrayLayout(1, size, fields)) == 0 {
+        fmap_inc_emit_error_count(fm)
+        bu32(code, encode_brk(68))
+      } else {
+        let descriptor = pipeline_ir_native_ensure_record_layout_descriptor(
+          code,
+          size,
+          pipeline_array_layout_descriptor_fields(fields, 1, size),
+          fm
+        )
+        pipeline_ir_native_emit_image_address(code, 17, descriptor)
+        pipeline_ir_native_store_reg_pinned(code, pinned, dst, 17)
+      }
+    }
+  }
 }
 
 pub(package) fn pipeline_ir_native_emit_addr_plus_imm(

@@ -1,5 +1,13 @@
 use runtime/rc_implicit_test.{*}
+use stdlib/option.{None, Option, Some}
+use stdlib/ord.{Greater, Less, Ordering}
+use stdlib/persistent_vector as persistent_vector
+use stdlib/result.{Err, Ok, Result}
+use stdlib/sorted_map as sorted_map
 use stdlib/string.{str_len}
+use stdlib/vector as vector
+use stdlib/vector.{Vector, to_array}
+use runtime/vector_storage.{vector_storage_promote}
 
 -- test/structural_collection_storage.weft -- closed structural values in
 -- indexed and collection storage. A structural value travels as one lane per
@@ -134,4 +142,264 @@ test "array-bearing elements churn with a flat heap" {
   Test.assert_eq(array_bearing_churn(2000), 2000 * 1999 / 2 * 4 + 2000 * 3)
   let after = runtime_rc_test_heap_arena_offset()
   Test.assert_eq(after, before)
+}
+
+-- Vectors hold structural values inline, exactly as arrays and slices lay
+-- them out; one layout descriptor per element type names the managed words.
+fn named_score(value: (i64, str)) -> i64 {
+  let (n, name) = value
+  n * 100 + str_len(name)
+}
+
+fn named_vector() -> owned Vector<(i64, str)> {
+  let mut xs = vector.new<(i64, str)>()
+  xs.push((1, "a"))
+  xs.push((2, "bb"))
+  xs.push((3, "ccc"))
+  xs
+}
+
+fn named_total(xs: borrow Vector<(i64, str)>) -> i64 {
+  let mut total = 0
+  for value in xs[..] { total = total * 1000 + named_score(value) }
+  total
+}
+
+test "vectors read managed lanes in every position" {
+  let xs = named_vector()
+  match xs.get(1) {
+    Some(value) -> Test.assert_eq(named_score(value), 202)
+    None -> Test.assert_true(false)
+  }
+  let mut firsts = vector.new<(str, i64)>()
+  firsts.push(("x", 4))
+  firsts.push(("yy", 5))
+  match firsts.get(1) {
+    Some((name, n)) -> Test.assert_eq(str_len(name) * 10 + n, 25)
+    None -> Test.assert_true(false)
+  }
+  let mut rows = vector.new<{ name: str, n: i64 }>()
+  rows.push({ name: "r", n: 6 })
+  rows.push({ name: "rrr", n: 7 })
+  match rows.get(1) {
+    Some(row) -> Test.assert_eq(str_len(row.name) * 10 + row.n, 37)
+    None -> Test.assert_true(false)
+  }
+  Test.assert_eq(named_total(xs), 101202303)
+}
+
+test "vector element operations move managed structural values intact" {
+  let mut xs = named_vector()
+  match xs.set(0, (9, "nine")) {
+    Ok(previous) -> Test.assert_eq(named_score(previous), 101)
+    Err(_) -> Test.assert_true(false)
+  }
+  Test.assert_true(match xs.swap(0, 2) { Ok(_) -> true, Err(_) -> false })
+  Test.assert_eq(named_total(xs), 303202904)
+  match xs.pop() {
+    Some(value) -> Test.assert_eq(named_score(value), 904)
+    None -> Test.assert_true(false)
+  }
+  Test.assert_true(match xs.insert(1, (5, "fives")) { Ok(_) -> true, Err(_) -> false })
+  Test.assert_eq(named_total(xs), 303505202)
+  match xs.remove(0) {
+    Some(value) -> Test.assert_eq(named_score(value), 303)
+    None -> Test.assert_true(false)
+  }
+  Test.assert_eq(named_total(xs), 505202)
+  xs.clear()
+  Test.assert_true(xs.is_empty())
+}
+
+test "derived vectors copy managed structural values" {
+  let xs = named_vector()
+  let other = named_vector()
+  let doubled = xs.concat(other)
+  Test.assert_eq(named_total(doubled), 101202303101202303)
+  let long = xs.filter((value) => str_len(value.1) > 1)
+  Test.assert_eq(named_total(long), 202303)
+  match xs.slice(1, 3) {
+    Some(part) -> Test.assert_eq(named_total(part), 202303)
+    None -> Test.assert_true(false)
+  }
+  let lengths = xs.map((value) => str_len(value.1))
+  Test.assert_eq(lengths.fold(0, (total, n) => total * 10 + n), 123)
+  Test.assert_eq(named_total(xs), 101202303)
+  let reversed = named_vector().reverse()
+  Test.assert_eq(named_total(reversed), 303202101)
+  let sorted = named_vector().sort_by(
+    (left, right) => if left.0 > right.0 { Less } else { Greater }
+  )
+  Test.assert_eq(named_total(sorted), 303202101)
+  let source = [(7, "s"), (8, "tt")]
+  let copied = vector.to_vector(source[..])
+  Test.assert_eq(named_total(copied), 701802)
+}
+
+test "vectors grow while holding managed structural values" {
+  let mut xs = vector.new<(i64, str)>()
+  for i in 0..300 { xs.push((i, if i % 2 == 0 { "even" } else { "odd" })) }
+  let mut total = 0
+  for (n, name) in xs[..] { total = total + n + str_len(name) }
+  Test.assert_eq(total, 299 * 300 / 2 + 150 * 4 + 150 * 3)
+}
+
+test "vectors hold array-bearing structural values" {
+  let mut xs = vector.new<([i64; 3], i64)>()
+  xs.push(([1, 2, 3], 4))
+  xs.push(([5, 6, 7], 8))
+  match xs.get(1) {
+    Some(value) -> Test.assert_eq(tuple_score(value), 8567)
+    None -> Test.assert_true(false)
+  }
+  let mut total = 0
+  for value in xs[..] { total = total + tuple_score(value) }
+  Test.assert_eq(total, 4123 + 8567)
+}
+
+test "a vector owns each managed lane of its elements exactly once" {
+  let probe = runtime_rc_probe_new(3)
+  let (stored, read) = {
+    let mut xs = vector.new<(RuntimeRcProbe, i64, RuntimeRcProbe)>()
+    xs.push((probe, 1, probe))
+    xs.push((probe, 2, probe))
+    let stored = runtime_rc_probe_count(probe)
+    let copy = xs.get(1)
+    (stored, runtime_rc_probe_count(probe))
+  }
+  Test.assert_eq(stored, 5)
+  Test.assert_eq(read, 7)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "vector element operations keep managed stakes balanced" {
+  let old = runtime_rc_probe_new(1)
+  let new = runtime_rc_probe_new(2)
+  let (after_set, after_clear) = {
+    let mut xs = vector.new<(i64, RuntimeRcProbe)>()
+    for i in 0..4 { xs.push((i, old)) }
+    xs.set(0, (9, new))
+    xs.swap(0, 3)
+    xs.pop()
+    xs.insert(1, (5, new))
+    xs.remove(0)
+    let after_set = runtime_rc_probe_count(old) * 10 + runtime_rc_probe_count(new)
+    xs.clear()
+    (after_set, runtime_rc_probe_count(old) * 10 + runtime_rc_probe_count(new))
+  }
+  -- Left: (5, new), (1, old), (2, old) after the pop, insert and remove.
+  Test.assert_eq(after_set, 32)
+  Test.assert_eq(after_clear, 11)
+  Test.assert_eq(runtime_rc_probe_count(old), 1)
+  Test.assert_eq(runtime_rc_probe_count(new), 1)
+}
+
+test "vectors own embedded array leaves exactly once" {
+  let probe = runtime_rc_probe_new(4)
+  let stored = {
+    let mut xs = vector.new<([RuntimeRcProbe; 2], i64)>()
+    xs.push(([probe, probe], 1))
+    xs.push(([probe, probe], 2))
+    runtime_rc_probe_count(probe)
+  }
+  Test.assert_eq(stored, 5)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+fn managed_vector_churn(n: i64) -> i64 {
+  let mut acc = 0
+  for i in 0..n {
+    let mut xs = vector.new<(i64, str)>()
+    xs.push((i, "left"))
+    xs.push((i + 1, "right"))
+    for (value, name) in xs[..] { acc = acc + value + str_len(name) }
+  }
+  acc
+}
+
+test "vectors of managed structural values churn with a flat heap" {
+  managed_vector_churn(64)
+  let before = runtime_rc_test_heap_arena_offset()
+  Test.assert_eq(managed_vector_churn(2000), 2000 * 1999 + 2000 + 2000 * 9)
+  let after = runtime_rc_test_heap_arena_offset()
+  Test.assert_eq(after, before)
+}
+
+test "persistent vector versions keep managed structural values" {
+  let first = persistent_vector.new<(i64, str)>().push((1, "a")).push((2, "bb"))
+  let second = first.push((3, "ccc"))
+  match second.set(0, (9, "nine")) {
+    Some(third) -> {
+      match third.get(0) {
+        Some(value) -> Test.assert_eq(named_score(value), 904)
+        None -> Test.assert_true(false)
+      }
+    }
+    None -> Test.assert_true(false)
+  }
+  match first.get(1) {
+    Some(value) -> Test.assert_eq(named_score(value), 202)
+    None -> Test.assert_true(false)
+  }
+  match second.get(2) {
+    Some(value) -> Test.assert_eq(named_score(value), 303)
+    None -> Test.assert_true(false)
+  }
+  Test.assert_true(second.len() == 3)
+}
+
+test "persistent vector versions release managed lanes with the family" {
+  let probe = runtime_rc_probe_new(8)
+  let held = {
+    let first = persistent_vector.new<(i64, RuntimeRcProbe)>().push((1, probe))
+    let second = first.push((2, probe))
+    let mut total = 0
+    for i in 0..40 {
+      let third = second.push((i, probe))
+      total = total + match third.get(2) {
+        Some((n, value)) -> n + runtime_rc_probe_load(value)
+        None -> 0 - 1000000
+      }
+    }
+    Test.assert_eq(total, 780 + 40 * 8)
+    runtime_rc_probe_count(probe)
+  }
+  -- Family stakes live until the last version dies: the test's own, one per
+  -- stored element, and one per element each version's tail copy retained.
+  Test.assert_eq(held, 1 + 1 + 2 + 40 * 3)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+test "sorted map entries carry managed values" {
+  let entries = {
+    let m = sorted_map.new<i64, str>()
+    m.insert(2, "two")
+    m.insert(1, "one!")
+    m.entries()
+  }
+  let mut total = 0
+  for (key, value) in entries[..] { total = total * 100 + key * 10 + str_len(value) }
+  Test.assert_eq(total, 14 * 100 + 23)
+}
+
+test "promoting a vector reaches managed lanes of its structural elements" {
+  let probe = runtime_rc_probe_new(6)
+  let mut xs = vector.new<(i64, RuntimeRcProbe)>()
+  xs.push((1, probe))
+  Test.assert_eq(runtime_rc_probe_is_promoted(probe), 0)
+  vector_storage_promote<(i64, RuntimeRcProbe)>(xs)
+  Test.assert_eq(runtime_rc_probe_is_promoted(probe), 1)
+}
+
+test "vectors copy managed structural values into fixed arrays" {
+  let xs = named_vector()
+  let copied: Option<[(i64, str); 3]> = xs.to_array < 3 > ()
+  match copied {
+    Some(values) -> {
+      Test.assert_eq(named_score(values[0]) * 1000000 + named_score(values[2]), 101000303)
+    }
+    None -> Test.assert_true(false)
+  }
+  let short: Option<[(i64, str); 2]> = xs.to_array < 2 > ()
+  Test.assert_true(match short { Some(_) -> false, None -> true })
 }
