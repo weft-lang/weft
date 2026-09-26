@@ -2739,7 +2739,7 @@ assert_equals "check_empty_file_exit" "$check_empty_exit" "0"
 assert_check_output_equals "check_empty_file_is_an_empty_module" "$(<"$tmp_err")" "check: 0 functions, 0 errors"
 
 # Directories and patterns name their roots in place, input by input, each
-# in byte order; a root named again keeps its first place.
+# in byte order; a root named by several inputs is reported for each.
 tmp_check_tree="$tmp_check_dir/tree"
 mkdir -p "$tmp_check_tree/nested" "$tmp_check_dir/no_sources"
 printf 'fn tree_b() -> i64 { 1 }\n' > "$tmp_check_tree/b.weft"
@@ -2750,7 +2750,7 @@ set +e
 check_tree_exit=$?
 set -e
 assert_equals "check_tree_exit" "$check_tree_exit" "0"
-assert_equals "check_tree_expands_in_input_order" "$(grep '^==> ' "$tmp_err")" "$(printf '==> %s <==\n==> %s <==\n==> %s <==' "$tmp_check_clean" "$tmp_check_tree/b.weft" "$tmp_check_tree/nested/a.weft")"
+assert_equals "check_tree_expands_in_input_order" "$(grep '^==> ' "$tmp_err")" "$(printf '==> %s <==\n==> %s <==\n==> %s <==\n==> %s <==' "$tmp_check_clean" "$tmp_check_tree/b.weft" "$tmp_check_tree/nested/a.weft" "$tmp_check_clean")"
 assert_check_output_contains "check_tree_checks_nested_root" "$(<"$tmp_err")" "==> $tmp_check_tree/nested/a.weft <=="$'\n'"check: 1 functions, 0 errors"
 set +e
 "$WEFT" check "$tmp_check_tree" > "$tmp_out" 2> "$tmp_err"
