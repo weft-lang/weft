@@ -1,4 +1,7 @@
 use runtime/rc_implicit_test.{*}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map, persistent_map_promote}
 use stdlib/option.{None, Option, Some}
 use stdlib/ord.{Greater, Less, Ordering}
 use stdlib/persistent_vector as persistent_vector
@@ -402,4 +405,123 @@ test "vectors copy managed structural values into fixed arrays" {
   }
   let short: Option<[(i64, str); 2]> = xs.to_array < 2 > ()
   Test.assert_true(match short { Some(_) -> false, None -> true })
+}
+
+-- Map nodes hold one word per value, so a structural value of two or more
+-- lanes is held as one boxed element.
+fn pair_value(m: Map<i64, (i64, i64)>, key: i64) -> i64 {
+  match m.get(key) {
+    Some((left, right)) -> left * 10 + right
+    None -> 0 - 1
+  }
+}
+
+test "maps keep every lane of plain structural values" {
+  let m = map.new<i64, (i64, i64)>().insert(1, (1, 2)).insert(2, (3, 4))
+  Test.assert_eq(pair_value(m, 1), 12)
+  Test.assert_eq(pair_value(m, 2), 34)
+  Test.assert_eq(pair_value(m, 3), 0 - 1)
+}
+
+test "maps keep managed lanes in every position" {
+  let firsts = map.new<i64, (str, i64)>().insert(1, ("s1", 2)).insert(2, ("s33", 4))
+  match firsts.get(2) {
+    Some((name, n)) -> Test.assert_eq(str_len(name) * 10 + n, 34)
+    None -> Test.assert_true(false)
+  }
+  let seconds = map.new<i64, (i64, str)>().insert(1, (1, "t")).insert(2, (3, "ttt"))
+  match seconds.get(2) {
+    Some((n, name)) -> Test.assert_eq(n * 10 + str_len(name), 33)
+    None -> Test.assert_true(false)
+  }
+  let rows = map.new<str, { name: str, n: i64 }>().insert("a", { name: "r", n: 1 }).insert(
+    "b",
+    { name: "rrr", n: 2 }
+  )
+  match rows.get("b") {
+    Some(row) -> Test.assert_eq(str_len(row.name) * 10 + row.n, 32)
+    None -> Test.assert_true(false)
+  }
+}
+
+test "maps keep array-bearing structural values" {
+  let m = map.new<i64, ([i64; 3], i64)>().insert(1, ([1, 2, 3], 4)).insert(2, ([5, 6, 7], 8))
+  match m.get(2) {
+    Some(value) -> Test.assert_eq(tuple_score(value), 8567)
+    None -> Test.assert_true(false)
+  }
+  let managed = map.new<i64, ([str; 2], i64)>().insert(1, (["ab", "c"], 5))
+  match managed.get(1) {
+    Some((names, n)) -> Test.assert_eq(str_len(names[0]) * 100 + str_len(names[1]) * 10 + n, 215)
+    None -> Test.assert_true(false)
+  }
+}
+
+test "map versions keep their own structural values" {
+  let first = map.new<i64, (i64, str)>().insert(1, (1, "one"))
+  let second = first.insert(1, (2, "two!")).insert(3, (3, "three"))
+  let third = second.remove(1)
+  Test.assert_eq(named_score(first.get(1).unwrap_or((0, ""))), 103)
+  Test.assert_eq(named_score(second.get(1).unwrap_or((0, ""))), 204)
+  Test.assert_true(not third.contains_key(1))
+  Test.assert_eq(named_score(third.get(3).unwrap_or((0, ""))), 305)
+  let total = second.fold(0, (sum, key, value) => sum + key + named_score(value))
+  Test.assert_eq(total, 1 + 204 + 3 + 305)
+  let mut values_total = 0
+  let mut values = second.values()
+  let mut walking = true
+  while walking {
+    match values {
+      Cons(value, rest) -> {
+        values_total = values_total + named_score(value)
+        values = rest
+      }
+      Nil -> { walking = false }
+    }
+  }
+  Test.assert_eq(values_total, 204 + 305)
+}
+
+test "a map family owns each boxed value's managed lanes exactly once" {
+  let probe = runtime_rc_probe_new(9)
+  let (stored, read) = {
+    let m = map.new<i64, (i64, RuntimeRcProbe)>().insert(1, (1, probe)).insert(2, (2, probe))
+    let updated = m.insert(1, (7, probe))
+    let stored = runtime_rc_probe_count(probe)
+    let copy = updated.get(1)
+    (stored, runtime_rc_probe_count(probe))
+  }
+  -- Three boxes each hold one stake until the family dies.
+  Test.assert_eq(stored, 4)
+  Test.assert_eq(read, 5)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+}
+
+fn boxed_map_churn(n: i64) -> i64 {
+  let mut acc = 0
+  for i in 0..n {
+    let m = map.new<i64, (i64, str)>().insert(i, (i, "v")).insert(i + 1, (i * 2, "vv"))
+    acc = acc + named_score(m.get(i + 1).unwrap_or((0, "")))
+  }
+  acc
+}
+
+test "maps of boxed values churn with a flat heap" {
+  -- The first thousand rounds first-touch the box and region size classes.
+  boxed_map_churn(1000)
+  let before = runtime_rc_test_heap_arena_offset()
+  Test.assert_eq(boxed_map_churn(1000), 1000 * 999 * 100 + 1000 * 2)
+  let after = runtime_rc_test_heap_arena_offset()
+  Test.assert_eq(after, before)
+}
+
+test "publishing a boxed value into a map family promotes its managed lanes" {
+  let probe = runtime_rc_probe_new(1)
+  Test.assert_eq(runtime_rc_probe_is_promoted(probe), 0)
+  let m = map.new<i64, (i64, RuntimeRcProbe)>().insert(1, (1, probe))
+  -- Families promote in constant time by holding only atomic stakes, so a
+  -- boxed value is promoted, lanes included, when the family takes it.
+  Test.assert_eq(runtime_rc_probe_is_promoted(probe), 1)
+  persistent_map_promote(m)
+  Test.assert_true(m.contains_key(1))
 }

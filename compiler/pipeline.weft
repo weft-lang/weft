@@ -12894,6 +12894,11 @@ pub(package) fn pipeline_rc_array_storage_new_hash() -> i64 {
   str_hash(__str_ptr("rc_array_storage_new"), 0, __str_len("rc_array_storage_new"))
 }
 
+pub(package) fn pipeline_rc_persistent_region_register_retained_kind_hash() -> i64 {
+  let name = "rc_persistent_region_register_retained_kind"
+  str_hash(__str_ptr(name), 0, __str_len(name))
+}
+
 pub(package) fn pipeline_rc_array_storage_data_hash() -> i64 {
   str_hash(__str_ptr("rc_array_storage_data"), 0, __str_len("rc_array_storage_data"))
 }
@@ -50417,7 +50422,7 @@ pub(package) fn pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(
               let storage_ty = if type_expr_list_len(call_type_args) == 1 {
                 type_expr_to_node(type_expr_list_nth(call_type_args, 0))
               } else { 0 }
-              let structural_storage = pipeline_lower_structural_vector_storage_call(
+              let structural_storage = pipeline_lower_structural_storage_call(
                 str_hash(src, ns, nl),
                 storage_ty,
                 logical_args,
@@ -50425,7 +50430,7 @@ pub(package) fn pipeline_lower_generic_call_expr_typed_sidecar_handler_opt(
                 tt
               )
               if ir_lowered_expr_is_valid(structural_storage) == 0 and
-                pipeline_vector_storage_call_requires_placement(
+                pipeline_storage_call_requires_placement(
                   str_hash(src, ns, nl),
                   storage_ty,
                   logical_args
@@ -52768,11 +52773,12 @@ pub(package) fn pipeline_lower_plain_record_store(
   }
 }
 
--- Whether a vector storage load or store names an element the word-shaped
--- runtime shim cannot carry: a fixed array, a closed structural value, or
--- any value wider than one word. Such a call must be placed by type; falling
--- back to the shim would erase every lane but the first.
-pub(package) fn pipeline_vector_storage_call_requires_placement(
+-- Whether a collection storage load or store names a value the word-shaped
+-- runtime shim cannot carry: in a vector, a fixed array, a closed structural
+-- value, or any value wider than one word; in a map, a boxed value. Such a
+-- call must be placed by type; falling back to the shim would erase every
+-- lane but the first.
+pub(package) fn pipeline_storage_call_requires_placement(
   callee_hash: i64,
   element: i64,
   values: IrValueList
@@ -52788,18 +52794,111 @@ pub(package) fn pipeline_vector_storage_call_requires_placement(
     nargs == 3 and callee_hash == pipeline_ir_native_vector_storage_load_value_in_bounds_hash()
   }
   let lanes = if element_ty == 0 { 0 } else { pipeline_type_value_lane_count_or_one(element_ty) }
-  storage_call and element_ty != 0 and (
-    ty_is_array(element_ty) or ty_is_record(element_ty) or lanes != 1
-  )
+  let map_call = (
+    callee_hash == pipeline_ir_native_map_storage_retain_stored_hash() and nargs == 2
+  ) or (callee_hash == pipeline_ir_native_map_storage_load_owned_hash() and nargs == 1)
+  (
+    storage_call and element_ty != 0 and (
+      ty_is_array(element_ty) or ty_is_record(element_ty) or lanes != 1
+    )
+  ) or (map_call and cg_layout_word_storage_boxes(element_ty))
 }
 
-pub(package) fn pipeline_lower_structural_vector_storage_call(
+-- A boxed value crosses a word-shaped map slot as its box. Publishing builds
+-- the box holding the storage's stakes in the value's lanes and hands its one
+-- fresh stake to the family region; loading reads the element with fresh
+-- stakes and leaves the box to the storage.
+pub(package) fn pipeline_lower_boxed_map_storage_call(
   callee_hash: i64,
   element: i64,
   values: IrValueList,
   next_value: i64,
   tt: i64
 ) -> IrLoweredExpr {
+  let element_ty = cg_layout_element_representation(element)
+  let nargs = ir_value_list_len(values)
+  if not cg_layout_word_storage_boxes(element_ty) { ir_lowered_expr_invalid(next_value) }
+  else if callee_hash == pipeline_ir_native_map_storage_retain_stored_hash() and nargs == 2 {
+    let region = pipeline_ir_value_list_get_or(values, 0, 0 - 1)
+    let value = pipeline_ir_value_list_get_or(values, 1, 0 - 1)
+    let storage = pipeline_lower_array_literal_storage(ty_array(element_ty, 1), 1, next_value, tt)
+    if ir_lowered_expr_is_valid(storage) == 0 { return ir_lowered_expr_invalid(next_value) }
+    let data = ir_lowered_expr_next_value(storage) - 1
+    let retain = pipeline_inline_storage_retain_inst_list(
+      value,
+      element_ty,
+      0,
+      ir_lowered_expr_next_value(storage),
+      ir_managed_stake_origin_aggregate()
+    )
+    let stored = pipeline_lower_indexed_structural_store_value(
+      data,
+      value,
+      0,
+      element_ty,
+      ir_lowered_expr_next_value(storage) + ir_inst_list_len(retain),
+      tt
+    )
+    if pipeline_lowered_args_is_valid(stored) == 0 { return ir_lowered_expr_invalid(next_value) }
+    let kind = pipeline_lowered_args_next_value(stored)
+    let registered = kind + 1
+    let box = ir_lowered_expr_value(storage)
+    let insts = ir_lowered_expr_insts(storage)
+      |> ir_inst_list_append(retain)
+      |> ir_inst_list_append(pipeline_lowered_args_insts(stored))
+      |> ir_inst_list_append(pipeline_inline_storage_commit_inst_list(value, element_ty, 0))
+      |> ir_inst_list_append(
+        IrInstCons(
+          IrConstI64(kind, continuation_cleanup_kind_rc()),
+          IrInstCons(
+            ir_inst_call_i64(
+              registered,
+              pipeline_rc_persistent_region_register_retained_kind_hash(),
+              ir_value_list_prepend(
+                region,
+                ir_value_list_prepend(box, ir_value_list_prepend(kind, ir_value_list_empty()))
+              )
+            ),
+            IrInstNil
+          )
+        )
+      )
+    ir_lowered_expr(box, registered + 1, insts)
+  } else if callee_hash == pipeline_ir_native_map_storage_load_owned_hash() and nargs == 1 {
+    let data = next_value
+    let read = pipeline_lower_indexed_structural_record_value(data, element_ty, data + 1, tt)
+    if ir_lowered_expr_is_valid(read) == 0 { ir_lowered_expr_invalid(next_value) }
+    else {
+      ir_lowered_expr(
+        ir_lowered_expr_value(read),
+        ir_lowered_expr_next_value(read),
+        IrInstCons(
+          ir_inst_call_i64(
+            data,
+            pipeline_rc_array_storage_data_hash(),
+            ir_value_list_prepend(
+              pipeline_ir_value_list_get_or(values, 0, 0 - 1),
+              ir_value_list_empty()
+            )
+          ),
+          ir_lowered_expr_insts(read)
+        )
+      )
+    }
+  } else { ir_lowered_expr_invalid(next_value) }
+}
+
+pub(package) fn pipeline_lower_structural_storage_call(
+  callee_hash: i64,
+  element: i64,
+  values: IrValueList,
+  next_value: i64,
+  tt: i64
+) -> IrLoweredExpr {
+  if callee_hash == pipeline_ir_native_map_storage_retain_stored_hash() or callee_hash ==
+    pipeline_ir_native_map_storage_load_owned_hash() {
+      return pipeline_lower_boxed_map_storage_call(callee_hash, element, values, next_value, tt)
+    }
   let element_ty = cg_layout_element_representation(element)
   if element_ty == 0 {
     ir_lowered_expr_invalid(next_value)
@@ -56763,7 +56862,7 @@ pub(package) fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(
             let storage_ty = if nlist_len(call_type_args) == 1 { nlist_get(call_type_args, 0) } else {
               0
             }
-            let structural_storage = pipeline_lower_structural_vector_storage_call(
+            let structural_storage = pipeline_lower_structural_storage_call(
               str_hash(src, ns, nl),
               storage_ty,
               logical_args,
@@ -56771,7 +56870,7 @@ pub(package) fn pipeline_lower_generic_call_node_typed_sidecar_handler_opt(
               tt
             )
             if ir_lowered_expr_is_valid(structural_storage) == 0 and
-              pipeline_vector_storage_call_requires_placement(
+              pipeline_storage_call_requires_placement(
                 str_hash(src, ns, nl),
                 storage_ty,
                 logical_args
@@ -77187,7 +77286,10 @@ pub(package) fn pipeline_ir_native_map_scalar_payload_intrinsic(
     if shape == 0 { 0 }
     else {
       let ty = pipeline_ir_native_vector_type_arg_node(type_args)
-      if ty != 0 and cg_managed_drop_kind_for_ty(ty) == 0 { 1 } else { 0 }
+      -- Only words whose storage cleanup kind is none are scalar payloads.
+      if ty != 0 and cg_layout_word_storage_cleanup_kind(ty) == continuation_cleanup_kind_none() {
+        1
+      } else { 0 }
     }
   }
 }
