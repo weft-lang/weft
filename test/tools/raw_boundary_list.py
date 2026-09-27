@@ -13,7 +13,7 @@ import sys
 
 # Lower this with every entry that leaves the list. Never raise it: strict code
 # that needs raw memory it does not reach today needs an honest trusted leaf.
-CEILING = 300
+CEILING = 299
 
 POLICY = sys.argv[1] if len(sys.argv) > 1 else "compiler/source/raw_boundary.weft"
 
