@@ -41,6 +41,12 @@ docs-focus: dev-candidate
     bash test/docs/run_markdown_examples.sh README.md docs/getting-started.md docs/networking.md docs/concurrency.md docs/testing.md
     python3 test/docs/run_source_examples.py
 
+# Run the standalone Linux DNS resolver against a hermetic nameserver in
+# Docker with a fresh candidate. Resolver, socket and descriptor changes need
+# this Linux execution evidence; the Darwin suite only inspects the product.
+linux-dns-gate: dev-candidate
+    WEFT="$PWD/.weft-dev-candidate" sh test/run_linux_dns_gate.sh
+
 # Test the converged candidate without installing it as the trust root.
 # Repository-private fixtures require checkout SDK selection, which depends on
 # the executable being invoked from the checkout rather than from /tmp. The

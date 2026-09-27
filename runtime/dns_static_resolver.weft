@@ -31,20 +31,17 @@ use runtime/dns_static.{
   dns_wire_parse_reply,
   dns_wire_query
 }
-use runtime/memory.{mem_store8_at}
+use runtime/descriptor_io.{descriptor_read_append, descriptor_write_suffix}
 use runtime/secure_random.{runtime_secure_random_bytes}
 use runtime/syscall.{
   sys_close,
-  sys_dns_connect,
   sys_dns_set_receive_timeout,
   sys_dns_tcp_socket,
   sys_dns_udp_socket,
-  sys_read,
   sys_socket_af_inet,
-  sys_socket_af_inet6,
-  sys_socket_sockaddr_prefix,
-  sys_write
+  sys_socket_af_inet6
 }
+use runtime/tcp.{runtime_tcp_connect_descriptor_safe}
 use stdlib/bytes.{Bytes}
 use stdlib/dns as dns
 use stdlib/dns.{
@@ -64,12 +61,12 @@ use stdlib/dns.{
 use stdlib/idna.{DomainName}
 use stdlib/io.{io_read_file_bytes_raw}
 use stdlib/net_address as net
-use stdlib/net_address.{IpAddress, IpV4, IpV6, Ipv4Address, Ipv6Address, SocketAddress}
+use stdlib/net_address.{IpAddress, IpV4, IpV6, SocketAddress, SocketV4, SocketV6}
 use stdlib/num
 use stdlib/option.{None, Some}
 use stdlib/result.{Err, Ok, Result}
 use stdlib/vector as vector
-use stdlib/vector.{vector_data, vector_get_in_bounds, vector_len, vector_push}
+use stdlib/vector.{vector_get_in_bounds, vector_len, vector_push}
 use stdlib/vector/handles.{Vector}
 
 type DnsLinuxExchange {
@@ -82,32 +79,6 @@ fn dns_resolver_u8(value: i64) -> u8 {
   value.to_u8_checked().unwrap_or(0)
 }
 
-fn dns_resolver_u16_i64(value: u16) -> i64 { __u64_to_i64(value.to_u64()) }
-
-fn dns_resolver_ipv4_octet(address: Ipv4Address, index: i64) -> i64 {
-  match address.octet(__i64_to_usize(index)) {
-    Some(value) -> __u64_to_i64(__u8_to_u64(value))
-    None -> 0
-  }
-}
-
-fn dns_resolver_ipv6_segment(address: Ipv6Address, index: i64) -> i64 {
-  match address.segment(__i64_to_usize(index)) {
-    Some(value) -> dns_resolver_u16_i64(value)
-    None -> 0
-  }
-}
-
-fn dns_resolver_store_u16(pointer: i64, offset: i64, value: i64) -> i64 {
-  mem_store8_at(pointer, offset, value band 255)
-  mem_store8_at(pointer, offset + 1, (value bshr 8) band 255)
-}
-
-fn dns_resolver_zero(pointer: i64, count: i64) -> i64 {
-  for index in 0..count { mem_store8_at(pointer, index, 0) }
-  count
-}
-
 fn dns_resolver_server_family(server: IpAddress) -> i64 {
   match server {
     IpV4(_) -> sys_socket_af_inet()
@@ -115,48 +86,12 @@ fn dns_resolver_server_family(server: IpAddress) -> i64 {
   }
 }
 
-fn dns_resolver_encode_server(server: IpAddress, storage: i64) -> i64 {
-  dns_resolver_zero(storage, 28)
+--- Nameservers listen on the DNS port of their configured address.
+fn dns_resolver_server_address(server: IpAddress) -> SocketAddress {
   match server {
-    IpV4(address) -> {
-      let family = sys_socket_af_inet()
-      dns_resolver_store_u16(storage, 0, sys_socket_sockaddr_prefix(family, 16))
-      mem_store8_at(storage, 2, 0)
-      mem_store8_at(storage, 3, 53)
-      for index in 0..4 {
-        mem_store8_at(storage, 4 + index, dns_resolver_ipv4_octet(address, index))
-      }
-      16
-    }
-    IpV6(address) -> {
-      let family = sys_socket_af_inet6()
-      dns_resolver_store_u16(storage, 0, sys_socket_sockaddr_prefix(family, 28))
-      mem_store8_at(storage, 2, 0)
-      mem_store8_at(storage, 3, 53)
-      for index in 0..8 {
-        let segment = dns_resolver_ipv6_segment(address, index)
-        mem_store8_at(storage, 8 + index * 2, (segment bshr 8) band 255)
-        mem_store8_at(storage, 9 + index * 2, segment band 255)
-      }
-      28
-    }
+    IpV4(address) -> SocketV4(address, 53)
+    IpV6(address) -> SocketV6(address, 53, 0)
   }
-}
-
-fn dns_resolver_response_buffer(size: i64) -> Vector<u8> {
-  let values = vector.with_capacity<u8>(
-    size.to_usize_checked().expect("DNS response buffer size is nonnegative")
-  )
-  for index in 0..size { vector_push<u8>(values, dns_resolver_u8(0)) }
-  values
-}
-
-fn dns_resolver_copy_prefix(values: Vector<u8>, count: i64) -> Vector<u8> {
-  let out = vector.with_capacity<u8>(
-    count.to_usize_checked().expect("DNS prefix count is nonnegative")
-  )
-  for index in 0..count { vector_push<u8>(out, vector_get_in_bounds<u8>(values, index)) }
-  out
 }
 
 fn dns_resolver_connected_socket(server: IpAddress, stream: bool, timeout_ms: i64) -> i64 {
@@ -167,11 +102,9 @@ fn dns_resolver_connected_socket(server: IpAddress, stream: bool, timeout_ms: i6
   }
   if fd < 0 { fd }
   else {
-    let storage = dns_resolver_response_buffer(28)
-    let size = dns_resolver_encode_server(server, vector_data<u8>(storage))
     let timeout_status = sys_dns_set_receive_timeout(fd, timeout_ms)
     let connect_status = if timeout_status == 0 {
-      sys_dns_connect(fd, vector_data<u8>(storage), size)
+      runtime_tcp_connect_descriptor_safe(fd, dns_resolver_server_address(server))
     } else { timeout_status }
     if connect_status == 0 { fd } else { sys_close(fd); connect_status }
   }
@@ -186,15 +119,15 @@ fn dns_resolver_udp_exchange(
   if fd < 0 { DnsLinuxExchangeTemporary }
   else {
     let query_len = vector_len<u8>(query)
-    let written = sys_write(fd, vector_data<u8>(query), query_len)
-    let scratch = dns_resolver_response_buffer(4096)
-    let received = if written == query_len { sys_read(fd, vector_data<u8>(scratch), 4096) } else {
+    let written = descriptor_write_suffix(fd, query, 0)
+    let mut reply = vector.new<u8>()
+    let received = if written == query_len { descriptor_read_append(fd, reply, 4096) } else {
       0 - 1
     }
     let close_status = sys_close(fd)
-    if received > 0 and received <= 4096 {
-      DnsLinuxExchangeBytes(dns_resolver_copy_prefix(scratch, received))
-    } else { DnsLinuxExchangeTemporary }
+    if received > 0 and received <= 4096 { DnsLinuxExchangeBytes(reply) } else {
+      DnsLinuxExchangeTemporary
+    }
   }
 }
 
@@ -203,7 +136,7 @@ fn dns_resolver_write_all(fd: i64, values: Vector<u8>) -> bool {
   let mut offset = 0
   let mut failed = false
   while offset < total and not failed {
-    let status = sys_write(fd, vector_data<u8>(values) + offset, total - offset)
+    let status = descriptor_write_suffix(fd, values, __i64_to_usize(offset))
     if status > 0 and status <= total - offset { offset = offset + status }
     else { failed = true }
   }
@@ -213,13 +146,12 @@ fn dns_resolver_write_all(fd: i64, values: Vector<u8>) -> bool {
 fn dns_resolver_read_exact(fd: i64, count: i64) -> DnsLinuxExchange {
   if count < 0 or count > 65535 { DnsLinuxExchangeResourceExhausted }
   else {
-    let values = dns_resolver_response_buffer(count)
-    let mut offset = 0
+    let mut values = vector.with_capacity<u8>(__i64_to_usize(count))
     let mut failed = false
-    while offset < count and not failed {
-      let status = sys_read(fd, vector_data<u8>(values) + offset, count - offset)
-      if status > 0 and status <= count - offset { offset = offset + status }
-      else { failed = true }
+    while vector_len<u8>(values) < count and not failed {
+      let remaining = count - vector_len<u8>(values)
+      let status = descriptor_read_append(fd, values, __i64_to_usize(remaining))
+      if status <= 0 or status > remaining { failed = true } else { nil }
     }
     if failed { DnsLinuxExchangeTemporary } else { DnsLinuxExchangeBytes(values) }
   }
