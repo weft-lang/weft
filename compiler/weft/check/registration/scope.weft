@@ -6,6 +6,7 @@
 
 use compiler/project/identity.{*}
 use compiler/source/raw_boundary.{*}
+use compiler/source/trust.{SourceAuthority, StrictSourceAuthority, TrustedSourceAuthority}
 use compiler/project/identity/equality.{declaration_identity_eq, module_identity_eq}
 use compiler/project/module.{
   DeclVisibility,
@@ -600,37 +601,41 @@ fn module_logical_path(identity: ModuleIdentity) -> str {
   }
 }
 
--- Whether the raw boundary refuses this edge's importer a raw-memory binding.
-fn import_raw_memory_refused(edge: ResolvedImport, importer_trusted: bool) -> bool {
-  raw_boundary_import_refused(
-    importer_trusted,
-    module_logical_path(edge.importer),
-    visibility_rank(edge.visibility) > 0
-  )
-}
+-- The raw boundary's view of one import edge, decided once per edge: whether
+-- the importer may be refused a raw binding, and whether the target is a
+-- trusted module, whose exports are raw unless audited safe.
+type RawImport { refusable: bool, target_trusted: bool }
 
-fn module_reaches_raw_memory(identity: ModuleIdentity) -> bool {
-  match raw_boundary_module(module_logical_path(identity)) {
-    NotRawMemory -> false
-    _ -> true
+fn authority_trusted(authority: SourceAuthority) -> bool {
+  match authority {
+    TrustedSourceAuthority -> true
+    StrictSourceAuthority -> false
   }
 }
 
--- Whether a candidate reaches raw memory: any member of a raw family, a raw
--- member of runtime/string, or a raw module bound under a name. A re-exported
--- declaration keeps the module that declared it.
-fn candidate_reaches_raw_memory(candidate: ScopeCandidate) -> bool {
+fn raw_import(edge: ResolvedImport, importer_trusted: bool, target_trusted: bool) -> RawImport {
+  RawImport {
+    refusable: raw_boundary_import_refused(
+      importer_trusted,
+      module_logical_path(edge.importer),
+      visibility_rank(edge.visibility) > 0
+    ),
+    target_trusted: target_trusted
+  }
+}
+
+-- Whether the boundary refuses a candidate: a trusted module bound under a
+-- name, or a trusted export outside its module's safe surface. A strict module
+-- re-exports only safe exports, so a declaration re-exported through the
+-- target keeps the safe surface of the module that declared it.
+fn raw_import_refuses(raw: RawImport, candidate: ScopeCandidate) -> bool {
+  if not raw.refusable or not raw.target_trusted { return false }
   match candidate.target {
-    ScopeModuleTarget(identity) -> module_reaches_raw_memory(identity)
-    ScopeDeclarationTarget(name) -> match raw_boundary_module(
-      module_logical_path(declaration_identity_module(name.identity))
-    ) {
-      RawMemoryFamily -> true
-      RawMemoryMembers -> raw_boundary_string_member(
-        required_text(declaration_identity_name(name.identity))
-      )
-      NotRawMemory -> false
-    }
+    ScopeModuleTarget(_) -> true
+    ScopeDeclarationTarget(name) -> not raw_boundary_safe_export(
+      module_logical_path(declaration_identity_module(name.identity)),
+      required_text(declaration_identity_name(name.identity))
+    )
   }
 }
 
@@ -638,14 +643,14 @@ fn import_candidate(
   entries: borrow Vector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
-  importer_trusted: bool,
+  raw: RawImport,
   target_entry: ScopeEntry,
   spelling: str,
   candidate: ScopeCandidate,
   origin: Option<Span>,
   issue_location: Option<Span>
 ) -> nil {
-  if candidate_reaches_raw_memory(candidate) and import_raw_memory_refused(edge, importer_trusted) {
+  if raw_import_refuses(raw, candidate) {
     add_issue(
       issues,
       edge,
@@ -691,7 +696,7 @@ fn import_entry(
   entries: borrow Vector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
-  importer_trusted: bool,
+  raw: RawImport,
   target_entry: ScopeEntry,
   spelling: str,
   origin: Option<Span>,
@@ -702,7 +707,7 @@ fn import_entry(
       entries,
       issues,
       edge,
-      importer_trusted,
+      raw,
       target_entry,
       spelling,
       target_entry.primary,
@@ -714,7 +719,7 @@ fn import_entry(
         entries,
         issues,
         edge,
-        importer_trusted,
+        raw,
         target_entry,
         spelling,
         target_entry.primary,
@@ -726,7 +731,7 @@ fn import_entry(
           entries,
           issues,
           edge,
-          importer_trusted,
+          raw,
           target_entry,
           spelling,
           conflict,
@@ -754,11 +759,11 @@ fn add_wildcard_import(
   target_entries: PersistentVector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
-  importer_trusted: bool
+  raw: RawImport
 ) -> nil {
-  -- A wildcard cannot select around raw members, so a raw module refuses the
-  -- whole import once.
-  if module_reaches_raw_memory(edge.target) and import_raw_memory_refused(edge, importer_trusted) {
+  -- A wildcard cannot select around raw exports, so a trusted module refuses
+  -- the whole import once.
+  if raw.refusable and raw.target_trusted {
     add_issue(
       issues,
       edge,
@@ -779,7 +784,7 @@ fn add_wildcard_import(
           entries,
           issues,
           edge,
-          importer_trusted,
+          raw,
           entry,
           entry.spelling,
           edge.location,
@@ -795,7 +800,7 @@ fn add_selected_import(
   target_entries: PersistentVector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
-  importer_trusted: bool,
+  raw: RawImport,
   selected: Span,
   local: Span
 ) -> nil {
@@ -817,7 +822,7 @@ fn add_selected_import(
       entries,
       issues,
       edge,
-      importer_trusted,
+      raw,
       persistent_get_in_bounds<ScopeEntry>(target_entries, index),
       local_name,
       Some(local),
@@ -831,33 +836,32 @@ fn add_import(
   target_entries: PersistentVector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
-  importer_trusted: bool
+  raw: RawImport
 ) -> nil {
   match edge.binding {
-    ResolvedModuleImport(alias) -> if module_reaches_raw_memory(edge.target) and
-      import_raw_memory_refused(edge, importer_trusted) {
-        add_issue(
-          issues,
-          edge,
-          required_text(alias),
-          ScopeImportRawMemory,
-          Some(alias),
-          None,
-          None
-        )
-      } else {
-        add_binding(
-          entries,
-          edge.importer,
-          required_text(alias),
-          ScopeCandidate {
-            target: ScopeModuleTarget(edge.target),
-            visibility: edge.visibility,
-            weak: edge.weak,
-            origin: Some(alias)
-          }
-        )
-      }
+    ResolvedModuleImport(alias) -> if raw.refusable and raw.target_trusted {
+      add_issue(
+        issues,
+        edge,
+        required_text(alias),
+        ScopeImportRawMemory,
+        Some(alias),
+        None,
+        None
+      )
+    } else {
+      add_binding(
+        entries,
+        edge.importer,
+        required_text(alias),
+        ScopeCandidate {
+          target: ScopeModuleTarget(edge.target),
+          visibility: edge.visibility,
+          weak: edge.weak,
+          origin: Some(alias)
+        }
+      )
+    }
     ResolvedSymbolImport(selections) -> for selection in selections {
       match selection {
         ResolvedImportWildcard -> add_wildcard_import(
@@ -865,14 +869,14 @@ fn add_import(
           target_entries,
           issues,
           edge,
-          importer_trusted
+          raw
         )
         ResolvedImportSymbol(selected, local) -> add_selected_import(
           entries,
           target_entries,
           issues,
           edge,
-          importer_trusted,
+          raw,
           selected,
           local
         )
@@ -1006,10 +1010,18 @@ fn build_module(
               target_entries,
               issues,
               edge,
-              match vector_get_in_bounds<RegisteredModule>(modules, index).authority {
-                TrustedSourceAuthority -> true
-                StrictSourceAuthority -> false
-              }
+              raw_import(
+                edge,
+                authority_trusted(
+                  vector_get_in_bounds<RegisteredModule>(modules, index).authority
+                ),
+                raw_boundary_trusted_runtime(
+                  authority_trusted(
+                    vector_get_in_bounds<RegisteredModule>(modules, target_index).authority
+                  ),
+                  module_logical_path(edge.target)
+                )
+              )
             )
           } else { nil }
         }

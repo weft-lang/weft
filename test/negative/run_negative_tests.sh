@@ -98,6 +98,10 @@ check_rejects raw_boundary_string_wildcard test/negative/raw_boundary_string_wil
 check_rejects raw_boundary_string_alias test/negative/raw_boundary_string_alias.weft "error[E4008]: import 'text' reaches raw memory" 1
 check_rejects raw_boundary_string_mixed_selection test/negative/raw_boundary_string_mixed_selection.weft "line 1, col 38: error[E4008]: import 'runtime_str_ptr' reaches raw memory" 1
 check_rejects raw_boundary_string_intrinsic test/negative/raw_boundary_string_intrinsic.weft "type error: string address intrinsics are sealed to trusted runtime/platform code" 1
+check_rejects raw_boundary_syscall_address test/negative/raw_boundary_syscall_address.weft "error[E4008]: import 'sys_write' reaches raw memory" 1
+check_rejects raw_boundary_storage_handle test/negative/raw_boundary_storage_handle.weft "error[E4008]: import 'vector_storage_data' reaches raw memory" 1
+check_rejects raw_boundary_trusted_wildcard test/negative/raw_boundary_trusted_wildcard.weft "error[E4008]: import 'runtime/tcp' reaches raw memory" 1
+check_rejects raw_boundary_trusted_alias test/negative/raw_boundary_trusted_alias.weft "error[E4008]: import 'descriptors' reaches raw memory" 1
 check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
 check_rejects checked_grammar_impl_effect_identity test/negative/checked_grammar_impl_effect_identity.weft 'impl method effect mismatch' 1
 check_rejects checked_grammar_requires_host_effect test/negative/checked_grammar_requires_host_effect.weft 'error[E2001]: effect `TypeCheck<G.Identity>` is not available in this context' 1

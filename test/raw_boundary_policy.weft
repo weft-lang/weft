@@ -15,6 +15,8 @@ use compiler/weft/check/registration/scope.{
 }
 use compiler/weft/grammar.{WeftParser, ParsedWeftSource}
 use runtime/string.{runtime_str_byte_at, runtime_str_len}
+use runtime/syscall.{sys_socket_af_inet}
+use runtime/terminal.{terminal_color_mode_always, terminal_color_policy}
 use stdlib/diagnostic.{Diagnose}
 use stdlib/grammar.{Grammar, Parsed}
 use stdlib/list as list
@@ -26,29 +28,35 @@ use stdlib/result.{Result}
 use stdlib/string.{str_concat, str_ends_with, str_len, str_starts_with}
 use stdlib/test/property as prop
 
-fn kind_name(kind: RawMemoryModule) -> str {
-  match kind {
-    RawMemoryFamily -> "family"
-    RawMemoryMembers -> "members"
-    NotRawMemory -> "none"
-  }
+test "only trusted modules under runtime form the raw ring" {
+  Test.assert_true(raw_boundary_trusted_runtime(true, "runtime/memory"))
+  Test.assert_true(raw_boundary_trusted_runtime(true, "runtime/tls_mbedtls"))
+  Test.assert_false(raw_boundary_trusted_runtime(false, "runtime/memory"))
+  Test.assert_false(raw_boundary_trusted_runtime(true, "native/raw"))
+  Test.assert_false(raw_boundary_trusted_runtime(true, "stdlib/runtime/memory"))
+  Test.assert_false(raw_boundary_trusted_runtime(true, "runtimes/memory"))
+  Test.assert_false(raw_boundary_trusted_runtime(true, "runtime"))
 }
 
-test "raw families and runtime string members are classified by exact path" {
-  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/memory")), "family")
-  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/buffer")), "family")
-  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/alloc")), "family")
-  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/string")), "members")
-  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/memory.weft")), "none")
-  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/memory/extra")), "none")
-  Test.assert_str_eq(kind_name(raw_boundary_module("stdlib/memory")), "none")
-  Test.assert_str_eq(kind_name(raw_boundary_module("")), "none")
-  Test.assert_true(raw_boundary_string_member("runtime_str_ptr"))
-  Test.assert_true(raw_boundary_string_member("runtime_str_from_bytes_copy"))
-  Test.assert_true(raw_boundary_string_member("runtime_str_word_as_str"))
-  Test.assert_false(raw_boundary_string_member("runtime_str_len"))
-  Test.assert_false(raw_boundary_string_member("runtime_str_byte_at"))
-  Test.assert_false(raw_boundary_string_member("runtime_str_ptr_extra"))
+test "trusted exports are raw unless they belong to the audited safe surface" {
+  Test.assert_true(raw_boundary_safe_export("runtime/tcp", "runtime_tcp_connect_safe"))
+  Test.assert_true(raw_boundary_safe_export("runtime/string", "runtime_str_len"))
+  Test.assert_true(raw_boundary_safe_export("runtime/descriptor_io", "descriptor_read_into"))
+  Test.assert_true(raw_boundary_safe_export("runtime/syscall", "sys_close"))
+  Test.assert_true(raw_boundary_safe_export("runtime/unsafe", "Unsafe"))
+  -- Raw families, raw string members and raw-address syscalls stay raw.
+  Test.assert_false(raw_boundary_safe_export("runtime/memory", "mem_load8_at"))
+  Test.assert_false(raw_boundary_safe_export("runtime/alloc", "alloc_words"))
+  Test.assert_false(raw_boundary_safe_export("runtime/string", "runtime_str_ptr"))
+  Test.assert_false(raw_boundary_safe_export("runtime/syscall", "sys_read"))
+  Test.assert_false(raw_boundary_safe_export("runtime/syscall", "sys_write"))
+  Test.assert_false(raw_boundary_safe_export("runtime/tcp", "runtime_tcp_connect_raw"))
+  Test.assert_false(raw_boundary_safe_export("runtime/vector_storage", "vector_storage_data"))
+  -- A safe name is safe only in the module that declares it.
+  Test.assert_false(raw_boundary_safe_export("runtime/memory", "runtime_str_len"))
+  Test.assert_false(raw_boundary_safe_export("runtime", "tcp.runtime_tcp_connect_safe"))
+  Test.assert_false(raw_boundary_safe_export("runtime/tcp.runtime_tcp", "connect_safe"))
+  Test.assert_false(raw_boundary_safe_export("", ""))
 }
 
 test "strict modules bind raw memory only while listed and re-export it only while trusted" {
@@ -61,7 +69,8 @@ test "strict modules bind raw memory only while listed and re-export it only whi
   Test.assert_false(raw_boundary_import_refused(true, "runtime/rc", true))
   Test.assert_false(raw_boundary_import_refused(true, "", true))
   -- Migrated and new strict modules may do neither.
-  Test.assert_true(raw_boundary_import_refused(false, "stdlib/bytes", false))
+  Test.assert_true(raw_boundary_import_refused(false, "stdlib/utf8", false))
+  Test.assert_true(raw_boundary_import_refused(false, "runtime/dns_static_resolver", false))
   Test.assert_true(raw_boundary_import_refused(false, "compiler/backend/binary", false))
   Test.assert_true(raw_boundary_import_refused(false, "test/raw_boundary_policy", false))
   Test.assert_true(raw_boundary_import_refused(false, "", false))
@@ -72,6 +81,7 @@ test "strict modules bind raw memory only while listed and re-export it only whi
   -- The first and last listed paths bound the search.
   Test.assert_true(raw_boundary_transitional("compiler/backend/aarch64/codegen"))
   Test.assert_true(raw_boundary_transitional("tools/typed_differential"))
+  Test.assert_true(raw_boundary_transitional("stdlib/vector"))
   Test.assert_false(raw_boundary_transitional("a"))
   Test.assert_false(raw_boundary_transitional("zzz"))
   Test.assert_str_eq(raw_boundary_logical_path("test/example.weft"), "test/example")
@@ -112,10 +122,12 @@ test "logical paths ignore leading ./ and drop exactly one .weft suffix" {
 }
 
 -- One generated import: who imports, from where, how visibly, from which
--- target, in which form, and which of the eight members it selects or renames.
+-- target and with what authority, in which form, and which of the eight
+-- members it selects or renames.
 type BoundaryCase {
   trusted: bool,
   listed: bool,
+  target_trusted: bool,
   visibility: usize,
   target: usize,
   form: usize,
@@ -123,7 +135,8 @@ type BoundaryCase {
   renamed: usize
 }
 
--- Even members are raw members of runtime/string; odd members are safe.
+-- Even members are raw exports of runtime/string; odd members belong to its
+-- audited safe surface. No member is safe in any other module.
 fn boundary_member(index: usize) -> str {
   let members = [
     "runtime_str_ptr",
@@ -131,9 +144,9 @@ fn boundary_member(index: usize) -> str {
     "runtime_str_set_len",
     "runtime_str_byte_at",
     "runtime_str_from_bytes_copy",
-    "runtime_str_hash",
+    "runtime_str_concat",
     "runtime_str_word_as_str",
-    "runtime_str_is_empty"
+    "runtime_str_eq"
   ]
   members[index]
 }
@@ -160,6 +173,7 @@ fn boundary_case(draws: List<usize>) -> BoundaryCase {
   BoundaryCase {
     trusted: boundary_draw(draws, 0) % 2 == 1,
     listed: boundary_draw(draws, 1) % 2 == 1,
+    target_trusted: boundary_draw(draws, 7) % 2 == 1,
     visibility: boundary_draw(draws, 2) % 3,
     target: boundary_draw(draws, 3) % 3,
     form: boundary_draw(draws, 4) % 3,
@@ -228,7 +242,7 @@ fn boundary_module(text: str, path: str, authority: SourceAuthority) -[Test]> Re
   )
 }
 
-fn boundary_target(target: usize) -[Test]> RegisteredModule {
+fn boundary_target(target: usize, trusted: bool) -[Test]> RegisteredModule {
   let mut text = ""
   let mut index: usize = 0
   while index < 8 {
@@ -238,26 +252,30 @@ fn boundary_target(target: usize) -[Test]> RegisteredModule {
     )
     index = index + 1
   }
-  boundary_module(text, boundary_target_path(target), StrictSourceAuthority)
+  boundary_module(
+    text,
+    boundary_target_path(target),
+    if trusted { TrustedSourceAuthority } else { StrictSourceAuthority }
+  )
 }
 
 -- The oracle states the policy independently of the implementation's tables:
--- a trusted importer is never refused, a strict re-export always is, and a
--- strict private import is refused unless its path is listed. A refused
--- selection reports each raw member it names; a refused wildcard or module
--- alias reports once.
+-- only a trusted runtime target's exports can be raw; a trusted importer is never
+-- refused, a strict re-export always is, and a strict private import is
+-- refused unless its path is listed. A refused selection reports each raw
+-- member it names; a refused wildcard or module alias reports once.
 fn boundary_expected_issues(case: BoundaryCase) -> usize {
   let zero: usize = 0
   let one: usize = 1
   let refused = if case.trusted { false } else if case.visibility > 0 { true } else {
     not case.listed
   }
-  if not refused or case.target == 2 { return zero }
+  if not refused or not case.target_trusted or case.target == 2 { return zero }
   if case.form != 0 { return one }
   let mut count: usize = 0
   let mut index: usize = 0
   while index < 8 {
-    if boundary_bit(case.selected, index) and (case.target == 1 or index % 2 == 0) {
+    if boundary_bit(case.selected, index) and (case.target != 0 or index % 2 == 0) {
       count = count + 1
     }
     index = index + 1
@@ -282,7 +300,7 @@ fn boundary_raw_issues(scope: RegistrationScope) -> usize {
 
 fn boundary_refusals_follow_policy(draws: List<usize>) -[Test]> bool {
   let case = boundary_case(draws)
-  let target = boundary_target(case.target)
+  let target = boundary_target(case.target, case.target_trusted)
   let importer = boundary_module(
     str_concat(boundary_import(case), " fn main() -> i64 { 0 }"),
     if case.listed { "compiler/pipeline" } else { "test/boundary_probe" },
@@ -305,7 +323,7 @@ fn boundary_refusals_follow_policy(draws: List<usize>) -[Test]> bool {
 
 test "generated imports are refused exactly where the raw boundary policy says" {
   let draw = prop.usize_below(256).expect("the draw domain is nonempty")
-  let lengths = prop.lengths(7, 7).expect("a case takes seven draws")
+  let lengths = prop.lengths(8, 8).expect("a case takes eight draws")
   let config = prop.config(random.seed(0x5241574252445259), 300, 16, 0, 200).expect(
     "the boundary campaign is valid"
   )
@@ -315,4 +333,9 @@ test "generated imports are refused exactly where the raw boundary policy says" 
 test "unlisted strict code keeps the safe runtime string members" {
   Test.assert_eq(runtime_str_len("boundary"), 8)
   Test.assert_eq(runtime_str_byte_at("boundary", 0), 98)
+}
+
+test "unlisted strict code binds audited safe exports of trusted modules" {
+  Test.assert_eq(terminal_color_policy(0, terminal_color_mode_always()), 1)
+  Test.assert_eq(sys_socket_af_inet(), 2)
 }

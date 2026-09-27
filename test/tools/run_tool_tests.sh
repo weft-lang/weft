@@ -1527,30 +1527,10 @@ assert_equals "run_forwards_product_exit_status" "$run_exit" "42"
 assert_equals "run_product_stdout_is_inherited" "$(<"$tmp_out")" ""
 assert_equals "run_product_stderr_is_inherited" "$(<"$tmp_err")" ""
 
-tmp_run_args_source="$tmp_scratch_dir/run_args.weft"
-printf '%s\n' \
-  'use runtime/env as env_handler' \
-  'use stdlib/env.{Env}' \
-  '' \
-  'fn inspect_args() -[Env]> i64 {' \
-  '  if Env.arg_count() != 3 { 10 }' \
-  '  else {' \
-  '    match Env.arg(1) {' \
-  '      nil -> 11' \
-  '      first -> if first != "alpha" { 12 } else {' \
-  '        match Env.arg(2) {' \
-  '          nil -> 13' \
-  '          second -> if second == "two words" { 0 } else { 14 }' \
-  '        }' \
-  '      }' \
-  '    }' \
-  '  }' \
-  '}' \
-  '' \
-  'fn main(argc: i64, argv: i64) -> i64 {' \
-  '  with env_handler(argc, argv) { inspect_args() }' \
-  '}' > "$tmp_run_args_source"
-run_weft_compile_guarded "$WEFT" run "$tmp_run_args_source" -- alpha "two words" > "$tmp_out" 2> "$tmp_err"
+# Products that read the argument vector install their platform handler from
+# it, so they live in listed fixtures rather than scratch files.
+run_args_source="test/fixtures/run_product/arguments.weft"
+run_weft_compile_guarded "$WEFT" run "$run_args_source" -- alpha "two words" > "$tmp_out" 2> "$tmp_err"
 assert_equals "run_forwards_exact_product_arguments_stdout" "$(<"$tmp_out")" ""
 assert_equals "run_forwards_exact_product_arguments_stderr" "$(<"$tmp_err")" ""
 
@@ -1578,44 +1558,17 @@ assert_equals "run_product_reads_inherited_stdin" "$run_stdin_exit" "5"
 assert_equals "run_product_stdin_stderr_empty" "$(<"$tmp_err")" ""
 
 # A product ended by a signal reports 128 plus its number.
-tmp_run_signal_source="$tmp_scratch_dir/run_signal.weft"
-printf '%s\n' \
-  'use runtime/process as process_handler' \
-  'use stdlib/list.{Cons, Nil}' \
-  'use stdlib/process.{Proc}' \
-  '' \
-  'fn main(argc: i64, argv: i64) -> i64 {' \
-  '  with process_handler(argc, argv) {' \
-  '    Proc.run("/bin/sh", Cons("-c", Cons("kill -9 $PPID", Nil<str>())))' \
-  '  }' \
-  '  0' \
-  '}' > "$tmp_run_signal_source"
+run_signal_source="test/fixtures/run_product/signalled.weft"
 set +e
-run_weft_compile_guarded "$WEFT" run "$tmp_run_signal_source" < /dev/null > "$tmp_out" 2> "$tmp_err"
+run_weft_compile_guarded "$WEFT" run "$run_signal_source" < /dev/null > "$tmp_out" 2> "$tmp_err"
 run_signal_exit=$?
 set -e
 assert_equals "run_signalled_product_exits_128_plus_signal" "$run_signal_exit" "137"
 
 # The product runs from a private temporary executable that is gone once
 # the run ends.
-tmp_run_self_source="$tmp_scratch_dir/run_self.weft"
-printf '%s\n' \
-  'use runtime/env as env_handler' \
-  'use stdlib/console as console' \
-  'use stdlib/console/terminal as console_terminal' \
-  'use stdlib/env.{Env}' \
-  '' \
-  'fn main(argc: i64, argv: i64) -> i64 {' \
-  '  let name = with env_handler(argc, argv) { Env.arg(0) }' \
-  '  match name {' \
-  '    nil -> 1' \
-  '    text: str -> {' \
-  '      with console_terminal() { console.print(text) }' \
-  '      0' \
-  '    }' \
-  '  }' \
-  '}' > "$tmp_run_self_source"
-run_weft_compile_guarded "$WEFT" run "$tmp_run_self_source" < /dev/null > "$tmp_out" 2> "$tmp_err"
+run_self_source="test/fixtures/run_product/self_path.weft"
+run_weft_compile_guarded "$WEFT" run "$run_self_source" < /dev/null > "$tmp_out" 2> "$tmp_err"
 run_self_path=$(<"$tmp_out")
 assert_contains "run_product_runs_from_private_temporary" "$run_self_path" "/tmp/weft-exec-"
 assert_equals "run_removes_temporary_executable" "$(test -e "$run_self_path"; echo $?)" "1"
@@ -7442,18 +7395,19 @@ set -e
 assert_equals "test_rc_quarantine_env_quarantines_roots" "$quarantine_root_exit" "0"
 assert_equals "test_rc_quarantine_is_off_by_default" "$ordinary_root_exit" "1"
 # A failing root's trap report carries the freeing history only when the
-# runner built it with the quarantine.
-sed 's/^-- Expected exit code: 102/-- Expected exit code: 0/' test/rc_quarantine_trace_exit.weft > "$tmp_import"
+# runner built it with the quarantine. The root releases runtime memory
+# directly, so it is a listed fixture rather than a scratch copy.
+quarantine_unexpected_root="test/fixtures/rc_quarantine_trace_unexpected.weft"
 set +e
-env WEFT_TEST_RC_QUARANTINE=1 "$WEFT" test --jobs 1 "$tmp_import" > "$tmp_out" 2>"$tmp_err"
+env WEFT_TEST_RC_QUARANTINE=1 "$WEFT" test --jobs 1 "$quarantine_unexpected_root" > "$tmp_out" 2>"$tmp_err"
 quarantine_legacy_exit=$?
 quarantine_legacy_err=$(<"$tmp_err")
-"$WEFT" test --jobs 1 "$tmp_import" > "$tmp_out" 2>"$tmp_err"
+"$WEFT" test --jobs 1 "$quarantine_unexpected_root" > "$tmp_out" 2>"$tmp_err"
 ordinary_legacy_err=$(<"$tmp_err")
 set -e
 assert_equals "test_rc_quarantine_expected_exit_root_fails" "$quarantine_legacy_exit" "1"
 assert_contains "test_rc_quarantine_expected_exit_root_reports_the_free" "$quarantine_legacy_err" "freed by release #1:"
-assert_contains "test_rc_quarantine_expected_exit_root_names_the_freeing_caller" "$quarantine_legacy_err" "free_after at $tmp_import:8:4"
+assert_contains "test_rc_quarantine_expected_exit_root_names_the_freeing_caller" "$quarantine_legacy_err" "free_after at $quarantine_unexpected_root:8:4"
 assert_not_contains "test_rc_quarantine_expected_exit_root_is_ordinary_by_default" "$ordinary_legacy_err" "freed by release"
 
 # A shared optimised dependency product replaces a root's dependency functions
