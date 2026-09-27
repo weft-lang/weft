@@ -87,6 +87,17 @@ check_rejects staging_site_interpolated_source test/negative/staging_site_interp
 check_rejects staging_site_escaped_source test/negative/staging_site_escaped_source.weft 'error[E1010]:' 1
 check_rejects staging_site_computed_source test/negative/staging_site_computed_source.weft 'error[E1010]:' 1
 check_rejects staging_site_through_lambda test/negative/staging_site_through_lambda.weft 'error[E1010]:' 1
+check_rejects raw_boundary_named_member test/negative/raw_boundary_named_member.weft "error[E4008]: import 'mem_load64_at' reaches raw memory" 1
+check_rejects raw_boundary_module_alias test/negative/raw_boundary_module_alias.weft "error[E4008]: import 'buffer' reaches raw memory" 1
+check_rejects raw_boundary_wildcard test/negative/raw_boundary_wildcard.weft "error[E4008]: import 'runtime/alloc' reaches raw memory" 1
+check_rejects raw_boundary_function_value test/negative/raw_boundary_function_value.weft "error[E4008]: import 'memory' reaches raw memory" 1
+check_rejects raw_boundary_reexport test/negative/raw_boundary_reexport.weft "error[E4008]: import 'mem_store8_at' reaches raw memory" 1
+check_rejects raw_boundary_through_wrapper test/negative/raw_boundary_through_wrapper.weft "raw_boundary_wrapper.weft: line 5, col 21: error[E4008]: import 'mem_load8_at' reaches raw memory" 1
+check_rejects raw_boundary_string_member test/negative/raw_boundary_string_member.weft "error[E4008]: import 'runtime_str_from_bytes_copy' reaches raw memory" 1
+check_rejects raw_boundary_string_wildcard test/negative/raw_boundary_string_wildcard.weft "error[E4008]: import 'runtime/string' reaches raw memory" 1
+check_rejects raw_boundary_string_alias test/negative/raw_boundary_string_alias.weft "error[E4008]: import 'text' reaches raw memory" 1
+check_rejects raw_boundary_string_mixed_selection test/negative/raw_boundary_string_mixed_selection.weft "line 1, col 38: error[E4008]: import 'runtime_str_ptr' reaches raw memory" 1
+check_rejects raw_boundary_string_intrinsic test/negative/raw_boundary_string_intrinsic.weft "type error: string address intrinsics are sealed to trusted runtime/platform code" 1
 check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
 check_rejects checked_grammar_impl_effect_identity test/negative/checked_grammar_impl_effect_identity.weft 'impl method effect mismatch' 1
 check_rejects checked_grammar_requires_host_effect test/negative/checked_grammar_requires_host_effect.weft 'error[E2001]: effect `TypeCheck<G.Identity>` is not available in this context' 1

@@ -604,6 +604,13 @@ write_huge_padding() {
 
 if [ "$WEFT_TOOL_SHARD" = core ]; then
 
+# The raw boundary's transitional list only shrinks: every entry must still
+# reach raw memory, so a file leaves the list with its last raw use; its length
+# is pinned to a ceiling that falls with it; and the list stays sorted for the
+# compiler's bisection.
+raw_boundary_list_out=$(python3 test/tools/raw_boundary_list.py 2>&1)
+assert_equals "raw_boundary_transitional_list_only_shrinks" "$raw_boundary_list_out" "raw boundary list: sorted, and every entry still reaches raw memory"
+
 # The compiler's import closure must not contain a guest grammar package:
 # grammars reach tools only through the driver protocol, never by import.
 compiler_guest_grammar_imports() {
@@ -1211,7 +1218,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
-    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 56. Documented: 56."
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 57. Documented: 57."
     assert_contains "doc_stdlib_diagnostic_registry_missing_source" "$(<"$tmp_out")" "pub fn module_source_unavailable() -> DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
     assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
@@ -4632,8 +4639,8 @@ assert_contains "lsp_hover_constant" "$lsp_out" '"value":"constant answer: i64"'
 assert_contains "lsp_definition_constant" "$lsp_out" '"range":{"start":{"line":0,"character":6},"end":{"line":0,"character":12}}'
 
 lsp_pattern_before='fn main(value: ((i64, str), i64)) -> i64 { let ((left, '
-lsp_pattern_middle='label), right) = value __str_len('
-lsp_pattern_after='label) + left + right }'
+lsp_pattern_middle='label), right) = value if '
+lsp_pattern_after='label.len() > 0 { left } else { right } }'
 lsp_pattern_source="${lsp_pattern_before}${lsp_pattern_middle}${lsp_pattern_after}"
 lsp_pattern_def=$((${#lsp_pattern_before}))
 lsp_pattern_use=$((${#lsp_pattern_before} + ${#lsp_pattern_middle}))
@@ -4701,7 +4708,7 @@ assert_contains "lsp_unknown_tuple_position_diagnostic" "$lsp_out" 'type error: 
 assert_contains "lsp_unknown_tuple_position_has_no_hover" "$lsp_out" '"id":70,"result":null'
 
 lsp_match_before_first='fn main(value: str | nil) -> i64 { match value { '
-lsp_match_first_arm='text: str if __str_len(text) > 3 -> 1, '
+lsp_match_first_arm='text: str if text.len() > 3 -> 1, '
 lsp_match_second_arm='text: str -> 2, '
 lsp_match_nil_arm='nil -> 3 } }'
 lsp_match_source="${lsp_match_before_first}${lsp_match_first_arm}${lsp_match_second_arm}${lsp_match_nil_arm}"
@@ -7420,11 +7427,10 @@ assert_contains "test_rss_limit_reports_failed_summary" "$test_rss_err" "0 passe
 # WEFT_TEST_RC_QUARANTINE=1 builds every root with the `--rc-quarantine`
 # heap: ordinary roots, and legacy expected-exit roots alike.
 cat > "$tmp_import" <<'QUARANTINE_EOF'
-use runtime/alloc.{heap_quarantine}
-use runtime/rc.{rc_default_heap}
+use runtime/rc.{rc_quarantine_enabled}
 
 test "the default heap quarantines freed objects" {
-  Test.assert_eq(if heap_quarantine(rc_default_heap()) != 0 { 1 } else { 0 }, 1)
+  Test.assert_true(rc_quarantine_enabled())
 }
 QUARANTINE_EOF
 set +e

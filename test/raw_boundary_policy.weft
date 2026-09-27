@@ -1,0 +1,318 @@
+-- The raw-memory boundary classifies raw modules and members, and decides
+-- which strict modules may bind or re-export them.
+
+use compiler/project/identity.{named_module_identity}
+use compiler/source/input.{source_from_text}
+use compiler/source/raw_boundary.{*}
+use compiler/source/trust.{SourceAuthority, StrictSourceAuthority, TrustedSourceAuthority}
+use compiler/weft/check/registration/catalog as registration_catalog
+use compiler/weft/check/registration/catalog.{RegisteredModule}
+use compiler/weft/check/registration/scope as registration_scope
+use compiler/weft/check/registration/scope.{
+  RegistrationScope,
+  ResolvedImport,
+  ScopeImportRawMemory
+}
+use compiler/weft/grammar.{WeftParser, ParsedWeftSource}
+use runtime/string.{runtime_str_byte_at, runtime_str_len}
+use stdlib/diagnostic.{Diagnose}
+use stdlib/grammar.{Grammar, Parsed}
+use stdlib/list as list
+use stdlib/list.{List, Nil, Cons}
+use stdlib/option.{None, Some}
+use stdlib/panic.{panic}
+use stdlib/random as random
+use stdlib/result.{Result}
+use stdlib/string.{str_concat, str_ends_with, str_len, str_starts_with}
+use stdlib/test/property as prop
+
+fn kind_name(kind: RawMemoryModule) -> str {
+  match kind {
+    RawMemoryFamily -> "family"
+    RawMemoryMembers -> "members"
+    NotRawMemory -> "none"
+  }
+}
+
+test "raw families and runtime string members are classified by exact path" {
+  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/memory")), "family")
+  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/buffer")), "family")
+  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/alloc")), "family")
+  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/string")), "members")
+  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/memory.weft")), "none")
+  Test.assert_str_eq(kind_name(raw_boundary_module("runtime/memory/extra")), "none")
+  Test.assert_str_eq(kind_name(raw_boundary_module("stdlib/memory")), "none")
+  Test.assert_str_eq(kind_name(raw_boundary_module("")), "none")
+  Test.assert_true(raw_boundary_string_member("runtime_str_ptr"))
+  Test.assert_true(raw_boundary_string_member("runtime_str_from_bytes_copy"))
+  Test.assert_true(raw_boundary_string_member("runtime_str_word_as_str"))
+  Test.assert_false(raw_boundary_string_member("runtime_str_len"))
+  Test.assert_false(raw_boundary_string_member("runtime_str_byte_at"))
+  Test.assert_false(raw_boundary_string_member("runtime_str_ptr_extra"))
+}
+
+test "strict modules bind raw memory only while listed and re-export it only while trusted" {
+  -- A listed strict module may bind privately, but never re-export.
+  Test.assert_false(raw_boundary_import_refused(false, "compiler/pipeline", false))
+  Test.assert_true(raw_boundary_import_refused(false, "compiler/pipeline", true))
+  -- A trusted module, including compiler-generated trusted source with no
+  -- path of its own, may do both.
+  Test.assert_false(raw_boundary_import_refused(true, "runtime/rc", false))
+  Test.assert_false(raw_boundary_import_refused(true, "runtime/rc", true))
+  Test.assert_false(raw_boundary_import_refused(true, "", true))
+  -- Migrated and new strict modules may do neither.
+  Test.assert_true(raw_boundary_import_refused(false, "stdlib/bytes", false))
+  Test.assert_true(raw_boundary_import_refused(false, "compiler/backend/binary", false))
+  Test.assert_true(raw_boundary_import_refused(false, "test/raw_boundary_policy", false))
+  Test.assert_true(raw_boundary_import_refused(false, "", false))
+  -- Paths match exactly: neighbours of listed entries are not listed.
+  Test.assert_true(raw_boundary_import_refused(false, "compiler/pipelin", false))
+  Test.assert_true(raw_boundary_import_refused(false, "compiler/pipeline/child", false))
+  Test.assert_true(raw_boundary_import_refused(false, "compiler/pipeline.weft", false))
+  -- The first and last listed paths bound the search.
+  Test.assert_true(raw_boundary_transitional("compiler/backend/aarch64/codegen"))
+  Test.assert_true(raw_boundary_transitional("tools/typed_differential"))
+  Test.assert_false(raw_boundary_transitional("a"))
+  Test.assert_false(raw_boundary_transitional("zzz"))
+  Test.assert_str_eq(raw_boundary_logical_path("test/example.weft"), "test/example")
+  Test.assert_str_eq(raw_boundary_logical_path("test/example"), "test/example")
+  Test.assert_str_eq(raw_boundary_logical_path("./test/example.weft"), "test/example")
+  Test.assert_str_eq(raw_boundary_logical_path("././test/example.weft"), "test/example")
+  Test.assert_str_eq(raw_boundary_logical_path(".weft"), "")
+  Test.assert_str_eq(raw_boundary_logical_path("./example.weft.weft"), "example.weft")
+}
+
+-- Fragments that collide with the prefix and suffix a logical path drops, so
+-- generated paths repeat, nest and split them.
+fn generated_path(fragments: List<usize>) -> str {
+  let pieces = ["./", ".weft", ".", "/", "weft", "runtime/memory", "é"]
+  match fragments {
+    Nil -> ""
+    Cons(index, rest) -> str_concat(pieces[index], generated_path(rest))
+  }
+}
+
+fn logical_path_laws(fragments: List<usize>) -> bool {
+  let path = generated_path(fragments)
+  let logical = raw_boundary_logical_path(path)
+  let prefixed = raw_boundary_logical_path(str_concat("./", path)) == logical
+  if str_starts_with(path, "./") == 1 { return prefixed }
+  let suffixed = raw_boundary_logical_path(str_concat(path, ".weft")) == path
+  let settled = str_ends_with(path, ".weft") == 1 or logical == path
+  prefixed and suffixed and settled
+}
+
+test "logical paths ignore leading ./ and drop exactly one .weft suffix" {
+  let fragment = prop.usize_below(7).expect("the fragment table is nonempty")
+  let lengths = prop.lengths(0, 8).expect("the path length range is valid")
+  let config = prop.config(random.seed(0x5241574c4f474943), 400, 8, 0, 200).expect(
+    "the path campaign is valid"
+  )
+  prop.check(config, prop.list<usize>(fragment, lengths), logical_path_laws)
+}
+
+-- One generated import: who imports, from where, how visibly, from which
+-- target, in which form, and which of the eight members it selects or renames.
+type BoundaryCase {
+  trusted: bool,
+  listed: bool,
+  visibility: usize,
+  target: usize,
+  form: usize,
+  selected: usize,
+  renamed: usize
+}
+
+-- Even members are raw members of runtime/string; odd members are safe.
+fn boundary_member(index: usize) -> str {
+  let members = [
+    "runtime_str_ptr",
+    "runtime_str_len",
+    "runtime_str_set_len",
+    "runtime_str_byte_at",
+    "runtime_str_from_bytes_copy",
+    "runtime_str_hash",
+    "runtime_str_word_as_str",
+    "runtime_str_is_empty"
+  ]
+  members[index]
+}
+
+fn boundary_bit(mask: usize, index: usize) -> bool {
+  let mut value = mask
+  let mut remaining = index
+  while remaining > 0 {
+    value = value / 2
+    remaining = remaining - 1
+  }
+  value % 2 == 1
+}
+
+fn boundary_draw(draws: List<usize>, index: usize) -> usize {
+  let zero: usize = 0
+  match draws.get(index) {
+    Some(value) -> value
+    None -> zero
+  }
+}
+
+fn boundary_case(draws: List<usize>) -> BoundaryCase {
+  BoundaryCase {
+    trusted: boundary_draw(draws, 0) % 2 == 1,
+    listed: boundary_draw(draws, 1) % 2 == 1,
+    visibility: boundary_draw(draws, 2) % 3,
+    target: boundary_draw(draws, 3) % 3,
+    form: boundary_draw(draws, 4) % 3,
+    selected: boundary_draw(draws, 5) % 255 + 1,
+    renamed: boundary_draw(draws, 6)
+  }
+}
+
+fn boundary_target_path(target: usize) -> str {
+  if target == 0 {
+    "runtime/string"
+  } else if target == 1 { "runtime/memory" } else { "stdlib/boundary_probe" }
+}
+
+fn boundary_selection(case: BoundaryCase) -> str {
+  let mut names = ""
+  let mut index: usize = 0
+  while index < 8 {
+    if boundary_bit(case.selected, index) {
+      let member = boundary_member(index)
+      let spelled = if boundary_bit(case.renamed, index) {
+        str_concat(member, str_concat(" as renamed_", member))
+      } else { member }
+      names = if str_len(names) == 0 { spelled } else {
+        str_concat(names, str_concat(", ", spelled))
+      }
+    }
+    index = index + 1
+  }
+  str_concat(".{", str_concat(names, "}"))
+}
+
+fn boundary_import(case: BoundaryCase) -> str {
+  let visibility = if case.visibility == 0 { "" } else if case.visibility == 1 {
+    "pub(package) "
+  } else { "pub " }
+  let binding = if case.form == 1 { ".{*}" } else if case.form == 2 {
+    " as boundary_module"
+  } else { boundary_selection(case) }
+  str_concat(
+    visibility,
+    str_concat("use ", str_concat(boundary_target_path(case.target), binding))
+  )
+}
+
+fn boundary_parse(text: str) -[Test]> ParsedWeftSource {
+  let result = handle WeftParser().parse(source_from_text(text).all()) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false); resume(0) }
+    Diagnose.error(message, location) -> { Test.assert_true(false); resume(0) }
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  }
+  match result {
+    Parsed(syntax) -> syntax
+    _ -> panic("expected a complete generated boundary module")
+  }
+}
+
+fn boundary_module(text: str, path: str, authority: SourceAuthority) -[Test]> RegisteredModule {
+  let syntax = boundary_parse(text)
+  registration_catalog.register_with_authority(
+    syntax.declarations,
+    syntax.source.source(),
+    named_module_identity(path, 1),
+    authority
+  )
+}
+
+fn boundary_target(target: usize) -[Test]> RegisteredModule {
+  let mut text = ""
+  let mut index: usize = 0
+  while index < 8 {
+    text = str_concat(
+      text,
+      str_concat("pub fn ", str_concat(boundary_member(index), "() -> i64 { 0 } "))
+    )
+    index = index + 1
+  }
+  boundary_module(text, boundary_target_path(target), StrictSourceAuthority)
+}
+
+-- The oracle states the policy independently of the implementation's tables:
+-- a trusted importer is never refused, a strict re-export always is, and a
+-- strict private import is refused unless its path is listed. A refused
+-- selection reports each raw member it names; a refused wildcard or module
+-- alias reports once.
+fn boundary_expected_issues(case: BoundaryCase) -> usize {
+  let zero: usize = 0
+  let one: usize = 1
+  let refused = if case.trusted { false } else if case.visibility > 0 { true } else {
+    not case.listed
+  }
+  if not refused or case.target == 2 { return zero }
+  if case.form != 0 { return one }
+  let mut count: usize = 0
+  let mut index: usize = 0
+  while index < 8 {
+    if boundary_bit(case.selected, index) and (case.target == 1 or index % 2 == 0) {
+      count = count + 1
+    }
+    index = index + 1
+  }
+  count
+}
+
+fn boundary_raw_issues(scope: RegistrationScope) -> usize {
+  let mut count: usize = 0
+  let mut seen: usize = 0
+  let mut index = 0
+  while seen < registration_scope.registration_scope_issue_count(scope) {
+    match registration_scope.registration_scope_issue_at(scope, index).status {
+      ScopeImportRawMemory -> { count = count + 1 }
+      _ -> nil
+    }
+    seen = seen + 1
+    index = index + 1
+  }
+  count
+}
+
+fn boundary_refusals_follow_policy(draws: List<usize>) -[Test]> bool {
+  let case = boundary_case(draws)
+  let target = boundary_target(case.target)
+  let importer = boundary_module(
+    str_concat(boundary_import(case), " fn main() -> i64 { 0 }"),
+    if case.listed { "compiler/pipeline" } else { "test/boundary_probe" },
+    if case.trusted { TrustedSourceAuthority } else { StrictSourceAuthority }
+  )
+  let edges = importer.syntax.imports.map<ResolvedImport>(
+    declaration => registration_scope.resolved_import(
+      importer,
+      declaration,
+      target.identity,
+      false
+    )
+  )
+  let modules = [importer, target]
+  let scope = registration_scope.registration_scope_build(list.from_slice(modules[..]), edges)
+  let raw = boundary_raw_issues(scope)
+  raw == boundary_expected_issues(case) and
+    registration_scope.registration_scope_issue_count(scope) == raw
+}
+
+test "generated imports are refused exactly where the raw boundary policy says" {
+  let draw = prop.usize_below(256).expect("the draw domain is nonempty")
+  let lengths = prop.lengths(7, 7).expect("a case takes seven draws")
+  let config = prop.config(random.seed(0x5241574252445259), 300, 16, 0, 200).expect(
+    "the boundary campaign is valid"
+  )
+  prop.check(config, prop.list<usize>(draw, lengths), boundary_refusals_follow_policy)
+}
+
+test "unlisted strict code keeps the safe runtime string members" {
+  Test.assert_eq(runtime_str_len("boundary"), 8)
+  Test.assert_eq(runtime_str_byte_at("boundary", 0), 98)
+}

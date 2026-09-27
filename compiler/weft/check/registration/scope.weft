@@ -5,6 +5,7 @@
 -- constructs the legacy checker table.
 
 use compiler/project/identity.{*}
+use compiler/source/raw_boundary.{*}
 use compiler/project/identity/equality.{declaration_identity_eq, module_identity_eq}
 use compiler/project/module.{
   DeclVisibility,
@@ -102,7 +103,10 @@ pub(package) type ScopeIssueStatus {
   ScopeImportMissing,
   ScopeImportInvisible,
   ScopeImportWidenedReexport,
-  ScopeImportAmbiguous
+  ScopeImportAmbiguous,
+  --- Strict code binding or re-exporting raw memory outside the raw
+  --- boundary's allowance.
+  ScopeImportRawMemory
 }
 
 pub(package) type ScopeIssue {
@@ -589,17 +593,69 @@ fn imported_candidate(
   }
 }
 
+fn module_logical_path(identity: ModuleIdentity) -> str {
+  match identity {
+    NamedModuleIdentity(path, _) -> path
+    AnonymousModuleIdentity(_, _) -> ""
+  }
+}
+
+-- Whether the raw boundary refuses this edge's importer a raw-memory binding.
+fn import_raw_memory_refused(edge: ResolvedImport, importer_trusted: bool) -> bool {
+  raw_boundary_import_refused(
+    importer_trusted,
+    module_logical_path(edge.importer),
+    visibility_rank(edge.visibility) > 0
+  )
+}
+
+fn module_reaches_raw_memory(identity: ModuleIdentity) -> bool {
+  match raw_boundary_module(module_logical_path(identity)) {
+    NotRawMemory -> false
+    _ -> true
+  }
+}
+
+-- Whether a candidate reaches raw memory: any member of a raw family, a raw
+-- member of runtime/string, or a raw module bound under a name. A re-exported
+-- declaration keeps the module that declared it.
+fn candidate_reaches_raw_memory(candidate: ScopeCandidate) -> bool {
+  match candidate.target {
+    ScopeModuleTarget(identity) -> module_reaches_raw_memory(identity)
+    ScopeDeclarationTarget(name) -> match raw_boundary_module(
+      module_logical_path(declaration_identity_module(name.identity))
+    ) {
+      RawMemoryFamily -> true
+      RawMemoryMembers -> raw_boundary_string_member(
+        required_text(declaration_identity_name(name.identity))
+      )
+      NotRawMemory -> false
+    }
+  }
+}
+
 fn import_candidate(
   entries: borrow Vector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
+  importer_trusted: bool,
   target_entry: ScopeEntry,
   spelling: str,
   candidate: ScopeCandidate,
   origin: Option<Span>,
   issue_location: Option<Span>
 ) -> nil {
-  if not candidate_visible_from(candidate, target_entry.module, edge.importer) {
+  if candidate_reaches_raw_memory(candidate) and import_raw_memory_refused(edge, importer_trusted) {
+    add_issue(
+      issues,
+      edge,
+      spelling,
+      ScopeImportRawMemory,
+      issue_location,
+      Some(candidate),
+      None
+    )
+  } else if not candidate_visible_from(candidate, target_entry.module, edge.importer) {
     add_issue(
       issues,
       edge,
@@ -635,6 +691,7 @@ fn import_entry(
   entries: borrow Vector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
+  importer_trusted: bool,
   target_entry: ScopeEntry,
   spelling: str,
   origin: Option<Span>,
@@ -645,6 +702,7 @@ fn import_entry(
       entries,
       issues,
       edge,
+      importer_trusted,
       target_entry,
       spelling,
       target_entry.primary,
@@ -656,6 +714,7 @@ fn import_entry(
         entries,
         issues,
         edge,
+        importer_trusted,
         target_entry,
         spelling,
         target_entry.primary,
@@ -667,6 +726,7 @@ fn import_entry(
           entries,
           issues,
           edge,
+          importer_trusted,
           target_entry,
           spelling,
           conflict,
@@ -693,8 +753,23 @@ fn add_wildcard_import(
   entries: borrow Vector<ScopeEntry>,
   target_entries: PersistentVector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
-  edge: ResolvedImport
+  edge: ResolvedImport,
+  importer_trusted: bool
 ) -> nil {
+  -- A wildcard cannot select around raw members, so a raw module refuses the
+  -- whole import once.
+  if module_reaches_raw_memory(edge.target) and import_raw_memory_refused(edge, importer_trusted) {
+    add_issue(
+      issues,
+      edge,
+      module_logical_path(edge.target),
+      ScopeImportRawMemory,
+      edge.location,
+      None,
+      None
+    )
+    return nil
+  }
   let count = persistent_vector_len<ScopeEntry>(target_entries)
   for index in 0..count {
     let entry = persistent_get_in_bounds<ScopeEntry>(target_entries, index)
@@ -704,6 +779,7 @@ fn add_wildcard_import(
           entries,
           issues,
           edge,
+          importer_trusted,
           entry,
           entry.spelling,
           edge.location,
@@ -719,6 +795,7 @@ fn add_selected_import(
   target_entries: PersistentVector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
   edge: ResolvedImport,
+  importer_trusted: bool,
   selected: Span,
   local: Span
 ) -> nil {
@@ -740,6 +817,7 @@ fn add_selected_import(
       entries,
       issues,
       edge,
+      importer_trusted,
       persistent_get_in_bounds<ScopeEntry>(target_entries, index),
       local_name,
       Some(local),
@@ -752,33 +830,49 @@ fn add_import(
   entries: borrow Vector<ScopeEntry>,
   target_entries: PersistentVector<ScopeEntry>,
   issues: borrow Vector<ScopeIssue>,
-  edge: ResolvedImport
+  edge: ResolvedImport,
+  importer_trusted: bool
 ) -> nil {
   match edge.binding {
-    ResolvedModuleImport(alias) -> add_binding(
-      entries,
-      edge.importer,
-      required_text(alias),
-      ScopeCandidate {
-        target: ScopeModuleTarget(edge.target),
-        visibility: edge.visibility,
-        weak: edge.weak,
-        origin: Some(alias)
+    ResolvedModuleImport(alias) -> if module_reaches_raw_memory(edge.target) and
+      import_raw_memory_refused(edge, importer_trusted) {
+        add_issue(
+          issues,
+          edge,
+          required_text(alias),
+          ScopeImportRawMemory,
+          Some(alias),
+          None,
+          None
+        )
+      } else {
+        add_binding(
+          entries,
+          edge.importer,
+          required_text(alias),
+          ScopeCandidate {
+            target: ScopeModuleTarget(edge.target),
+            visibility: edge.visibility,
+            weak: edge.weak,
+            origin: Some(alias)
+          }
+        )
       }
-    )
     ResolvedSymbolImport(selections) -> for selection in selections {
       match selection {
         ResolvedImportWildcard -> add_wildcard_import(
           entries,
           target_entries,
           issues,
-          edge
+          edge,
+          importer_trusted
         )
         ResolvedImportSymbol(selected, local) -> add_selected_import(
           entries,
           target_entries,
           issues,
           edge,
+          importer_trusted,
           selected,
           local
         )
@@ -911,7 +1005,11 @@ fn build_module(
               entries,
               target_entries,
               issues,
-              edge
+              edge,
+              match vector_get_in_bounds<RegisteredModule>(modules, index).authority {
+                TrustedSourceAuthority -> true
+                StrictSourceAuthority -> false
+              }
             )
           } else { nil }
         }
