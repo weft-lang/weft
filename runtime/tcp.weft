@@ -10,7 +10,7 @@ use stdlib/io/types.{IoEndOfFile, IoReadBytes, IoReadProgress, IoWriteProgress, 
 use stdlib/net_address as net
 use stdlib/net_address.{Ipv4Address, Ipv6Address, SocketAddress, SocketV4, SocketV6}
 use stdlib/num
-use stdlib/option.{None, Some}
+use stdlib/option.{None, Option, Some}
 use stdlib/result.{Result, Err, Ok}
 use stdlib/tcp.{
   TcpConnect,
@@ -21,6 +21,7 @@ use stdlib/tcp.{
   TcpListenOptions,
   TcpListener,
   TcpListenerIO,
+  TcpOwnerForeign,
   TcpPlatform,
   TcpShutdown,
   TcpShutdownBoth,
@@ -29,12 +30,12 @@ use stdlib/tcp.{
   TcpStream,
   TcpStreamIO,
   tcp_error_from_platform_status,
-  tcp_listener_from_token,
-  tcp_listener_release_token,
-  tcp_listener_token,
-  tcp_stream_from_token,
-  tcp_stream_release_token,
-  tcp_stream_token
+  tcp_listener_descriptor,
+  tcp_listener_from_platform,
+  tcp_listener_release_descriptor,
+  tcp_stream_descriptor,
+  tcp_stream_from_platform,
+  tcp_stream_release_descriptor
 }
 use stdlib/vector as vector
 use stdlib/vector.{vector_data, vector_get_in_bounds, vector_push}
@@ -278,12 +279,18 @@ fn runtime_tcp_listen_raw(address: SocketAddress, options: TcpListenOptions) -[U
   }
 }
 
-fn runtime_tcp_accept_raw(listener: borrow mut TcpListener) -[Unsafe]> i64 {
-  __platform_tcp_accept(tcp_listener_token(listener))
-}
-
 fn runtime_tcp_read(
   stream: borrow mut TcpStream,
+  buffer: [mut u8]
+) -[Unsafe]> Result<IoReadProgress, TcpError> {
+  match tcp_stream_descriptor(stream) {
+    None -> Err<IoReadProgress, TcpError>(TcpOwnerForeign)
+    Some(descriptor) -> runtime_tcp_read_descriptor(descriptor, buffer)
+  }
+}
+
+fn runtime_tcp_read_descriptor(
+  descriptor: i64,
   buffer: [mut u8]
 ) -[Unsafe]> Result<IoReadProgress, TcpError> {
   let length = runtime_tcp_usize_to_i64(buffer.len)
@@ -295,7 +302,7 @@ fn runtime_tcp_read(
     } else {
       let scratch: Vector<u8> = vector.with_capacity<u8>(buffer.len)
       for index in 0..length { vector_push<u8>(scratch, runtime_tcp_i64_to_u8(0)) }
-      let status = sys_read(tcp_stream_token(stream), vector_data<u8>(scratch), length)
+      let status = sys_read(descriptor, vector_data<u8>(scratch), length)
       if status < 0 {
         Err<IoReadProgress, TcpError>(tcp_error_from_platform_status(status))
       } else {
@@ -320,6 +327,16 @@ fn runtime_tcp_write(
   stream: borrow mut TcpStream,
   buffer: [u8]
 ) -[Unsafe]> Result<IoWriteProgress, TcpError> {
+  match tcp_stream_descriptor(stream) {
+    None -> Err<IoWriteProgress, TcpError>(TcpOwnerForeign)
+    Some(descriptor) -> runtime_tcp_write_descriptor(descriptor, buffer)
+  }
+}
+
+fn runtime_tcp_write_descriptor(
+  descriptor: i64,
+  buffer: [u8]
+) -[Unsafe]> Result<IoWriteProgress, TcpError> {
   let length = runtime_tcp_usize_to_i64(buffer.len)
   if length < 0 {
     Err<IoWriteProgress, TcpError>(TcpInvalidProgress)
@@ -329,7 +346,7 @@ fn runtime_tcp_write(
     } else {
       let scratch: Vector<u8> = vector.with_capacity<u8>(buffer.len)
       for index in 0..length { vector_push<u8>(scratch, buffer[__i64_to_usize(index)]) }
-      let status = sys_write(tcp_stream_token(stream), vector_data<u8>(scratch), length)
+      let status = sys_write(descriptor, vector_data<u8>(scratch), length)
       if status < 0 {
         Err<IoWriteProgress, TcpError>(tcp_error_from_platform_status(status))
       } else {
@@ -355,12 +372,14 @@ fn runtime_tcp_shutdown(
   stream: borrow mut TcpStream,
   direction: TcpShutdown
 ) -[Unsafe]> Result<nil, TcpError> {
-  let status = __platform_tcp_shutdown(
-    tcp_stream_token(stream),
-    runtime_tcp_shutdown_code(direction)
-  )
-  if status == 0 { Ok<nil, TcpError>(nil) }
-  else { Err<nil, TcpError>(tcp_error_from_platform_status(status)) }
+  match tcp_stream_descriptor(stream) {
+    None -> Err<nil, TcpError>(TcpOwnerForeign)
+    Some(descriptor) -> {
+      let status = __platform_tcp_shutdown(descriptor, runtime_tcp_shutdown_code(direction))
+      if status == 0 { Ok<nil, TcpError>(nil) }
+      else { Err<nil, TcpError>(tcp_error_from_platform_status(status)) }
+    }
+  }
 }
 
 fn runtime_tcp_socket_address(fd: i64, peer: bool) -[Unsafe]> Result<SocketAddress, TcpError> {
@@ -383,6 +402,27 @@ fn runtime_tcp_socket_address(fd: i64, peer: bool) -[Unsafe]> Result<SocketAddre
   result
 }
 
+-- The address of an owner's socket, refusing an owner of another TCP
+-- interpretation.
+fn runtime_tcp_owner_address(
+  descriptor: Option<i64>,
+  peer: bool
+) -[Unsafe]> Result<SocketAddress, TcpError> {
+  match descriptor {
+    None -> Err<SocketAddress, TcpError>(TcpOwnerForeign)
+    Some(fd) -> runtime_tcp_socket_address(fd, peer)
+  }
+}
+
+-- Close an owner's descriptor. An owner of another TCP interpretation names
+-- no descriptor of ours, so it reports EBADF.
+fn runtime_tcp_close_owner(descriptor: Option<i64>) -[Unsafe]> i64 {
+  match descriptor {
+    None -> 0 - 9
+    Some(fd) -> sys_close(fd)
+  }
+}
+
 fn runtime_tcp_connect(
   address: SocketAddress,
   options: TcpConnectOptions
@@ -391,7 +431,7 @@ fn runtime_tcp_connect(
   if status < 0 {
     Err<owned TcpStream, TcpError>(tcp_error_from_platform_status(status))
   } else {
-    Ok<owned TcpStream, TcpError>(tcp_stream_from_token(status))
+    Ok<owned TcpStream, TcpError>(tcp_stream_from_platform(status))
   }
 }
 
@@ -403,18 +443,23 @@ fn runtime_tcp_listen(
   if status < 0 {
     Err<owned TcpListener, TcpError>(tcp_error_from_platform_status(status))
   } else {
-    Ok<owned TcpListener, TcpError>(tcp_listener_from_token(status))
+    Ok<owned TcpListener, TcpError>(tcp_listener_from_platform(status))
   }
 }
 
 fn runtime_tcp_accept(
   listener: borrow mut TcpListener
 ) -[Unsafe]> Result<owned TcpStream, TcpError> {
-  let status = runtime_tcp_accept_raw(listener)
-  if status < 0 {
-    Err<owned TcpStream, TcpError>(tcp_error_from_platform_status(status))
-  } else {
-    Ok<owned TcpStream, TcpError>(tcp_stream_from_token(status))
+  match tcp_listener_descriptor(listener) {
+    None -> Err<owned TcpStream, TcpError>(TcpOwnerForeign)
+    Some(descriptor) -> {
+      let status = __platform_tcp_accept(descriptor)
+      if status < 0 {
+        Err<owned TcpStream, TcpError>(tcp_error_from_platform_status(status))
+      } else {
+        Ok<owned TcpStream, TcpError>(tcp_stream_from_platform(status))
+      }
+    }
   }
 }
 
@@ -455,13 +500,13 @@ pub(package) fn runtime_tcp_accept_safe(
 pub(package) fn runtime_tcp_listener_local_address_safe(
   listener: borrow TcpListener
 ) -> Result<SocketAddress, TcpError> {
-  handle runtime_tcp_socket_address(tcp_listener_token(listener), false) {
+  handle runtime_tcp_owner_address(tcp_listener_descriptor(listener), false) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
   }
 }
 
 pub(package) fn runtime_tcp_listener_release_safe(listener: TcpListener) -> i64 {
-  handle sys_close(tcp_listener_release_token(listener)) {
+  handle runtime_tcp_close_owner(tcp_listener_release_descriptor(listener)) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
   }
 }
@@ -489,9 +534,14 @@ pub(package) fn runtime_tcp_configure_safe(
   options: TcpConnectOptions
 ) -> Result<nil, TcpError> {
   handle {
-    let status = runtime_tcp_configure_fd(tcp_stream_token(stream), options)
-    if status == 0 { Ok<nil, TcpError>(nil) }
-    else { Err<nil, TcpError>(tcp_error_from_platform_status(status)) }
+    match tcp_stream_descriptor(stream) {
+      None -> Err<nil, TcpError>(TcpOwnerForeign)
+      Some(descriptor) -> {
+        let status = runtime_tcp_configure_fd(descriptor, options)
+        if status == 0 { Ok<nil, TcpError>(nil) }
+        else { Err<nil, TcpError>(tcp_error_from_platform_status(status)) }
+      }
+    }
   } {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
   }
@@ -509,7 +559,7 @@ pub(package) fn runtime_tcp_shutdown_safe(
 pub(package) fn runtime_tcp_stream_local_address_safe(
   stream: borrow TcpStream
 ) -> Result<SocketAddress, TcpError> {
-  handle runtime_tcp_socket_address(tcp_stream_token(stream), false) {
+  handle runtime_tcp_owner_address(tcp_stream_descriptor(stream), false) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
   }
 }
@@ -517,13 +567,13 @@ pub(package) fn runtime_tcp_stream_local_address_safe(
 pub(package) fn runtime_tcp_stream_peer_address_safe(
   stream: borrow TcpStream
 ) -> Result<SocketAddress, TcpError> {
-  handle runtime_tcp_socket_address(tcp_stream_token(stream), true) {
+  handle runtime_tcp_owner_address(tcp_stream_descriptor(stream), true) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
   }
 }
 
 pub(package) fn runtime_tcp_stream_release_safe(stream: TcpStream) -> i64 {
-  handle sys_close(tcp_stream_release_token(stream)) {
+  handle runtime_tcp_close_owner(tcp_stream_release_descriptor(stream)) {
     Unsafe.transmute(raw) -> resume(__transmute(raw))
   }
 }

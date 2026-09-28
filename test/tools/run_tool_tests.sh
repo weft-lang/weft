@@ -976,7 +976,10 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_env_pins_public_surface" "$(<"$tmp_out")" "Public API items: 4. Documented: 4."
     assert_contains "doc_stdlib_env_pins_optional_argument" "$(<"$tmp_out")" "fn arg(index: i64) -> str | nil"
   elif [ "$stdlib_doc_name" = "process" ]; then
-    assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 42. Documented: 42."
+    assert_contains "doc_stdlib_process_pins_public_surface" "$(<"$tmp_out")" "Public API items: 49. Documented: 49."
+    assert_contains "doc_stdlib_process_pins_scripted_owner" "$(<"$tmp_out")" "pub fn scripted_handle(id: i64) -> owned ProcHandle"
+    assert_contains "doc_stdlib_process_pins_scripted_release" "$(<"$tmp_out")" "pub fn release_scripted_session(session: ProcSession) -> i64"
+    assert_contains "doc_stdlib_process_pins_foreign_owner" "$(<"$tmp_out")" "ProcOwnerForeign"
     assert_contains "doc_stdlib_process_pins_typed_run" "$(<"$tmp_out")" "fn run(path: str, args: List<str>) -> Result<ProcTermination, ProcError>"
     assert_contains "doc_stdlib_process_pins_opaque_owner" "$(<"$tmp_out")" "pub type ProcHandle = opaque"
     assert_contains "doc_stdlib_process_pins_typed_deadline" "$(<"$tmp_out")" "fn wait_until(resource: ProcHandle, deadline: Instant) -> ProcOutput"
@@ -991,7 +994,9 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_dns_pins_public_surface" "$(<"$tmp_out")" "Public API items: 16. Documented: 16."
     assert_contains "doc_stdlib_dns_resolve_preserves_authority_fact" "$(<"$tmp_out")" "pub fn resolve(host: DomainName, port: u16, family: DnsFamily) -[DnsResolve]> Result<Vector<SocketAddress>, DnsError>"
   elif [ "$stdlib_doc_name" = "tcp" ]; then
-    assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public API items: 77. Documented: 77."
+    assert_contains "doc_stdlib_tcp_pins_public_surface" "$(<"$tmp_out")" "Public API items: 84. Documented: 84."
+    assert_contains "doc_stdlib_tcp_pins_scripted_owner" "$(<"$tmp_out")" "pub fn scripted_stream(id: i64) -> owned TcpStream"
+    assert_contains "doc_stdlib_tcp_pins_foreign_owner" "$(<"$tmp_out")" "TcpOwnerForeign"
     assert_contains "doc_stdlib_tcp_connect_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn connect(address: SocketAddress, options: TcpConnectOptions) -[TcpConnect]> Result<owned TcpStream, TcpError>"
     assert_contains "doc_stdlib_tcp_listen_preserves_owned_authority_fact" "$(<"$tmp_out")" "pub fn listen(address: SocketAddress, options: TcpListenOptions) -[TcpListen]> Result<owned TcpListener, TcpError>"
   elif [ "$stdlib_doc_name" = "url" ]; then
