@@ -19,6 +19,7 @@ use compiler/types/graph.{
   SemanticContinuationNode,
   SemanticFunctionNode,
   SemanticOwnedNode,
+  SemanticSelfVariable,
   SemanticTraitNode,
   SemanticTypeId,
   SemanticTypeVariable,
@@ -132,6 +133,8 @@ use stdlib/option.{None, Option, Some}
 
 type CheckedSpecializationRequest {
   identity: FunctionIdentity,
+  -- For a method, only the method's own type arguments: the implementation the
+  -- receiver selects supplies the parameters that precede them.
   type_arguments: List<SemanticTypeId>,
   call_signature: Option<SemanticTypeId>,
   method_declaration: Option<DeclarationIdentity>,
@@ -321,13 +324,13 @@ fn checked_specialization_requests_in_insts(
           )
         IrSemanticCallI64(
           _,
-          IrSemanticMethodTarget(declaration, _, signature),
+          IrSemanticMethodTarget(declaration, _, signature, method_arguments),
           _,
           _,
         ) -> rest.prepend(
           CheckedSpecializationRequest {
             identity: DeclaredFunctionIdentity(declaration),
-            type_arguments: Nil<SemanticTypeId>(),
+            type_arguments: method_arguments,
             call_signature: Some<SemanticTypeId>(signature),
             method_declaration: Some<DeclarationIdentity>(declaration),
             dispatch_target: None<SemanticTypeId>()
@@ -557,7 +560,7 @@ fn checked_specialization_rewrite_insts(
       }
       IrSemanticCallI64(
         dst,
-        IrSemanticMethodTarget(_, receiver, _),
+        IrSemanticMethodTarget(_, receiver, _, _),
         _,
         arguments,
       ) -> match keys {
@@ -2024,6 +2027,41 @@ fn checked_specialization_materialize_arguments(
   }
 }
 
+-- Bind a method's own type arguments to its trailing type parameters: a
+-- method's declared parameters are its implementation's followed by its own.
+fn checked_specialization_bind_method_arguments(
+  product: borrow CheckedBodyProduct,
+  function_index: usize,
+  substitution: SemanticTypeSubstitution,
+  arguments: List<SemanticTypeId>
+) -> SemanticTypeSubstitution {
+  let signatures = product.signatures()
+  let signature = product.function(function_index).signature
+  let count = signatures.type_parameter_count(signature)
+  let own = arguments.len()
+  if own > count { substitution }
+  else {
+    let mut bound = substitution
+    let mut remaining = arguments
+    let mut position = count - own
+    loop {
+      match remaining {
+        Nil -> break
+        Cons(argument, rest) -> {
+          bound = semantic_type_substitution_bind(
+            bound,
+            signatures.type_parameter_at(signature, position),
+            argument
+          )
+          remaining = rest
+          position = position + 1
+        }
+      }
+    }
+    bound
+  }
+}
+
 fn checked_specialization_arguments_from_substitution(
   product: borrow CheckedBodyProduct,
   function_index: usize,
@@ -2169,29 +2207,50 @@ fn checked_specialization_prepare_request(
             target,
             declaration
           ) {
-            SemanticImplementationMethodSelected(_, function, _, substitution) ->
+            SemanticImplementationMethodSelected(_, function, _, substitution) -> {
+              let own = checked_specialization_materialize_arguments(
+                next_types,
+                caller,
+                request.type_arguments
+              )
               Some<CheckedSpecializationPreparedRequest>(
                 CheckedSpecializationPreparedRequest {
-                  types: next_types,
+                  types: own.types,
                   identity: function,
-                  arguments: Nil<SemanticTypeId>(),
+                  arguments: own.values,
                   concrete_signature: Some<SemanticTypeId>(concrete_signature),
                   method_substitution: Some<SemanticTypeSubstitution>(substitution)
                 }
               )
+            }
+            -- The call names the method's own function. Its declared template
+            -- calls the receiver `Self`, which the receiver's type supplies.
             _ -> match checked_specialization_function(
               universe.bodies,
               request.identity
             ) {
-              Some(_) -> Some<CheckedSpecializationPreparedRequest>(
-                CheckedSpecializationPreparedRequest {
-                  types: next_types,
-                  identity: request.identity,
-                  arguments: Nil<SemanticTypeId>(),
-                  concrete_signature: Some<SemanticTypeId>(concrete_signature),
-                  method_substitution: None<SemanticTypeSubstitution>()
-                }
-              )
+              Some(_) -> {
+                let own = checked_specialization_materialize_arguments(
+                  next_types,
+                  caller,
+                  request.type_arguments
+                )
+                Some<CheckedSpecializationPreparedRequest>(
+                  CheckedSpecializationPreparedRequest {
+                    types: own.types,
+                    identity: request.identity,
+                    arguments: own.values,
+                    concrete_signature: Some<SemanticTypeId>(concrete_signature),
+                    method_substitution: Some<SemanticTypeSubstitution>(
+                      semantic_type_substitution_bind(
+                        semantic_type_substitution_empty(),
+                        SemanticSelfVariable,
+                        target
+                      )
+                    )
+                  }
+                )
+              }
               None -> None<CheckedSpecializationPreparedRequest>()
             }
           }
@@ -2207,69 +2266,85 @@ fn checked_specialization_materialize_request(
   function_index: usize,
   request: CheckedSpecializationPreparedRequest
 ) -> Option<CheckedSpecializationArguments> {
-  match request.method_substitution {
-    Some(substitution) -> match checked_specialization_arguments_from_substitution(
-      product,
-      function_index,
-      substitution,
-      0,
-      Nil<SemanticTypeId>()
-    ) {
-      None -> None<CheckedSpecializationArguments>()
-      Some(arguments) -> Some<CheckedSpecializationArguments>(
+  let parameter_count = {
+    let signatures = product.signatures()
+    signatures.type_parameter_count(product.function(function_index).signature)
+  }
+  match request.concrete_signature {
+    -- A generic call names every type argument.
+    None -> Some<CheckedSpecializationArguments>(
+      CheckedSpecializationArguments {
+        types: request.types,
+        values: request.arguments
+      }
+    )
+    Some(concrete_signature) -> if parameter_count == 0 {
+      Some<CheckedSpecializationArguments>(
         CheckedSpecializationArguments {
           types: request.types,
-          values: arguments
+          values: Nil<SemanticTypeId>()
         }
       )
-    }
-    None -> match request.concrete_signature {
-      None -> Some<CheckedSpecializationArguments>(
-        CheckedSpecializationArguments {
-          types: request.types,
-          values: request.arguments
-        }
+    } else {
+      -- The receiver's selection binds the implementation's parameters and
+      -- `Self`; the call carries the method's own arguments.
+      let seeded = checked_specialization_bind_method_arguments(
+        product,
+        function_index,
+        match request.method_substitution {
+          Some(substitution) -> substitution
+          None -> semantic_type_substitution_empty()
+        },
+        request.arguments
       )
-      Some(concrete_signature) -> if {
-        let signatures = product.signatures()
-        let function = product.function(function_index)
-        signatures.type_parameter_count(function.signature)
-      } == 0 {
-        Some<CheckedSpecializationArguments>(
+      match checked_specialization_arguments_from_substitution(
+        product,
+        function_index,
+        seeded,
+        0,
+        Nil<SemanticTypeId>()
+      ) {
+        Some(arguments) -> Some<CheckedSpecializationArguments>(
           CheckedSpecializationArguments {
             types: request.types,
-            values: Nil<SemanticTypeId>()
+            values: arguments
           }
         )
-      } else {
-        let request_types = request.types
-        let catalog = semantic_type_product_catalog(request_types)
-        let template = product.function(function_index).signature.type_id
-        let empty = semantic_type_substitution_empty()
-        match semantic_type_pattern_match_substituted(
-          catalog,
-          template,
-          empty,
-          concrete_signature,
-          empty
-        ) {
-          SemanticTypePatternRejected -> None<CheckedSpecializationArguments>()
-          SemanticTypePatternMatched(substitution) ->
-            match checked_specialization_arguments_from_substitution(
-              product,
-              function_index,
-              substitution,
-              0,
-              Nil<SemanticTypeId>()
-            ) {
-              None -> None<CheckedSpecializationArguments>()
-              Some(arguments) -> Some<CheckedSpecializationArguments>(
-                CheckedSpecializationArguments {
-                  types: request_types,
-                  values: arguments
-                }
-              )
-            }
+        -- Parameters still unbound follow from the call's concrete signature.
+        None -> {
+          let template = product.function(function_index).signature.type_id
+          let (request_types, pattern) = semantic_type_product_substitute(
+            request.types,
+            seeded,
+            template
+          )
+          let catalog = semantic_type_product_catalog(request_types)
+          let empty = semantic_type_substitution_empty()
+          match semantic_type_pattern_match_substituted(
+            catalog,
+            pattern,
+            seeded,
+            concrete_signature,
+            empty
+          ) {
+            SemanticTypePatternRejected -> None<CheckedSpecializationArguments>()
+            SemanticTypePatternMatched(substitution) ->
+              match checked_specialization_arguments_from_substitution(
+                product,
+                function_index,
+                substitution,
+                0,
+                Nil<SemanticTypeId>()
+              ) {
+                None -> None<CheckedSpecializationArguments>()
+                Some(arguments) -> Some<CheckedSpecializationArguments>(
+                  CheckedSpecializationArguments {
+                    types: request_types,
+                    values: arguments
+                  }
+                )
+              }
+          }
         }
       }
     }
@@ -2922,7 +2997,7 @@ fn checked_specialization_call_target_kind(target: IrSemanticCallTarget) -> i64 
   match target {
     IrSemanticGenericTarget(_, _) -> 1
     IrSemanticApplyTarget(_, _, _) -> 2
-    IrSemanticMethodTarget(_, _, _) -> 3
+    IrSemanticMethodTarget(_, _, _, _) -> 3
     IrSemanticAssociatedTarget(_, _, _) -> 4
     IrSemanticPerformTarget(_, _, _) -> 5
     IrSemanticHandleTarget(_) -> 6
