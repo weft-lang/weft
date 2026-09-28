@@ -443,6 +443,7 @@ use compiler/weft/check/body/effects.{
 }
 use compiler/weft/check/body/graph.{
   CheckedAdd,
+  checked_binding_id_from_ordinal,
   CheckedArrayLiteralKind,
   CheckedConstructorCallKind,
   CheckedExprKind,
@@ -551,7 +552,12 @@ use compiler/weft/check/body/propagation.{
 use compiler/weft/check/registration/catalog.{
   RegisteredModule,
   RegisteredOpaqueType,
-  RegisteredType
+  RegisteredRecordField,
+  RegisteredRecordType,
+  RegisteredType,
+  RegisteredTypeDeclaration,
+  RegisteredVariantMember,
+  RegisteredVariantType
 }
 use compiler/weft/check/resolution/handlers.{
   SemanticHandlerCallIssue,
@@ -603,6 +609,11 @@ use compiler/weft/check/signatures.{
 }
 use compiler/weft/check/storage.{dense_index}
 use compiler/weft/syntax/numeric.{numeric_float_literal_value}
+use compiler/weft/check/body/resource.{
+  CheckedResourceContext,
+  CheckedResourceIssue,
+  checked_resource_issue
+}
 use compiler/weft/check/literal.{
   checked_integer_literal_fits,
   checked_integer_literal_magnitude,
@@ -660,6 +671,9 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerInvalidFloatLiteral(CheckedSourceRange),
   -- An integer literal whose authored magnitude its contextual type cannot hold.
   CheckedBodyProducerIntegerLiteralRange(SemanticTypeId, CheckedSourceRange),
+  -- An owned or unique type a declaration, signature or binding cannot hold,
+  -- at the authored name when there is one.
+  CheckedBodyProducerResourceRefused(CheckedResourceIssue, Option<CheckedSourceRange>),
   CheckedBodyProducerNumericOperandRequired(SemanticTypeId),
   CheckedBodyProducerNonExhaustiveMatch,
   CheckedBodyProducerCanonicalEqUnavailable,
@@ -25172,10 +25186,328 @@ fn checked_body_owner_signature(
   }
 }
 
+type CheckedBodyResourcesBuild {
+  CheckedBodyResourcesAccepted(owned CheckedBodyBuild, CheckedBodyPrimitiveTypes),
+  CheckedBodyResourcesRejected(owned CheckedBodyBuild, CheckedBodyProducerIssue)
+}
+
+-- The SDK's `Drop` trait as an atom of the module's catalog, when the
+-- program contains it.
+fn checked_body_drop_atom(
+  types: CheckedBodyPrimitiveTypes,
+  scope: RegistrationScope
+) -> (CheckedBodyPrimitiveTypes, Option<SemanticTypeId>) {
+  match checked_body_standard_declaration(
+    types,
+    scope,
+    "stdlib/drop",
+    TraitDeclaration,
+    "Drop"
+  ) {
+    nil -> (types, None<SemanticTypeId>())
+    drop: DeclarationIdentity -> {
+      let catalog = types.catalog
+      let resolution = types.resolution
+      let segment = semantic_type_derived_segment_id(
+        types.module.identity,
+        catalog.next_derived_segment(types.module.identity, resolution.next_type_segment())
+      )
+      let builder = semantic_type_graph_builder(segment)
+      let (builder, atom) = builder.trait_atom(drop)
+      let next = semantic_type_catalog_with_graph(catalog, builder.freeze())
+      (checked_body_types_with_catalog(types, next), Some(atom))
+    }
+  }
+}
+
+fn checked_body_resource_context(
+  state: borrow CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  drop_atom: Option<SemanticTypeId>
+) -> CheckedResourceContext {
+  let resolution = types.resolution
+  CheckedResourceContext {
+    types: state.types(),
+    declarations: resolution.declarations(),
+    sealed: types.sendable,
+    drop_atom: drop_atom
+  }
+}
+
+-- A signature's parameters and result, each a root position.
+fn checked_body_signature_resource_issue(
+  state: borrow CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  drop_atom: Option<SemanticTypeId>,
+  function_type: SemanticTypeId
+) -[SemanticConformance]> CheckedResourceIssue? {
+  let context = checked_body_resource_context(state, types, drop_atom)
+  let catalog = state.types()
+  let parameters = semantic_function_parameters_into(
+    catalog,
+    function_type,
+    0,
+    Nil<SemanticTypeId>()
+  )
+  for parameter in parameters {
+    match checked_resource_issue(context, parameter, true) {
+      found: CheckedResourceIssue -> return found
+      nil -> nil
+    }
+  }
+  checked_resource_issue(context, semantic_function_result(catalog, function_type), true)
+}
+
+-- Every binding a body introduced from `first`, at its authored range.
+fn checked_body_binding_resource_issue(
+  state: borrow CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  drop_atom: Option<SemanticTypeId>,
+  first: usize
+) -[SemanticConformance]> Option<(CheckedResourceIssue, CheckedSourceRange)> {
+  let context = checked_body_resource_context(state, types, drop_atom)
+  let segment = state.segment()
+  let mut index = first
+  while index < state.binding_count() {
+    let binding = state.binding_info(checked_binding_id_from_ordinal(segment, index))
+    match checked_resource_issue(context, binding.value_type, true) {
+      found: CheckedResourceIssue -> return Some((found, binding.range))
+      nil -> nil
+    }
+    index = index + 1
+  }
+  None<(CheckedResourceIssue, CheckedSourceRange)>()
+}
+
+fn checked_body_name_range(name: TypeNameRange) -> Option<CheckedSourceRange> {
+  if name.start < 0 or name.length < 0 { None<CheckedSourceRange>() }
+  else {
+    Some(
+      CheckedSourceRange {
+        start: __i64_to_usize(name.start),
+        end: __i64_to_usize(name.start + name.length)
+      }
+    )
+  }
+}
+
+-- One authored type of a declaration, resolved in its module. A type the
+-- declaration's own resolution refused is reported there, not here.
+fn checked_body_declared_resource(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  drop_atom: Option<SemanticTypeId>,
+  parameters: TypeParamList,
+  annotation: TypeExpr,
+  root: bool,
+  name: TypeNameRange
+) -[SemanticConformance]> CheckedBodyResourcesBuild {
+  let catalog = state.types()
+  let resolution = types.resolution
+  let segment = catalog.next_derived_segment(module.identity, resolution.next_type_segment())
+  match resolve_type_product_in_scope(
+    semantic_type_product_continue(module.identity, catalog, segment),
+    module,
+    scope,
+    parameters,
+    annotation
+  ) {
+    (_, SemanticTypeRejected(_)) -> CheckedBodyResourcesAccepted(state, types)
+    (product, SemanticTypeResolved(declared)) -> {
+      let next_catalog = semantic_type_product_catalog(product)
+      let state = state.with_types(next_catalog)
+      let next_types = checked_body_types_with_catalog(types, next_catalog)
+      let context = checked_body_resource_context(state, next_types, drop_atom)
+      match checked_resource_issue(context, declared, root) {
+        found: CheckedResourceIssue -> CheckedBodyResourcesRejected(
+          state,
+          CheckedBodyProducerResourceRefused(found, checked_body_name_range(name))
+        )
+        nil -> CheckedBodyResourcesAccepted(state, next_types)
+      }
+    }
+  }
+}
+
+-- The fields, payloads and representations of the module's own types. A
+-- field or payload is never a root; a representation is.
+fn checked_body_declaration_resources(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  drop_atom: Option<SemanticTypeId>,
+  index: usize
+) -[SemanticConformance]> CheckedBodyResourcesBuild {
+  let declarations = module.declarations
+  if index >= declarations.len() { CheckedBodyResourcesAccepted(state, types) }
+  else {
+    let declaration = declarations.at(dense_index(index))
+    let checked = match declaration.kind {
+      RegisteredTypeDeclaration(RegisteredRecordType(_, parameters, fields)) ->
+        checked_body_field_resources(
+          state,
+          types,
+          module,
+          scope,
+          drop_atom,
+          parameters,
+          fields
+        )
+      RegisteredTypeDeclaration(RegisteredVariantType(_, parameters, members)) ->
+        checked_body_member_resources(
+          state,
+          types,
+          module,
+          scope,
+          drop_atom,
+          parameters,
+          members
+        )
+      RegisteredTypeDeclaration(RegisteredOpaqueType(name, parameters, representation)) ->
+        checked_body_declared_resource(
+          state,
+          types,
+          module,
+          scope,
+          drop_atom,
+          parameters,
+          representation,
+          true,
+          name.range
+        )
+      _ -> CheckedBodyResourcesAccepted(state, types)
+    }
+    match checked {
+      CheckedBodyResourcesAccepted(state, types) -> checked_body_declaration_resources(
+        state,
+        types,
+        module,
+        scope,
+        drop_atom,
+        index + 1
+      )
+      CheckedBodyResourcesRejected(state, issue) -> CheckedBodyResourcesRejected(state, issue)
+    }
+  }
+}
+
+fn checked_body_field_resources(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  drop_atom: Option<SemanticTypeId>,
+  parameters: TypeParamList,
+  fields: List<RegisteredRecordField>
+) -[SemanticConformance]> CheckedBodyResourcesBuild {
+  match fields {
+    Nil -> CheckedBodyResourcesAccepted(state, types)
+    Cons(field, rest) -> match checked_body_declared_resource(
+      state,
+      types,
+      module,
+      scope,
+      drop_atom,
+      parameters,
+      field.syntax.annotation,
+      false,
+      field.syntax.name
+    ) {
+      CheckedBodyResourcesAccepted(state, types) -> checked_body_field_resources(
+        state,
+        types,
+        module,
+        scope,
+        drop_atom,
+        parameters,
+        rest
+      )
+      CheckedBodyResourcesRejected(state, issue) -> CheckedBodyResourcesRejected(state, issue)
+    }
+  }
+}
+
+fn checked_body_member_resources(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  drop_atom: Option<SemanticTypeId>,
+  parameters: TypeParamList,
+  members: List<RegisteredVariantMember>
+) -[SemanticConformance]> CheckedBodyResourcesBuild {
+  match members {
+    Nil -> CheckedBodyResourcesAccepted(state, types)
+    Cons(member, rest) -> match checked_body_payload_resources(
+      state,
+      types,
+      module,
+      scope,
+      drop_atom,
+      parameters,
+      member.syntax.payloads,
+      member.syntax.name
+    ) {
+      CheckedBodyResourcesAccepted(state, types) -> checked_body_member_resources(
+        state,
+        types,
+        module,
+        scope,
+        drop_atom,
+        parameters,
+        rest
+      )
+      CheckedBodyResourcesRejected(state, issue) -> CheckedBodyResourcesRejected(state, issue)
+    }
+  }
+}
+
+fn checked_body_payload_resources(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  drop_atom: Option<SemanticTypeId>,
+  parameters: TypeParamList,
+  payloads: List<TypeExpr>,
+  name: TypeNameRange
+) -[SemanticConformance]> CheckedBodyResourcesBuild {
+  match payloads {
+    Nil -> CheckedBodyResourcesAccepted(state, types)
+    Cons(payload, rest) -> match checked_body_declared_resource(
+      state,
+      types,
+      module,
+      scope,
+      drop_atom,
+      parameters,
+      payload,
+      false,
+      name
+    ) {
+      CheckedBodyResourcesAccepted(state, types) -> checked_body_payload_resources(
+        state,
+        types,
+        module,
+        scope,
+        drop_atom,
+        parameters,
+        rest,
+        name
+      )
+      CheckedBodyResourcesRejected(state, issue) -> CheckedBodyResourcesRejected(state, issue)
+    }
+  }
+}
+
 fn checked_body_functions(
   module: RegisteredModule,
   scope: RegistrationScope,
   types: CheckedBodyPrimitiveTypes,
+  drop_atom: Option<SemanticTypeId>,
   index: usize,
   state: owned CheckedBodyBuild
 ) -[SemanticConformance]> CheckedBodyFunctionsBuild {
@@ -25186,65 +25518,88 @@ fn checked_body_functions(
     let signature = state.signature(index)
     match checked_body_owner_signature(state, types, signature) {
       (state, types, signature, substitution) -> {
-        let catalog = types.catalog
-        let expected = semantic_function_result(catalog, signature.type_id)
-        match checked_body_parameters(
-          state,
-          module.source,
-          catalog,
-          signature,
-          function.syntax.params,
-          0,
-          CheckedLexicalRoot(
-            scope,
-            module.identity,
-            function.syntax.type_params,
-            signature.type_id,
-            substitution
-          )
-        ) {
-          CheckedBodyParametersBuilt(state, environment) -> match checked_body_expr(
+        match checked_body_signature_resource_issue(state, types, drop_atom, signature.type_id) {
+          found: CheckedResourceIssue -> CheckedBodyFunctionsRejected(
             state,
-            module.source,
-            types,
             signature.identity,
-            expected,
-            CheckedOutsideLoop,
-            environment,
-            function.syntax.body,
-            CheckedRequireResult(expected)
-          ) {
-            CheckedBodyExprBuilt(state, root) -> {
-              let root_range = state.range(root)
-              if semantic_continuation_type(catalog, state.result_type(root)) and
-                not
-                semantic_continuation_type(catalog, expected) {
-                  CheckedBodyFunctionsRejected(
-                    state,
-                    signature.identity,
-                    CheckedBodyProducerContinuationResultRequired(root_range)
-                  )
-                } else {
-                  checked_body_functions(
-                    module,
-                    scope,
-                    types,
-                    index + 1,
-                    state.function(signature, root)
-                  )
-                }
-            }
-            CheckedBodyExprRejected(state, issue) -> CheckedBodyFunctionsRejected(
+            CheckedBodyProducerResourceRefused(found, None<CheckedSourceRange>())
+          )
+          nil -> {
+            let first_binding = state.binding_count()
+            let catalog = types.catalog
+            let expected = semantic_function_result(catalog, signature.type_id)
+            match checked_body_parameters(
               state,
-              signature.identity,
-              issue
-            )
+              module.source,
+              catalog,
+              signature,
+              function.syntax.params,
+              0,
+              CheckedLexicalRoot(
+                scope,
+                module.identity,
+                function.syntax.type_params,
+                signature.type_id,
+                substitution
+              )
+            ) {
+              CheckedBodyParametersBuilt(state, environment) -> match checked_body_expr(
+                state,
+                module.source,
+                types,
+                signature.identity,
+                expected,
+                CheckedOutsideLoop,
+                environment,
+                function.syntax.body,
+                CheckedRequireResult(expected)
+              ) {
+                CheckedBodyExprBuilt(state, root) -> {
+                  let root_range = state.range(root)
+                  if semantic_continuation_type(catalog, state.result_type(root)) and
+                    not
+                    semantic_continuation_type(catalog, expected) {
+                      CheckedBodyFunctionsRejected(
+                        state,
+                        signature.identity,
+                        CheckedBodyProducerContinuationResultRequired(root_range)
+                      )
+                    } else {
+                      match checked_body_binding_resource_issue(
+                        state,
+                        types,
+                        drop_atom,
+                        first_binding
+                      ) {
+                        Some((found, range)) -> CheckedBodyFunctionsRejected(
+                          state,
+                          signature.identity,
+                          CheckedBodyProducerResourceRefused(found, Some(range))
+                        )
+                        None -> checked_body_functions(
+                          module,
+                          scope,
+                          types,
+                          drop_atom,
+                          index + 1,
+                          state.function(signature, root)
+                        )
+                      }
+                    }
+                }
+                CheckedBodyExprRejected(state, issue) -> CheckedBodyFunctionsRejected(
+                  state,
+                  signature.identity,
+                  issue
+                )
+              }
+              CheckedBodyParametersRejected(state, issue) -> CheckedBodyFunctionsRejected(
+                state,
+                signature.identity,
+                issue
+              )
+            }
           }
-          CheckedBodyParametersRejected(state, issue) -> CheckedBodyFunctionsRejected(
-            state,
-            signature.identity,
-            issue
-          )
         }
       }
     }
@@ -25265,25 +25620,46 @@ pub(package) fn check_registered_bodies_detailed(
     resolution,
     sdk_package_id
   ) {
-    CheckedBodyPrimitivesResolved(_, types) -> match checked_body_functions(
-      module,
-      scope,
-      types,
-      0,
-      checked_body_build(module, signatures, types)
-    ) {
-      CheckedBodyFunctionsBuilt(state) -> match state.freeze(resolution.declarations()) {
-        CheckedBodiesAccepted(product) -> CheckedBodiesDetailedAccepted(product)
-        CheckedBodiesRejected(issue) -> CheckedBodiesDetailedRejected(
-          ModuleFunctionIdentity(module.identity, 0),
-          issue,
-          None<CheckedSourceRange>()
-        )
-      }
-      CheckedBodyFunctionsRejected(state, function, issue) -> {
-        let location = state.failure_location()
-        state.drop()
-        CheckedBodiesDetailedRejected(function, issue, location)
+    CheckedBodyPrimitivesResolved(_, primitive_types) -> {
+      let (types, drop_atom) = checked_body_drop_atom(primitive_types, scope)
+      match checked_body_declaration_resources(
+        checked_body_build(module, signatures, types),
+        types,
+        module,
+        scope,
+        drop_atom,
+        0
+      ) {
+        CheckedBodyResourcesRejected(state, issue) -> {
+          state.drop()
+          CheckedBodiesDetailedRejected(
+            ModuleFunctionIdentity(module.identity, 0),
+            issue,
+            None<CheckedSourceRange>()
+          )
+        }
+        CheckedBodyResourcesAccepted(state, types) -> match checked_body_functions(
+          module,
+          scope,
+          types,
+          drop_atom,
+          0,
+          state
+        ) {
+          CheckedBodyFunctionsBuilt(state) -> match state.freeze(resolution.declarations()) {
+            CheckedBodiesAccepted(product) -> CheckedBodiesDetailedAccepted(product)
+            CheckedBodiesRejected(issue) -> CheckedBodiesDetailedRejected(
+              ModuleFunctionIdentity(module.identity, 0),
+              issue,
+              None<CheckedSourceRange>()
+            )
+          }
+          CheckedBodyFunctionsRejected(state, function, issue) -> {
+            let location = state.failure_location()
+            state.drop()
+            CheckedBodiesDetailedRejected(function, issue, location)
+          }
+        }
       }
     }
     CheckedBodyPrimitivesRejected(issue) -> CheckedBodiesDetailedRejected(

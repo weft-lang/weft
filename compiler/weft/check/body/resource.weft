@@ -1,0 +1,261 @@
+-- Owned resources in types: what an `owned` or `unique` value may be, and
+-- where it may be stored.
+--
+-- An `owned` value is a resource with one cleanup obligation, so the type it
+-- owns must implement the SDK's `Drop`. Its storage keeps that obligation
+-- exact: a finite record, tuple or tagged variant may hold it, but an
+-- arbitrary container, an untagged union, intersection or complement, or an
+-- open record may not, and `unique` wraps only ordinary data at the root of
+-- a binding or signature. Function types store nothing, but their own
+-- parameters and results still name resources that must implement `Drop`.
+
+use compiler/project/identity.{DeclarationIdentity}
+use compiler/types/graph.{
+  SemanticArrayNode,
+  SemanticBorrowNode,
+  SemanticComplementNode,
+  SemanticFunctionNode,
+  SemanticIntersectionNode,
+  SemanticNamedNode,
+  SemanticOpaqueType,
+  SemanticOpenRecord,
+  SemanticOwnedNode,
+  SemanticRecordNode,
+  SemanticTypeId,
+  SemanticUnionNode,
+  SemanticUniqueNode,
+  SemanticVariableNode,
+  semantic_type_graph_list_type_id,
+  semantic_type_graph_node,
+  semantic_type_graph_record_field_type_id,
+  semantic_type_graph_records_local,
+  semantic_type_graph_type_lists_local,
+  semantic_type_list_edge,
+  semantic_type_list_len,
+  semantic_type_record_field_count,
+  semantic_type_record_field_edge
+}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/conformance.{SemanticConformance}
+use compiler/types/graph/declarations.{SemanticTypeDeclarationCatalog}
+use compiler/types/graph/sendable.{
+  SemanticSealedMutableContainer,
+  SemanticSealedPersistentCollection,
+  SemanticSendableIdentities,
+  semantic_sealed_kind
+}
+use compiler/weft/check/body/linearity.{checked_linear_type}
+use stdlib/option.{None, Option, Some}
+
+pub(package) type CheckedResourceShape {
+  -- A vector, persistent collection or array holding a linear value.
+  CheckedResourceContainer,
+  -- An untagged union, intersection or complement over a linear value.
+  CheckedResourceSetOperator,
+  -- An open record holding a linear value.
+  CheckedResourceOpenRecord,
+  -- `unique` anywhere but the root, or around another linear shape.
+  CheckedResourceNestedUnique
+}
+
+pub(package) type CheckedResourceIssue {
+  -- An `owned` type whose value does not implement the SDK's `Drop`.
+  CheckedResourceDropRequired(SemanticTypeId),
+  CheckedResourceStorage(CheckedResourceShape, SemanticTypeId)
+}
+
+-- What a check can consult: the program's types and declarations, the sealed
+-- SDK containers, and the SDK's `Drop` trait as an atom when it exists.
+pub(package) type CheckedResourceContext {
+  types: SemanticTypeCatalog,
+  declarations: SemanticTypeDeclarationCatalog,
+  sealed: SemanticSendableIdentities,
+  drop_atom: Option<SemanticTypeId>
+}
+
+-- The first resource issue in `value`. A binding or signature position may
+-- itself be `unique`; a field or payload may not.
+pub(package) fn checked_resource_issue(
+  context: borrow CheckedResourceContext,
+  value: SemanticTypeId,
+  root: bool
+) -[SemanticConformance]> CheckedResourceIssue? {
+  checked_resource_within(context, value, root, true, 0)
+}
+
+fn resource_linear(context: borrow CheckedResourceContext, value: SemanticTypeId) -> bool {
+  let types = context.types
+  let declarations = context.declarations
+  checked_linear_type(types, declarations, value)
+}
+
+-- `stored` is false inside a function type, which names but never holds its
+-- parameters and results.
+fn checked_resource_within(
+  context: borrow CheckedResourceContext,
+  value: SemanticTypeId,
+  root: bool,
+  stored: bool,
+  depth: usize
+) -[SemanticConformance]> CheckedResourceIssue? {
+  if depth > 32 { return nil }
+  let types = context.types
+  match types.graph_for(value) {
+    None -> nil
+    Some(graph) -> match semantic_type_graph_node(graph, value) {
+      SemanticOwnedNode(inner) -> if checked_resource_drops(context, inner) { nil } else {
+        CheckedResourceDropRequired(inner)
+      }
+      SemanticUniqueNode(inner) -> if stored and not root {
+        CheckedResourceStorage(CheckedResourceNestedUnique, value)
+      } else if stored and resource_linear(context, inner) {
+        CheckedResourceStorage(CheckedResourceNestedUnique, value)
+      } else { checked_resource_within(context, inner, false, stored, depth + 1) }
+      SemanticUnionNode(left, right) -> checked_resource_pair(
+        context,
+        value,
+        left,
+        right,
+        stored,
+        depth
+      )
+      SemanticIntersectionNode(left, right) -> checked_resource_pair(
+        context,
+        value,
+        left,
+        right,
+        stored,
+        depth
+      )
+      SemanticComplementNode(inner) -> if stored and resource_linear(context, inner) {
+        CheckedResourceStorage(CheckedResourceSetOperator, value)
+      } else { checked_resource_within(context, inner, false, stored, depth + 1) }
+      SemanticArrayNode(inner, _) -> if stored and resource_linear(context, inner) {
+        CheckedResourceStorage(CheckedResourceContainer, value)
+      } else { checked_resource_within(context, inner, false, stored, depth + 1) }
+      SemanticRecordNode(fields, _, openness) -> {
+        let records = semantic_type_graph_records_local(graph)
+        let count = semantic_type_record_field_count(records, fields)
+        let open = match openness {
+          SemanticOpenRecord -> true
+          _ -> false
+        }
+        let mut index: usize = 0
+        while index < count {
+          let field = semantic_type_graph_record_field_type_id(
+            graph,
+            semantic_type_record_field_edge(records, fields, index)
+          )
+          if stored and open and resource_linear(context, field) {
+            return CheckedResourceStorage(CheckedResourceOpenRecord, value)
+          }
+          match checked_resource_within(context, field, false, stored, depth + 1) {
+            found: CheckedResourceIssue -> return found
+            nil -> nil
+          }
+          index = index + 1
+        }
+        nil
+      }
+      SemanticFunctionNode(parameters, result, _) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        let count = semantic_type_list_len(lists, parameters)
+        let mut index: usize = 0
+        while index < count {
+          let parameter = semantic_type_graph_list_type_id(
+            graph,
+            semantic_type_list_edge(lists, parameters, index)
+          )
+          match checked_resource_within(context, parameter, true, false, depth + 1) {
+            found: CheckedResourceIssue -> return found
+            nil -> nil
+          }
+          index = index + 1
+        }
+        checked_resource_within(context, result, true, false, depth + 1)
+      }
+      SemanticNamedNode(declaration, role, representation, arguments) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        let count = semantic_type_list_len(lists, arguments)
+        let container = checked_resource_container(context, declaration)
+        let mut index: usize = 0
+        while index < count {
+          let argument = semantic_type_graph_list_type_id(
+            graph,
+            semantic_type_list_edge(lists, arguments, index)
+          )
+          if stored and container and resource_linear(context, argument) {
+            return CheckedResourceStorage(CheckedResourceContainer, value)
+          }
+          match checked_resource_within(context, argument, false, stored, depth + 1) {
+            found: CheckedResourceIssue -> return found
+            nil -> nil
+          }
+          index = index + 1
+        }
+        -- An opaque wrapper stores what its instantiated representation does.
+        match role {
+          SemanticOpaqueType -> if stored {
+            checked_resource_within(context, representation, false, stored, depth + 1)
+          } else { nil }
+          _ -> nil
+        }
+      }
+      -- A borrow views an owned resource or unique data without storing it.
+      SemanticBorrowNode(_, _) -> nil
+      _ -> nil
+    }
+  }
+}
+
+fn checked_resource_pair(
+  context: borrow CheckedResourceContext,
+  value: SemanticTypeId,
+  left: SemanticTypeId,
+  right: SemanticTypeId,
+  stored: bool,
+  depth: usize
+) -[SemanticConformance]> CheckedResourceIssue? {
+  if stored and (resource_linear(context, left) or resource_linear(context, right)) {
+    return CheckedResourceStorage(CheckedResourceSetOperator, value)
+  }
+  match checked_resource_within(context, left, false, stored, depth + 1) {
+    found: CheckedResourceIssue -> found
+    nil -> checked_resource_within(context, right, false, stored, depth + 1)
+  }
+}
+
+fn checked_resource_container(
+  context: borrow CheckedResourceContext,
+  declaration: DeclarationIdentity
+) -> bool {
+  let sealed = context.sealed
+  match semantic_sealed_kind(sealed, declaration) {
+    Some(SemanticSealedMutableContainer) -> true
+    Some(SemanticSealedPersistentCollection) -> true
+    _ -> false
+  }
+}
+
+-- Whether an owned value of this type has a Drop implementation: only a
+-- nominal type may, and only the SDK's `Drop` counts. A type variable is
+-- decided where it is instantiated.
+fn checked_resource_drops(
+  context: borrow CheckedResourceContext,
+  inner: SemanticTypeId
+) -[SemanticConformance]> bool {
+  let types = context.types
+  let nominal = match types.graph_for(inner) {
+    Some(graph) -> match semantic_type_graph_node(graph, inner) {
+      SemanticNamedNode(_, _, _, _) -> true
+      SemanticVariableNode(_) -> return true
+      _ -> false
+    }
+    None -> false
+  }
+  if not nominal { return false }
+  match context.drop_atom {
+    None -> false
+    Some(atom) -> SemanticConformance.conforms(types, inner, atom)
+  }
+}
