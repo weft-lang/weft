@@ -230,6 +230,7 @@ use compiler/types/graph.{
   SemanticMutable,
   SemanticMutability,
   SemanticNamedNode,
+  SemanticNil,
   SemanticNominalType,
   SemanticOpaqueType,
   SemanticUnionNode,
@@ -237,6 +238,7 @@ use compiler/types/graph.{
   SemanticOwnedNode,
   SemanticPointerNode,
   SemanticParameterVariable,
+  SemanticPrimitive,
   SemanticPrimitiveNode,
   SemanticRecordFieldListId,
   SemanticRecordNode,
@@ -244,6 +246,7 @@ use compiler/types/graph.{
   SemanticTraitBindingListId,
   SemanticSelfVariable,
   SemanticSliceNode,
+  SemanticStr,
   SemanticTypeId,
   SemanticTypeGraphBuilder,
   SemanticTypeGraph,
@@ -337,6 +340,15 @@ use compiler/types/graph/pattern.{
   semantic_type_pattern_match_substituted
 }
 use compiler/weft/check/resolution.{SemanticResolutionProduct}
+use compiler/weft/check/resolution/constants.{
+  SemanticConstant,
+  SemanticConstantBoolean,
+  SemanticConstantFloat,
+  SemanticConstantInteger,
+  SemanticConstantNil,
+  SemanticConstantString,
+  semantic_constant_find
+}
 use compiler/weft/check/resolution/applications.{
   SemanticEffectApplicationCatalog,
   SemanticEffectApplicationSelected,
@@ -576,6 +588,7 @@ use compiler/weft/check/semantic_types.{
   resolve_type_product_in_scope,
   semantic_type_product_catalog,
   semantic_type_product_continue,
+  semantic_primitive_authored_code,
   semantic_type_product_owned,
   semantic_type_product_substitute
 }
@@ -589,14 +602,7 @@ use compiler/weft/check/signatures.{
   semantic_signature_in_scope
 }
 use compiler/weft/check/storage.{dense_index}
-use runtime/float.{
-  runtime_f32_from_bits,
-  runtime_f64_from_bits,
-  runtime_float_bits_result_bits,
-  runtime_float_bits_result_ok,
-  runtime_float_decimal_f32_bits,
-  runtime_float_decimal_f64_bits
-}
+use compiler/weft/syntax/numeric.{numeric_float_literal_value}
 use runtime/string.{runtime_str_from_bytes_copy}
 use stdlib/drop.{Drop}
 use stdlib/list as list
@@ -6418,6 +6424,40 @@ impl CheckedBodyBuild {
     }
   }
 
+  -- Record that a literal materializes a use of a module constant.
+  fn constant_use(
+    self: owned Self,
+    constant: DeclarationIdentity,
+    literal: CheckedExprId
+  ) -> owned CheckedBodyBuild {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let {
+          signatures,
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          inference,
+          failure
+        } = storage
+        CheckedBodyBuild(
+          CheckedBodyBuildStorage {
+            signatures: signatures,
+            expressions: expressions.constant_use(constant, literal),
+            patterns: patterns,
+            closures: closures,
+            effects: effects,
+            propagation: propagation,
+            inference: inference,
+            failure: failure
+          }
+        )
+      }
+    }
+  }
+
   fn integer(
     self: owned Self,
     value: i64,
@@ -7738,36 +7778,6 @@ fn contextual_float_type(
       expected
     } else { types.float64 }
     CheckedInferResult -> types.float64
-  }
-}
-
-fn checked_float_literal_value(
-  source: Source,
-  start: i64,
-  length: i64,
-  float32: bool
-) -> Option<f64> {
-  let result = if float32 {
-    runtime_float_decimal_f32_bits(
-      __str_ptr(source.text),
-      start,
-      length
-    )
-  } else {
-    runtime_float_decimal_f64_bits(
-      __str_ptr(source.text),
-      start,
-      length
-    )
-  }
-  if runtime_float_bits_result_ok(result) == 0 { None<f64>() }
-  else {
-    let bits = runtime_float_bits_result_bits(result)
-    if float32 {
-      Some<f64>(__f32_to_f64(runtime_f32_from_bits(__i64_to_u32(bits))))
-    } else {
-      Some<f64>(runtime_f64_from_bits(__i64_to_u64(bits)))
-    }
   }
 }
 
@@ -16684,9 +16694,12 @@ fn checked_body_perform(
                 )
               }
             }
-            CheckedBodySignatureMissing(state) -> CheckedBodyExprRejected(
+            CheckedBodySignatureMissing(state) -> checked_body_missing_callee(
               state,
-              CheckedBodyProducerSignatureUnavailable(range)
+              types,
+              environment,
+              declaration,
+              range
             )
             CheckedBodySignatureRejected(state, issue) -> CheckedBodyExprRejected(
               state,
@@ -18760,9 +18773,12 @@ fn checked_body_generic_call(
             }
           }
         }
-        CheckedBodySignatureMissing(state) -> CheckedBodyExprRejected(
+        CheckedBodySignatureMissing(state) -> checked_body_missing_callee(
           state,
-          CheckedBodyProducerSignatureUnavailable(name_range)
+          types,
+          environment,
+          declaration,
+          name_range
         )
         CheckedBodySignatureRejected(state, issue) -> CheckedBodyExprRejected(
           state,
@@ -19850,6 +19866,183 @@ fn checked_constructor_member(
   }
 }
 
+-- A value declaration named by an expression: a function becomes a reference
+-- to it, and a module constant, which has no signature, its typed literal.
+fn checked_body_value_declaration(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  environment: CheckedLexicalEnvironment,
+  declaration: DeclarationIdentity,
+  range: CheckedSourceRange,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match state.resolve_signature(lexical_scope(environment), DeclaredFunctionIdentity(declaration)) {
+    CheckedBodySignatureFound(state, signature) -> {
+      let catalog = state.types()
+      if expectation_allows(catalog, signature.type_id, expectation) {
+        match expectation {
+          CheckedRequireResult(expected) -> if state.type_parameter_count(signature) > 0 {
+            checked_body_inferred_function_reference(
+              state,
+              checked_body_types_with_catalog(types, catalog),
+              owner,
+              declaration,
+              signature,
+              expected,
+              range
+            )
+          } else {
+            match state.declaration_reference(declaration, signature.type_id, range) {
+              (state, expression) -> CheckedBodyExprBuilt(state, expression)
+            }
+          }
+          CheckedInferResult -> match state.declaration_reference(
+            declaration,
+            signature.type_id,
+            range
+          ) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+        }
+      } else {
+        CheckedBodyExprRejected(state, expectation_mismatch(signature.type_id, expectation))
+      }
+    }
+    CheckedBodySignatureMissing(state) -> {
+      let resolution = types.resolution
+      match semantic_constant_find(resolution.constants(), declaration) {
+        Some(constant) -> checked_body_constant_reference(
+          state,
+          types,
+          environment,
+          constant,
+          range,
+          expectation
+        )
+        None -> CheckedBodyExprRejected(state, CheckedBodyProducerSignatureUnavailable(range))
+      }
+    }
+    CheckedBodySignatureRejected(state, issue) -> CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerTypeRejected(issue)
+    )
+  }
+}
+
+-- A called value declaration with no signature. A module constant is a value
+-- of its annotation, which is never callable.
+fn checked_body_missing_callee(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  environment: CheckedLexicalEnvironment,
+  declaration: DeclarationIdentity,
+  range: CheckedSourceRange
+) -> CheckedBodyExprBuild {
+  let resolution = types.resolution
+  match semantic_constant_find(resolution.constants(), declaration) {
+    None -> CheckedBodyExprRejected(state, CheckedBodyProducerSignatureUnavailable(range))
+    Some(constant) -> match checked_body_constant_type(
+      state,
+      types,
+      environment,
+      constant.primitive
+    ) {
+      (state, SemanticTypeRejected(issue)) -> CheckedBodyExprRejected(
+        state,
+        CheckedBodyProducerTypeRejected(issue)
+      )
+      (state, SemanticTypeResolved(declared)) -> CheckedBodyExprRejected(
+        state,
+        CheckedBodyProducerCallableRequired(declared)
+      )
+    }
+  }
+}
+
+-- The annotation of a module constant, as a type of this body's catalog.
+fn checked_body_constant_type(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  environment: CheckedLexicalEnvironment,
+  primitive: SemanticPrimitive
+) -> (owned CheckedBodyBuild, SemanticTypeResolution) {
+  match primitive {
+    SemanticI64 -> (state, SemanticTypeResolved(types.integer))
+    SemanticUsize -> (state, SemanticTypeResolved(types.usize_type))
+    SemanticStr -> (state, SemanticTypeResolved(types.string))
+    SemanticBool -> (state, SemanticTypeResolved(types.boolean))
+    SemanticNil -> (state, SemanticTypeResolved(types.nil_type))
+    SemanticF64 -> (state, SemanticTypeResolved(types.float64))
+    SemanticF32 -> (state, SemanticTypeResolved(types.float32))
+    _ -> {
+      let catalog = state.types()
+      let resolution = types.resolution
+      let segment = catalog.next_derived_segment(
+        types.module.identity,
+        resolution.next_type_segment()
+      )
+      match checked_body_resolve_type_in_environment(
+        semantic_type_product_continue(types.module.identity, catalog, segment),
+        types.module,
+        environment,
+        PrimitiveTypeExpr(semantic_primitive_authored_code(primitive))
+      ) {
+        (_, SemanticTypeRejected(issue)) -> (state, SemanticTypeRejected(issue))
+        (product, SemanticTypeResolved(declared)) -> (
+          state.with_types(semantic_type_product_catalog(product)),
+          SemanticTypeResolved(declared)
+        )
+      }
+    }
+  }
+}
+
+-- A module constant's use is the typed literal of its compile-time value at
+-- the use site, with the constant's annotation as its type. The graph
+-- records which constant the literal materializes.
+fn checked_body_constant_reference(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  environment: CheckedLexicalEnvironment,
+  constant: SemanticConstant,
+  range: CheckedSourceRange,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match checked_body_constant_type(state, types, environment, constant.primitive) {
+    (state, SemanticTypeRejected(issue)) -> CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerTypeRejected(issue)
+    )
+    (state, SemanticTypeResolved(declared)) -> {
+      let catalog = state.types()
+      if not expectation_allows(catalog, declared, expectation) {
+        CheckedBodyExprRejected(state, expectation_mismatch(declared, expectation))
+      } else {
+        let (state, literal) = match constant.value {
+          SemanticConstantInteger(value) -> state.integer(value, declared, range)
+          SemanticConstantFloat(value) -> state.float(value, declared, range)
+          SemanticConstantBoolean(truth) -> state.boolean(truth, declared, range)
+          SemanticConstantString(source, start, length) -> state.string(
+            checked_string_literal_text(source, start, length),
+            declared,
+            range
+          )
+          SemanticConstantNil -> state.nil(declared, range)
+        }
+        CheckedBodyExprBuilt(state.constant_use(constant.identity, literal), literal)
+      }
+    }
+  }
+}
+
+-- The decoded bytes of a string literal, which its parsed syntax retains
+-- beside its source.
+fn checked_string_literal_text(source: Source, decoded_start: i64, decoded_length: i64) -> str {
+  if decoded_length == 0 { "" }
+  else { runtime_str_from_bytes_copy(__str_ptr(source.text) + decoded_start, decoded_length) }
+}
+
 fn checked_body_qualified_declaration(
   source: Source,
   environment: CheckedLexicalEnvironment,
@@ -20170,9 +20363,12 @@ fn checked_body_call(
                   )
                 }
               }
-              CheckedBodySignatureMissing(state) -> CheckedBodyExprRejected(
+              CheckedBodySignatureMissing(state) -> checked_body_missing_callee(
                 state,
-                CheckedBodyProducerSignatureUnavailable(name_range)
+                types,
+                environment,
+                declaration.identity,
+                name_range
               )
               CheckedBodySignatureRejected(state, issue) -> CheckedBodyExprRejected(
                 state,
@@ -20994,55 +21190,15 @@ fn checked_body_field_access(
         field_range,
         ValueDeclaration
       ) {
-        Some((declaration, range)) -> match state.resolve_signature(
-          lexical_scope(environment),
-          DeclaredFunctionIdentity(declaration)
-        ) {
-          CheckedBodySignatureFound(state, signature) -> {
-            let catalog = state.types()
-            if expectation_allows(catalog, signature.type_id, expectation) {
-              match expectation {
-                CheckedRequireResult(expected) -> if state.type_parameter_count(
-                  signature
-                ) > 0 {
-                  checked_body_inferred_function_reference(
-                    state,
-                    checked_body_types_with_catalog(types, catalog),
-                    owner,
-                    declaration,
-                    signature,
-                    expected,
-                    range
-                  )
-                } else {
-                  match state.declaration_reference(declaration, signature.type_id, range) {
-                    (state, expression) -> CheckedBodyExprBuilt(state, expression)
-                  }
-                }
-                CheckedInferResult -> match state.declaration_reference(
-                  declaration,
-                  signature.type_id,
-                  range
-                ) {
-                  (state, expression) -> CheckedBodyExprBuilt(state, expression)
-                }
-              }
-            } else {
-              CheckedBodyExprRejected(
-                state,
-                expectation_mismatch(signature.type_id, expectation)
-              )
-            }
-          }
-          CheckedBodySignatureMissing(state) -> CheckedBodyExprRejected(
-            state,
-            CheckedBodyProducerSignatureUnavailable(range)
-          )
-          CheckedBodySignatureRejected(state, issue) -> CheckedBodyExprRejected(
-            state,
-            CheckedBodyProducerTypeRejected(issue)
-          )
-        }
+        Some((declaration, range)) -> checked_body_value_declaration(
+          state,
+          types,
+          owner,
+          environment,
+          declaration,
+          range,
+          expectation
+        )
         None -> match checked_body_qualified_declaration(
           source,
           environment,
@@ -24544,13 +24700,11 @@ fn checked_body_expr_node(
         CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
       } else {
         if expectation_allows(catalog, types.string, expectation) {
-          let value = if decoded_length == 0 { "" } else {
-            runtime_str_from_bytes_copy(
-              __str_ptr(source.text) + decoded_start,
-              decoded_length
-            )
-          }
-          match state.string(value, types.string, range) {
+          match state.string(
+            checked_string_literal_text(source, decoded_start, decoded_length),
+            types.string,
+            range
+          ) {
             (state, expression) -> CheckedBodyExprBuilt(state, expression)
           }
         } else {
@@ -24568,8 +24722,8 @@ fn checked_body_expr_node(
         if not expectation_allows(catalog, actual, expectation) {
           CheckedBodyExprRejected(state, expectation_mismatch(actual, expectation))
         } else {
-          match checked_float_literal_value(
-            source,
+          match numeric_float_literal_value(
+            source.text,
             start,
             length,
             semantic_type_catalog_equal(catalog, actual, types.float32)
@@ -24659,59 +24813,15 @@ fn checked_body_expr_node(
             ValueDeclaration,
             name
           ) {
-            Some(declaration) -> match state.resolve_signature(
-              lexical_scope(environment),
-              DeclaredFunctionIdentity(declaration.identity)
-            ) {
-              CheckedBodySignatureFound(state, signature) -> {
-                let catalog = state.types()
-                if expectation_allows(catalog, signature.type_id, expectation) {
-                  match expectation {
-                    CheckedRequireResult(expected) -> if state.type_parameter_count(
-                      signature
-                    ) > 0 {
-                      checked_body_inferred_function_reference(
-                        state,
-                        checked_body_types_with_catalog(types, catalog),
-                        owner,
-                        declaration.identity,
-                        signature,
-                        expected,
-                        range
-                      )
-                    } else {
-                      match state.declaration_reference(
-                        declaration.identity,
-                        signature.type_id,
-                        range
-                      ) {
-                        (state, expression) -> CheckedBodyExprBuilt(state, expression)
-                      }
-                    }
-                    CheckedInferResult -> match state.declaration_reference(
-                      declaration.identity,
-                      signature.type_id,
-                      range
-                    ) {
-                      (state, expression) -> CheckedBodyExprBuilt(state, expression)
-                    }
-                  }
-                } else {
-                  CheckedBodyExprRejected(
-                    state,
-                    expectation_mismatch(signature.type_id, expectation)
-                  )
-                }
-              }
-              CheckedBodySignatureMissing(state) -> CheckedBodyExprRejected(
-                state,
-                CheckedBodyProducerSignatureUnavailable(range)
-              )
-              CheckedBodySignatureRejected(state, issue) -> CheckedBodyExprRejected(
-                state,
-                CheckedBodyProducerTypeRejected(issue)
-              )
-            }
+            Some(declaration) -> checked_body_value_declaration(
+              state,
+              types,
+              owner,
+              environment,
+              declaration.identity,
+              range,
+              expectation
+            )
             None -> match registration_scope_lookup_declaration_span(
               lexical_scope(environment),
               lexical_module(environment),

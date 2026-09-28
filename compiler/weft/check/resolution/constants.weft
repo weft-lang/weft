@@ -1,0 +1,813 @@
+-- Module constants: the whole constant graph, evaluated before any body.
+--
+-- A constant is an immutable declaration-level value of the directly
+-- representable primitive domain. Its initializer is evaluated once, by
+-- declaration identity, from literals, other constants, `not`, `and`/`or`
+-- and the audited `i64` arithmetic and comparisons. Bodies materialize each
+-- use as its typed literal, so a constant has no storage, initializer or
+-- evaluation order of its own.
+
+use compiler/ir/data.{
+  BinOp,
+  BoolLit,
+  Expr,
+  FieldAccess,
+  FloatLit,
+  Ident,
+  IntLit,
+  Negate,
+  NilExpr,
+  Not,
+  StringLit,
+  TypeParamListNil
+}
+use compiler/project/identity.{DeclarationIdentity, ValueDeclaration}
+use compiler/project/identity/equality.{declaration_identity_eq}
+use compiler/types/graph.{
+  SemanticBool,
+  SemanticF32,
+  SemanticF64,
+  SemanticI16,
+  SemanticI32,
+  SemanticI64,
+  SemanticI8,
+  SemanticIsize,
+  SemanticNil,
+  SemanticPrimitive,
+  SemanticPrimitiveNode,
+  SemanticStr,
+  SemanticU16,
+  SemanticU32,
+  SemanticU64,
+  SemanticU8,
+  SemanticUsize,
+  semantic_type_graph_node
+}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/subtyping.{semantic_primitive_subtype}
+use compiler/weft/check/body/extent.{checked_authored_extent}
+use compiler/weft/check/body/graph.{CheckedSourceRange}
+use compiler/weft/check/registration/catalog.{
+  RegisteredConstant,
+  RegisteredConstantDeclaration,
+  RegisteredModule
+}
+use compiler/weft/check/registration/scope.{
+  RegistrationScope,
+  registration_scope_at,
+  registration_scope_len,
+  registration_scope_lookup_declaration_span,
+  registration_scope_lookup_qualified_declaration_span
+}
+use compiler/weft/check/semantic_types.{
+  SemanticTypeProductBuilder,
+  SemanticTypeRejected,
+  SemanticTypeResolutionIssue,
+  SemanticTypeResolved,
+  resolve_type_product_in_scope,
+  semantic_type_product_catalog
+}
+use compiler/weft/check/storage.{dense_index}
+use compiler/weft/syntax/numeric.{numeric_float_literal_value}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/source.{Source}
+
+pub(package) type SemanticConstantValue {
+  SemanticConstantInteger(i64),
+  SemanticConstantFloat(f64),
+  SemanticConstantBoolean(bool),
+  -- The decoded bytes of an authored string literal, which the parsed
+  -- syntax of the literal's own source retains.
+  SemanticConstantString(Source, i64, i64),
+  SemanticConstantNil
+}
+
+pub(package) type SemanticConstant {
+  identity: DeclarationIdentity,
+  primitive: SemanticPrimitive,
+  value: SemanticConstantValue
+}
+
+-- Every module constant in a scope, each evaluated exactly once.
+pub(package) type SemanticConstantCatalog = opaque List<SemanticConstant>
+
+pub(package) type SemanticConstantRefusal {
+  -- A name that no module constant declares.
+  SemanticConstantNameRefused,
+  SemanticConstantQualifiedNameRefused,
+  SemanticConstantNotOperandRefused,
+  -- Division and modulo, whose compile-time behaviour is not yet proved
+  -- identical to their runtime behaviour.
+  SemanticConstantOperatorUnaudited,
+  SemanticConstantOperatorRefused,
+  -- Calls, effects, allocation, mutation, control flow and every other
+  -- expression that only running the program can evaluate.
+  SemanticConstantRuntimeExpression,
+  SemanticConstantCycle,
+  -- An annotation outside the directly representable primitive domain.
+  SemanticConstantRuntimeType,
+  -- A float spelling with no value of the annotated width.
+  SemanticConstantFloatUnrepresentable
+}
+
+-- Ranges lie in the source of the constant each issue names.
+pub(package) type SemanticConstantIssue {
+  SemanticConstantRefused(DeclarationIdentity, SemanticConstantRefusal, CheckedSourceRange),
+  -- A compile-time value outside its annotation: the value's primitive, then
+  -- the annotation's.
+  SemanticConstantMismatch(
+    DeclarationIdentity,
+    SemanticPrimitive,
+    SemanticPrimitive,
+    CheckedSourceRange
+  ),
+  SemanticConstantTypeRejected(DeclarationIdentity, SemanticTypeResolutionIssue)
+}
+
+pub(package) type SemanticConstantsResolution {
+  SemanticConstantsResolved(SemanticTypeProductBuilder, SemanticConstantCatalog),
+  SemanticConstantsRejected(SemanticTypeProductBuilder, SemanticConstantIssue)
+}
+
+type SemanticConstantEntry {
+  module: RegisteredModule,
+  constant: RegisteredConstant
+}
+
+type SemanticConstantContext {
+  scope: RegistrationScope,
+  entries: List<SemanticConstantEntry>
+}
+
+-- An initializer's value. An unsuffixed literal takes the type of the
+-- annotation it meets; every other value already has its primitive.
+type SemanticConstantOperand {
+  SemanticIntegerLiteralOperand(i64),
+  SemanticFloatLiteralOperand(Source, i64, i64),
+  SemanticTypedOperand(SemanticPrimitive, SemanticConstantValue)
+}
+
+type SemanticConstantOperandResult {
+  SemanticConstantOperandEvaluated(
+    SemanticTypeProductBuilder,
+    List<SemanticConstant>,
+    SemanticConstantOperand
+  ),
+  SemanticConstantOperandFailed(SemanticTypeProductBuilder, SemanticConstantIssue)
+}
+
+type SemanticConstantResult {
+  SemanticConstantResolvedIn(SemanticTypeProductBuilder, List<SemanticConstant>, SemanticConstant),
+  SemanticConstantFailed(SemanticTypeProductBuilder, SemanticConstantIssue)
+}
+
+type SemanticConstantPrimitiveResult {
+  SemanticConstantPrimitiveResolved(SemanticTypeProductBuilder, SemanticPrimitive),
+  SemanticConstantPrimitiveFailed(SemanticTypeProductBuilder, SemanticConstantIssue)
+}
+
+type SemanticConstantAdmission {
+  SemanticConstantAdmitted(SemanticConstantValue),
+  SemanticConstantOutsideAnnotation(SemanticPrimitive),
+  SemanticConstantUnrepresentable
+}
+
+pub(package) fn semantic_constant_find(
+  catalog: SemanticConstantCatalog,
+  identity: DeclarationIdentity
+) -> Option<SemanticConstant> {
+  match catalog {
+    SemanticConstantCatalog(constants) -> semantic_constant_resolved(constants, identity)
+  }
+}
+
+pub(package) fn semantic_constant_catalog_len(catalog: SemanticConstantCatalog) -> usize {
+  match catalog {
+    SemanticConstantCatalog(constants) -> constants.len()
+  }
+}
+
+-- Resolve and evaluate every constant the scope's modules declare, in
+-- declaration order. Forward references evaluate their target first; the
+-- first refused constant rejects the whole graph.
+pub(package) fn resolve_semantic_constants(
+  product: SemanticTypeProductBuilder,
+  scope: RegistrationScope
+) -> SemanticConstantsResolution {
+  let context = SemanticConstantContext {
+    scope: scope,
+    entries: semantic_constant_entries(scope, 0, Nil<SemanticConstantEntry>())
+  }
+  semantic_constants_from(product, context, context.entries, Nil<SemanticConstant>())
+}
+
+fn semantic_constant_entries(
+  scope: RegistrationScope,
+  module_index: usize,
+  collected: List<SemanticConstantEntry>
+) -> List<SemanticConstantEntry> {
+  if module_index >= registration_scope_len(scope) { collected.reverse() }
+  else {
+    let module = registration_scope_at(scope, __u64_to_i64(__usize_to_u64(module_index)))
+    let declarations = module.declarations
+    let mut entries = collected
+    let mut index: usize = 0
+    while index < declarations.len() {
+      let declaration = declarations.at(dense_index(index))
+      match declaration.kind {
+        RegisteredConstantDeclaration(constant) -> {
+          entries = entries.prepend(SemanticConstantEntry { module: module, constant: constant })
+        }
+        _ -> nil
+      }
+      index = index + 1
+    }
+    semantic_constant_entries(scope, module_index + 1, entries)
+  }
+}
+
+fn semantic_constants_from(
+  product: SemanticTypeProductBuilder,
+  context: SemanticConstantContext,
+  remaining: List<SemanticConstantEntry>,
+  resolved: List<SemanticConstant>
+) -> SemanticConstantsResolution {
+  match remaining {
+    Nil -> SemanticConstantsResolved(product, SemanticConstantCatalog(resolved))
+    Cons(entry, rest) -> match semantic_constant_resolve(
+      product,
+      context,
+      resolved,
+      Nil<DeclarationIdentity>(),
+      entry
+    ) {
+      SemanticConstantResolvedIn(product, resolved, _) -> semantic_constants_from(
+        product,
+        context,
+        rest,
+        resolved
+      )
+      SemanticConstantFailed(product, issue) -> SemanticConstantsRejected(product, issue)
+    }
+  }
+}
+
+fn semantic_constant_resolved(
+  constants: List<SemanticConstant>,
+  identity: DeclarationIdentity
+) -> Option<SemanticConstant> {
+  match constants {
+    Nil -> None<SemanticConstant>()
+    Cons(constant, rest) -> if declaration_identity_eq(constant.identity, identity) {
+      Some(constant)
+    } else { semantic_constant_resolved(rest, identity) }
+  }
+}
+
+fn semantic_constant_entry(
+  entries: List<SemanticConstantEntry>,
+  identity: DeclarationIdentity
+) -> Option<SemanticConstantEntry> {
+  match entries {
+    Nil -> None<SemanticConstantEntry>()
+    Cons(entry, rest) -> if declaration_identity_eq(entry.constant.name.identity, identity) {
+      Some(entry)
+    } else { semantic_constant_entry(rest, identity) }
+  }
+}
+
+fn semantic_constant_visiting(
+  visiting: List<DeclarationIdentity>,
+  identity: DeclarationIdentity
+) -> bool {
+  match visiting {
+    Nil -> false
+    Cons(current, rest) -> declaration_identity_eq(current, identity) or
+      semantic_constant_visiting(rest, identity)
+  }
+}
+
+fn semantic_constant_name_range(entry: SemanticConstantEntry) -> CheckedSourceRange {
+  let name = entry.constant.name.range
+  CheckedSourceRange {
+    start: __i64_to_usize(name.start),
+    end: __i64_to_usize(name.start + name.length)
+  }
+}
+
+-- An expression's authored extent, or its constant's name for syntax with no
+-- position of its own.
+fn semantic_constant_range(entry: SemanticConstantEntry, expression: Expr) -> CheckedSourceRange {
+  match checked_authored_extent(entry.module.source, expression) {
+    nil -> semantic_constant_name_range(entry)
+    range: CheckedSourceRange -> range
+  }
+}
+
+fn semantic_constant_resolve(
+  product: SemanticTypeProductBuilder,
+  context: SemanticConstantContext,
+  resolved: List<SemanticConstant>,
+  visiting: List<DeclarationIdentity>,
+  entry: SemanticConstantEntry
+) -> SemanticConstantResult {
+  let identity = entry.constant.name.identity
+  match semantic_constant_resolved(resolved, identity) {
+    Some(constant) -> SemanticConstantResolvedIn(product, resolved, constant)
+    None -> if semantic_constant_visiting(visiting, identity) {
+      SemanticConstantFailed(
+        product,
+        SemanticConstantRefused(
+          identity,
+          SemanticConstantCycle,
+          semantic_constant_name_range(entry)
+        )
+      )
+    } else {
+      match semantic_constant_primitive(product, context.scope, entry) {
+        SemanticConstantPrimitiveFailed(product, issue) -> SemanticConstantFailed(product, issue)
+        SemanticConstantPrimitiveResolved(product, primitive) -> {
+          let initializer = entry.constant.initializer
+          match semantic_constant_operand(
+            product,
+            context,
+            resolved,
+            visiting.prepend(identity),
+            entry,
+            initializer
+          ) {
+            SemanticConstantOperandFailed(product, issue) -> SemanticConstantFailed(
+              product,
+              issue
+            )
+            SemanticConstantOperandEvaluated(product, resolved, operand) ->
+              match semantic_constant_admit(operand, primitive) {
+                SemanticConstantAdmitted(value) -> {
+                  let constant = SemanticConstant {
+                    identity: identity,
+                    primitive: primitive,
+                    value: value
+                  }
+                  SemanticConstantResolvedIn(product, resolved.prepend(constant), constant)
+                }
+                SemanticConstantOutsideAnnotation(found) -> SemanticConstantFailed(
+                  product,
+                  SemanticConstantMismatch(
+                    identity,
+                    found,
+                    primitive,
+                    semantic_constant_range(entry, initializer)
+                  )
+                )
+                SemanticConstantUnrepresentable -> SemanticConstantFailed(
+                  product,
+                  SemanticConstantRefused(
+                    identity,
+                    SemanticConstantFloatUnrepresentable,
+                    semantic_constant_range(entry, initializer)
+                  )
+                )
+              }
+          }
+        }
+      }
+    }
+  }
+}
+
+fn semantic_constant_primitive(
+  product: SemanticTypeProductBuilder,
+  scope: RegistrationScope,
+  entry: SemanticConstantEntry
+) -> SemanticConstantPrimitiveResult {
+  let identity = entry.constant.name.identity
+  match resolve_type_product_in_scope(
+    product,
+    entry.module,
+    scope,
+    TypeParamListNil,
+    entry.constant.declared_type
+  ) {
+    (product, SemanticTypeRejected(issue)) -> SemanticConstantPrimitiveFailed(
+      product,
+      SemanticConstantTypeRejected(identity, issue)
+    )
+    (product, SemanticTypeResolved(declared)) -> {
+      let catalog = semantic_type_product_catalog(product)
+      let primitive = match catalog.graph_for(declared) {
+        Some(graph) -> match semantic_type_graph_node(graph, declared) {
+          SemanticPrimitiveNode(primitive) -> Some(primitive)
+          _ -> None<SemanticPrimitive>()
+        }
+        None -> None<SemanticPrimitive>()
+      }
+      match primitive {
+        Some(found) -> SemanticConstantPrimitiveResolved(product, found)
+        None -> SemanticConstantPrimitiveFailed(
+          product,
+          SemanticConstantRefused(
+            identity,
+            SemanticConstantRuntimeType,
+            semantic_constant_name_range(entry)
+          )
+        )
+      }
+    }
+  }
+}
+
+fn semantic_integer_primitive(primitive: SemanticPrimitive) -> bool {
+  match primitive {
+    SemanticI64 -> true
+    SemanticI32 -> true
+    SemanticI16 -> true
+    SemanticI8 -> true
+    SemanticU64 -> true
+    SemanticU32 -> true
+    SemanticU16 -> true
+    SemanticU8 -> true
+    SemanticIsize -> true
+    SemanticUsize -> true
+    _ -> false
+  }
+}
+
+fn semantic_constant_admit(
+  operand: SemanticConstantOperand,
+  annotation: SemanticPrimitive
+) -> SemanticConstantAdmission {
+  match operand {
+    SemanticIntegerLiteralOperand(value) -> if semantic_integer_primitive(annotation) {
+      SemanticConstantAdmitted(SemanticConstantInteger(value))
+    } else { SemanticConstantOutsideAnnotation(SemanticI64) }
+    SemanticFloatLiteralOperand(source, start, length) -> {
+      let float32 = match annotation {
+        SemanticF32 -> Some(true)
+        SemanticF64 -> Some(false)
+        _ -> None<bool>()
+      }
+      match float32 {
+        None -> SemanticConstantOutsideAnnotation(SemanticF64)
+        Some(narrow) -> match numeric_float_literal_value(source.text, start, length, narrow) {
+          Some(value) -> SemanticConstantAdmitted(SemanticConstantFloat(value))
+          None -> SemanticConstantUnrepresentable
+        }
+      }
+    }
+    SemanticTypedOperand(primitive, value) -> if not semantic_primitive_subtype(
+      primitive,
+      annotation
+    ) {
+      SemanticConstantOutsideAnnotation(primitive)
+    } else {
+      -- A `bool` annotated as `i64` is the integer it already denotes.
+      match value {
+        SemanticConstantBoolean(truth) -> match annotation {
+          SemanticBool -> SemanticConstantAdmitted(value)
+          _ -> SemanticConstantAdmitted(SemanticConstantInteger(if truth { 1 } else { 0 }))
+        }
+        _ -> SemanticConstantAdmitted(value)
+      }
+    }
+  }
+}
+
+fn semantic_constant_refused(
+  product: SemanticTypeProductBuilder,
+  entry: SemanticConstantEntry,
+  refusal: SemanticConstantRefusal,
+  expression: Expr
+) -> SemanticConstantOperandResult {
+  SemanticConstantOperandFailed(
+    product,
+    SemanticConstantRefused(
+      entry.constant.name.identity,
+      refusal,
+      semantic_constant_range(entry, expression)
+    )
+  )
+}
+
+fn semantic_typed_operand(
+  product: SemanticTypeProductBuilder,
+  resolved: List<SemanticConstant>,
+  primitive: SemanticPrimitive,
+  value: SemanticConstantValue
+) -> SemanticConstantOperandResult {
+  SemanticConstantOperandEvaluated(product, resolved, SemanticTypedOperand(primitive, value))
+}
+
+-- Evaluate a reference to another constant, which a name resolved to.
+fn semantic_constant_reference(
+  product: SemanticTypeProductBuilder,
+  context: SemanticConstantContext,
+  resolved: List<SemanticConstant>,
+  visiting: List<DeclarationIdentity>,
+  target: Option<SemanticConstantEntry>,
+  entry: SemanticConstantEntry,
+  refusal: SemanticConstantRefusal,
+  expression: Expr
+) -> SemanticConstantOperandResult {
+  match target {
+    None -> semantic_constant_refused(product, entry, refusal, expression)
+    Some(referenced) -> match semantic_constant_resolve(
+      product,
+      context,
+      resolved,
+      visiting,
+      referenced
+    ) {
+      SemanticConstantFailed(product, issue) -> SemanticConstantOperandFailed(product, issue)
+      SemanticConstantResolvedIn(product, resolved, constant) -> semantic_typed_operand(
+        product,
+        resolved,
+        constant.primitive,
+        constant.value
+      )
+    }
+  }
+}
+
+fn semantic_constant_named(
+  context: SemanticConstantContext,
+  declaration: Option<DeclarationIdentity>
+) -> Option<SemanticConstantEntry> {
+  match declaration {
+    None -> None<SemanticConstantEntry>()
+    Some(identity) -> semantic_constant_entry(context.entries, identity)
+  }
+}
+
+fn semantic_constant_unqualified(
+  context: SemanticConstantContext,
+  entry: SemanticConstantEntry,
+  start: i64,
+  length: i64
+) -> Option<SemanticConstantEntry> {
+  let source = entry.module.source
+  if start < 0 or length < 0 { None<SemanticConstantEntry>() }
+  else {
+    match source.span(__i64_to_usize(start), __i64_to_usize(start + length)) {
+      None -> None<SemanticConstantEntry>()
+      Some(name) -> semantic_constant_named(
+        context,
+        match registration_scope_lookup_declaration_span(
+          context.scope,
+          entry.module.identity,
+          ValueDeclaration,
+          name
+        ) {
+          Some(found) -> Some(found.identity)
+          None -> None<DeclarationIdentity>()
+        }
+      )
+    }
+  }
+}
+
+fn semantic_constant_qualified(
+  context: SemanticConstantContext,
+  entry: SemanticConstantEntry,
+  qualifier: Expr,
+  start: i64,
+  length: i64
+) -> Option<SemanticConstantEntry> {
+  let source = entry.module.source
+  match qualifier {
+    Ident(qualifier_start, qualifier_length) -> if qualifier_start < 0 or qualifier_length < 0 or
+      start < 0 or length < 0 {
+        None<SemanticConstantEntry>()
+      } else {
+        match (
+          source.span(
+            __i64_to_usize(qualifier_start),
+            __i64_to_usize(qualifier_start + qualifier_length)
+          ),
+          source.span(__i64_to_usize(start), __i64_to_usize(start + length)),
+        ) {
+          (Some(module_name), Some(member)) -> semantic_constant_named(
+            context,
+            match registration_scope_lookup_qualified_declaration_span(
+              context.scope,
+              entry.module.identity,
+              module_name,
+              ValueDeclaration,
+              member
+            ) {
+              Some(found) -> Some(found.identity)
+              None -> None<DeclarationIdentity>()
+            }
+          )
+          _ -> None<SemanticConstantEntry>()
+        }
+      }
+    _ -> None<SemanticConstantEntry>()
+  }
+}
+
+fn semantic_constant_operand(
+  product: SemanticTypeProductBuilder,
+  context: SemanticConstantContext,
+  resolved: List<SemanticConstant>,
+  visiting: List<DeclarationIdentity>,
+  entry: SemanticConstantEntry,
+  expression: Expr
+) -> SemanticConstantOperandResult {
+  match expression {
+    IntLit(value, _, _) -> SemanticConstantOperandEvaluated(
+      product,
+      resolved,
+      SemanticIntegerLiteralOperand(value)
+    )
+    FloatLit(start, length, _) -> SemanticConstantOperandEvaluated(
+      product,
+      resolved,
+      SemanticFloatLiteralOperand(entry.module.source, start, length)
+    )
+    BoolLit(value, _, _) -> semantic_typed_operand(
+      product,
+      resolved,
+      SemanticBool,
+      SemanticConstantBoolean(value != 0)
+    )
+    NilExpr -> semantic_typed_operand(product, resolved, SemanticNil, SemanticConstantNil)
+    StringLit(decoded_start, decoded_length, _, _) -> if decoded_length < 0 {
+      semantic_constant_refused(product, entry, SemanticConstantRuntimeExpression, expression)
+    } else {
+      semantic_typed_operand(
+        product,
+        resolved,
+        SemanticStr,
+        SemanticConstantString(entry.module.source, decoded_start, decoded_length)
+      )
+    }
+    Ident(start, length) -> semantic_constant_reference(
+      product,
+      context,
+      resolved,
+      visiting,
+      semantic_constant_unqualified(context, entry, start, length),
+      entry,
+      SemanticConstantNameRefused,
+      expression
+    )
+    FieldAccess(qualifier, start, length, _) -> semantic_constant_reference(
+      product,
+      context,
+      resolved,
+      visiting,
+      semantic_constant_qualified(context, entry, qualifier, start, length),
+      entry,
+      SemanticConstantQualifiedNameRefused,
+      expression
+    )
+    Not(operand) -> match semantic_constant_operand(
+      product,
+      context,
+      resolved,
+      visiting,
+      entry,
+      operand
+    ) {
+      SemanticConstantOperandFailed(product, issue) -> SemanticConstantOperandFailed(
+        product,
+        issue
+      )
+      SemanticConstantOperandEvaluated(
+        product,
+        resolved,
+        SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(truth)),
+      ) -> semantic_typed_operand(
+        product,
+        resolved,
+        SemanticBool,
+        SemanticConstantBoolean(not truth)
+      )
+      SemanticConstantOperandEvaluated(product, _, _) -> semantic_constant_refused(
+        product,
+        entry,
+        SemanticConstantNotOperandRefused,
+        expression
+      )
+    }
+    BinOp(operator, left, right) -> semantic_constant_binary(
+      product,
+      context,
+      resolved,
+      visiting,
+      entry,
+      expression,
+      operator,
+      left,
+      right
+    )
+    -- Negation is the audited `0 - operand`.
+    Negate(operand, _) -> semantic_constant_binary(
+      product,
+      context,
+      resolved,
+      visiting,
+      entry,
+      expression,
+      2,
+      IntLit(0, 0, 0),
+      operand
+    )
+    _ -> semantic_constant_refused(
+      product,
+      entry,
+      SemanticConstantRuntimeExpression,
+      expression
+    )
+  }
+}
+
+fn semantic_operand_i64(operand: SemanticConstantOperand) -> Option<i64> {
+  match operand {
+    SemanticIntegerLiteralOperand(value) -> Some(value)
+    SemanticTypedOperand(SemanticI64, SemanticConstantInteger(value)) -> Some(value)
+    _ -> None<i64>()
+  }
+}
+
+fn semantic_operand_bool(operand: SemanticConstantOperand) -> Option<bool> {
+  match operand {
+    SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(truth)) -> Some(truth)
+    _ -> None<bool>()
+  }
+}
+
+-- The audited operators: `i64` `+`, `-`, `*` and comparisons, and `bool`
+-- `and`/`or`. Both operands are evaluated first, as at runtime.
+fn semantic_constant_apply(
+  operator: i64,
+  left: SemanticConstantOperand,
+  right: SemanticConstantOperand
+) -> Option<SemanticConstantOperand> {
+  match (semantic_operand_i64(left), semantic_operand_i64(right)) {
+    (Some(lhs), Some(rhs)) -> match operator {
+      1 -> Some(SemanticTypedOperand(SemanticI64, SemanticConstantInteger(lhs + rhs)))
+      2 -> Some(SemanticTypedOperand(SemanticI64, SemanticConstantInteger(lhs - rhs)))
+      3 -> Some(SemanticTypedOperand(SemanticI64, SemanticConstantInteger(lhs * rhs)))
+      5 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs == rhs)))
+      6 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs != rhs)))
+      7 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs < rhs)))
+      8 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs > rhs)))
+      9 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs <= rhs)))
+      10 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs >= rhs)))
+      _ -> None<SemanticConstantOperand>()
+    }
+    _ -> match (semantic_operand_bool(left), semantic_operand_bool(right)) {
+      (Some(lhs), Some(rhs)) -> match operator {
+        12 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs and rhs)))
+        13 -> Some(SemanticTypedOperand(SemanticBool, SemanticConstantBoolean(lhs or rhs)))
+        _ -> None<SemanticConstantOperand>()
+      }
+      _ -> None<SemanticConstantOperand>()
+    }
+  }
+}
+
+fn semantic_constant_binary(
+  product: SemanticTypeProductBuilder,
+  context: SemanticConstantContext,
+  resolved: List<SemanticConstant>,
+  visiting: List<DeclarationIdentity>,
+  entry: SemanticConstantEntry,
+  expression: Expr,
+  operator: i64,
+  left: Expr,
+  right: Expr
+) -> SemanticConstantOperandResult {
+  match semantic_constant_operand(product, context, resolved, visiting, entry, left) {
+    SemanticConstantOperandFailed(product, issue) -> SemanticConstantOperandFailed(product, issue)
+    SemanticConstantOperandEvaluated(product, resolved, lhs) -> match semantic_constant_operand(
+      product,
+      context,
+      resolved,
+      visiting,
+      entry,
+      right
+    ) {
+      SemanticConstantOperandFailed(product, issue) -> SemanticConstantOperandFailed(
+        product,
+        issue
+      )
+      SemanticConstantOperandEvaluated(product, resolved, rhs) ->
+        match semantic_constant_apply(operator, lhs, rhs) {
+          Some(value) -> SemanticConstantOperandEvaluated(product, resolved, value)
+          None -> semantic_constant_refused(
+            product,
+            entry,
+            match operator {
+              4 -> SemanticConstantOperatorUnaudited
+              11 -> SemanticConstantOperatorUnaudited
+              _ -> SemanticConstantOperatorRefused
+            },
+            expression
+          )
+        }
+    }
+  }
+}

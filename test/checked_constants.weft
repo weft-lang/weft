@@ -1,0 +1,794 @@
+-- Module constants on the typed path: the whole constant graph evaluates
+-- before any body, each use is the typed literal of its value with the
+-- constant's annotation as its type, and every refused initializer names its
+-- own constant, module and authored extent.
+
+use compiler/project/identity.{ModuleIdentity, declaration_identity_name, named_module_identity}
+use compiler/source/input.{source_from_text}
+use compiler/types/graph.{
+  SemanticBool,
+  SemanticF32,
+  SemanticF64,
+  SemanticI32,
+  SemanticI64,
+  SemanticNil,
+  SemanticPrimitive,
+  SemanticPrimitiveNode,
+  SemanticStr,
+  SemanticU64,
+  SemanticU8,
+  SemanticUsize,
+  semantic_type_graph_node
+}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/conformance.{SemanticConformance}
+use compiler/weft/check/body/graph.{
+  CheckedBooleanKind,
+  CheckedExprGraph,
+  CheckedExprId,
+  CheckedFloatKind,
+  CheckedIntegerKind,
+  CheckedNilKind,
+  CheckedStringKind
+}
+use compiler/weft/check/body/product.{CheckedBodyProduct}
+use compiler/weft/check/body/producer.{
+  CheckedBodiesAccepted,
+  CheckedBodiesRejected,
+  check_registered_bodies
+}
+use compiler/weft/check/checked_program.{check_registered_program}
+use compiler/weft/check/registration/catalog as registration
+use compiler/weft/check/registration/catalog.{RegisteredConstantDeclaration, RegisteredModule}
+use compiler/weft/check/storage.{dense_index}
+use compiler/weft/check/registration/scope as registration_scope
+use compiler/weft/check/registration/scope.{RegistrationScope}
+use compiler/weft/check/rejection.{
+  TypedCheckRejection,
+  checked_body_producer_issue_category,
+  typed_check_constant_issue_category,
+  typed_check_program_rejection,
+  typed_check_stage_name
+}
+use compiler/weft/check/resolution/constants.{
+  SemanticConstantInteger,
+  semantic_constant_catalog_len,
+  semantic_constant_find
+}
+use compiler/weft/check/resolution.{
+  SemanticConstantResolutionIssue,
+  SemanticResolutionAccepted,
+  SemanticResolutionRejected,
+  resolve_module_semantics
+}
+use compiler/weft/grammar.{ParsedWeftSource, WeftParser}
+use stdlib/diagnostic.{Diagnose, DiagnosticSourceRange}
+use stdlib/grammar.{Grammar, Parsed}
+use stdlib/list as list
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+use stdlib/string.{str_concat}
+use stdlib/test.{Test}
+
+type ConstantCheck {
+  ConstantAccepted(CheckedBodyProduct),
+  ConstantRejected(str)
+}
+
+fn parse(text: str) -[Test]> ParsedWeftSource {
+  let result = handle WeftParser().parse(source_from_text(text).all()) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false); resume(0) }
+    Diagnose.error(message, location) -> { Test.assert_true(false); resume(0) }
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  }
+  match result {
+    Parsed(syntax) -> syntax
+    _ -> panic("expected complete authored syntax")
+  }
+}
+
+fn registered(text: str, module: ModuleIdentity) -[Test]> RegisteredModule {
+  let parsed = parse(text)
+  registration.register(parsed.declarations, parsed.source.source(), module)
+}
+
+-- Resolve the scope from `module`, then check that module's bodies. A
+-- refused constant rejects resolution; a refused use rejects its body.
+fn checked_in(
+  module: RegisteredModule,
+  scope: RegistrationScope,
+  discriminator: i64
+) -[Test]>
+  ConstantCheck
+{
+  match resolve_module_semantics(module, scope) {
+    SemanticResolutionAccepted(resolution) -> {
+      let result = handle check_registered_bodies(module, scope, resolution, discriminator) {
+        SemanticConformance.conforms(_, concrete, trait_atom) -> resume(false)
+      }
+      match result {
+        CheckedBodiesAccepted(product) -> ConstantAccepted(product)
+        CheckedBodiesRejected(issue) -> ConstantRejected(
+          checked_body_producer_issue_category(issue)
+        )
+      }
+    }
+    SemanticResolutionRejected(SemanticConstantResolutionIssue(issue)) -> ConstantRejected(
+      typed_check_constant_issue_category(issue)
+    )
+    SemanticResolutionRejected(_) -> ConstantRejected("unresolved")
+  }
+}
+
+fn checked(text: str, discriminator: i64) -[Test]> ConstantCheck {
+  let module = registered(text, named_module_identity("fixture/constants", discriminator))
+  let builder = registration_scope.registration_builder()
+  registration_scope.registration_builder_add(builder, module)
+  checked_in(module, registration_scope.registration_builder_freeze(builder), discriminator)
+}
+
+-- A consumer whose first import names the dependency.
+fn two_modules(
+  dependency: str,
+  consumer: str,
+  discriminator: i64
+) -[Test]>
+  (RegisteredModule, RegistrationScope)
+{
+  let target = registered(
+    dependency,
+    named_module_identity("fixture/constants_dep", discriminator)
+  )
+  let caller = registered(consumer, named_module_identity("fixture/constants_use", discriminator))
+  let edge = registration_scope.resolved_import(
+    caller,
+    caller.syntax.imports.get(0).unwrap(),
+    target.identity,
+    false
+  )
+  let modules = [target, caller]
+  let imports = [edge]
+  (
+    caller,
+    registration_scope.registration_scope_build(
+      list.from_slice(modules[..]),
+      list.from_slice(imports[..])
+    )
+  )
+}
+
+fn checked_with(dependency: str, consumer: str, discriminator: i64) -[Test]> ConstantCheck {
+  let (caller, scope) = two_modules(dependency, consumer, discriminator)
+  checked_in(caller, scope, discriminator)
+}
+
+fn category(check: ConstantCheck) -> str {
+  match check {
+    ConstantAccepted(_) -> "accepted"
+    ConstantRejected(found) -> found
+  }
+}
+
+fn accepted(check: ConstantCheck) -[Test]> CheckedBodyProduct {
+  match check {
+    ConstantAccepted(product) -> product
+    ConstantRejected(found) -> {
+      Test.assert_str_eq(found, "accepted")
+      panic("expected accepted constants")
+    }
+  }
+}
+
+fn primitive_name(primitive: SemanticPrimitive) -> str {
+  match primitive {
+    SemanticI64 -> "i64"
+    SemanticI32 -> "i32"
+    SemanticU8 -> "u8"
+    SemanticU64 -> "u64"
+    SemanticUsize -> "usize"
+    SemanticF32 -> "f32"
+    SemanticF64 -> "f64"
+    SemanticBool -> "bool"
+    SemanticStr -> "str"
+    SemanticNil -> "nil"
+    _ -> "other"
+  }
+}
+
+fn result_primitive(expressions: borrow CheckedExprGraph, root: CheckedExprId) -> str {
+  let catalog = expressions.types()
+  let result = expressions.result_type(root)
+  match catalog.graph_for(result) {
+    Some(graph) -> match semantic_type_graph_node(graph, result) {
+      SemanticPrimitiveNode(primitive) -> primitive_name(primitive)
+      _ -> "not primitive"
+    }
+    None -> "outside catalog"
+  }
+}
+
+fn constant_named(expressions: borrow CheckedExprGraph, root: CheckedExprId) -> str {
+  match expressions.constant_use(root) {
+    Some(constant) -> declaration_identity_name(constant).text().unwrap()
+    None -> "none"
+  }
+}
+
+-- The first function's root is an integer literal of `primitive` that
+-- materializes `constant`.
+fn assert_integer(check: ConstantCheck, value: i64, primitive: str, constant: str) -[Test]> nil {
+  let product = accepted(check)
+  let expressions = product.expressions()
+  let root = product.function(0).body
+  Test.assert_true(
+    match expressions.kind(root) {
+      CheckedIntegerKind -> true
+      _ -> false
+    }
+  )
+  Test.assert_eq(expressions.integer_value(root), value)
+  Test.assert_str_eq(result_primitive(expressions, root), primitive)
+  Test.assert_str_eq(constant_named(expressions, root), constant)
+  nil
+}
+
+fn assert_boolean(check: ConstantCheck, value: bool, constant: str) -[Test]> nil {
+  let product = accepted(check)
+  let expressions = product.expressions()
+  let root = product.function(0).body
+  Test.assert_true(
+    match expressions.kind(root) {
+      CheckedBooleanKind -> true
+      _ -> false
+    }
+  )
+  Test.assert_true(expressions.boolean_value(root) == value)
+  Test.assert_str_eq(result_primitive(expressions, root), "bool")
+  Test.assert_str_eq(constant_named(expressions, root), constant)
+  nil
+}
+
+fn assert_float(check: ConstantCheck, value: f64, primitive: str, constant: str) -[Test]> nil {
+  let product = accepted(check)
+  let expressions = product.expressions()
+  let root = product.function(0).body
+  Test.assert_true(
+    match expressions.kind(root) {
+      CheckedFloatKind -> true
+      _ -> false
+    }
+  )
+  Test.assert_true(expressions.float_value(root) == value)
+  Test.assert_str_eq(result_primitive(expressions, root), primitive)
+  Test.assert_str_eq(constant_named(expressions, root), constant)
+  nil
+}
+
+fn assert_string(check: ConstantCheck, value: str, constant: str) -[Test]> nil {
+  let product = accepted(check)
+  let expressions = product.expressions()
+  let root = product.function(0).body
+  Test.assert_true(
+    match expressions.kind(root) {
+      CheckedStringKind -> true
+      _ -> false
+    }
+  )
+  Test.assert_str_eq(expressions.string_value(root), value)
+  Test.assert_str_eq(result_primitive(expressions, root), "str")
+  Test.assert_str_eq(constant_named(expressions, root), constant)
+  nil
+}
+
+-- The rejection of a program rooted at the consumer.
+fn program_rejection(
+  dependency: str,
+  consumer: str,
+  discriminator: i64
+) -[Test]>
+  TypedCheckRejection
+{
+  let (caller, scope) = two_modules(dependency, consumer, discriminator)
+  match typed_check_program_rejection(
+    check_registered_program(caller.identity, scope, discriminator),
+    scope
+  ) {
+    Some(rejection) -> rejection
+    None -> panic("expected a rejected program")
+  }
+}
+
+fn assert_located(rejection: TypedCheckRejection, text: str, needle: str) -[Test]> nil {
+  let start = text.find(needle).unwrap()
+  Test.assert_true(
+    match rejection.location {
+      DiagnosticSourceRange(_, found_start, found_end) ->
+        found_start == start and found_end == start + needle.len()
+      _ -> false
+    }
+  )
+  nil
+}
+
+test "typed constants materialize each use as the typed literal of its value" {
+  assert_integer(
+    checked("const ANSWER: i64 = 42 fn probe() -> i64 { ANSWER }", 3001),
+    42,
+    "i64",
+    "ANSWER"
+  )
+  -- Every use is its own literal, and each records the constant it names.
+  let product = accepted(
+    checked("const ANSWER: i64 = 42 fn probe() -> i64 { ANSWER + ANSWER * 2 }", 3002)
+  )
+  let expressions = product.expressions()
+  Test.assert_eq_usize(expressions.constant_use_len(), 2)
+  let left = expressions.binary_left(product.function(0).body)
+  Test.assert_eq(expressions.integer_value(left), 42)
+  Test.assert_str_eq(constant_named(expressions, left), "ANSWER")
+  Test.assert_str_eq(constant_named(expressions, product.function(0).body), "none")
+}
+
+test "typed constants cover every primitive of the constant domain" {
+  assert_integer(
+    checked("const BYTE: u8 = 255 fn probe() -> u8 { BYTE }", 3011),
+    255,
+    "u8",
+    "BYTE"
+  )
+  assert_integer(
+    checked("type Word = u64 const WORD: Word = 7 fn probe() -> u64 { WORD }", 3012),
+    7,
+    "u64",
+    "WORD"
+  )
+  assert_integer(
+    checked("const COUNT: usize = 3 fn probe() -> usize { COUNT }", 3013),
+    3,
+    "usize",
+    "COUNT"
+  )
+  assert_float(
+    checked("const HALF: f32 = 1.5 fn probe() -> f32 { HALF }", 3014),
+    1.5,
+    "f32",
+    "HALF"
+  )
+  assert_float(
+    checked("const RATE: f64 = 2.5 fn probe() -> f64 { RATE }", 3015),
+    2.5,
+    "f64",
+    "RATE"
+  )
+  assert_boolean(
+    checked("const ON: bool = not false fn probe() -> bool { ON }", 3016),
+    true,
+    "ON"
+  )
+  assert_string(
+    checked("const NAME: str = \"weft\" fn probe() -> str { NAME }", 3017),
+    "weft",
+    "NAME"
+  )
+  let product = accepted(checked("const NOTHING: nil = nil fn probe() -> nil { NOTHING }", 3018))
+  let expressions = product.expressions()
+  let root = product.function(0).body
+  Test.assert_true(
+    match expressions.kind(root) {
+      CheckedNilKind -> true
+      _ -> false
+    }
+  )
+  Test.assert_str_eq(result_primitive(expressions, root), "nil")
+  Test.assert_str_eq(constant_named(expressions, root), "NOTHING")
+}
+
+test "typed float constants round to their annotation's width" {
+  let narrow = accepted(checked("const TENTH: f32 = 0.1 fn probe() -> f32 { TENTH }", 3021))
+  let wide = accepted(checked("const TENTH: f64 = 0.1 fn probe() -> f64 { TENTH }", 3022))
+  let narrow_expressions = narrow.expressions()
+  let wide_expressions = wide.expressions()
+  let narrow_value = narrow_expressions.float_value(narrow.function(0).body)
+  let wide_value = wide_expressions.float_value(wide.function(0).body)
+  Test.assert_true(wide_value == 0.1)
+  -- The nearest `f32` to one tenth is 0.100000001490116...
+  Test.assert_true(narrow_value > 0.1000000014 and narrow_value < 0.1000000015)
+  -- A spelling beyond `f32` rounds to its infinity, exactly as the same
+  -- literal written in a body does.
+  let body = accepted(checked("fn probe() -> f32 { 1e39 }", 3023))
+  let body_expressions = body.expressions()
+  let rounded = body_expressions.float_value(body.function(0).body)
+  Test.assert_true(rounded > 1e308)
+  assert_float(
+    checked("const LARGE: f32 = 1e39 fn probe() -> f32 { LARGE }", 3024),
+    rounded,
+    "f32",
+    "LARGE"
+  )
+  assert_float(
+    checked("const LARGE: f64 = 1e39 fn probe() -> f64 { LARGE }", 3025),
+    1e39,
+    "f64",
+    "LARGE"
+  )
+}
+
+test "typed string constants keep their decoded text" {
+  assert_string(
+    checked("const GREETING: str = \"héllo\\n\" fn probe() -> str { GREETING }", 3031),
+    "héllo\n",
+    "GREETING"
+  )
+  assert_string(checked("const EMPTY: str = \"\" fn probe() -> str { EMPTY }", 3032), "", "EMPTY")
+}
+
+test "typed constants evaluate the audited operators before any body" {
+  assert_integer(
+    checked(
+      "const FIRST: i64 = SECOND + 2 const SECOND: i64 = 40 fn probe() -> i64 { FIRST }",
+      3041
+    ),
+    42,
+    "i64",
+    "FIRST"
+  )
+  assert_integer(
+    checked("const PRODUCT: i64 = 6 * 7 fn probe() -> i64 { PRODUCT }", 3042),
+    42,
+    "i64",
+    "PRODUCT"
+  )
+  assert_integer(
+    checked("const DIFFERENCE: i64 = 50 - 8 fn probe() -> i64 { DIFFERENCE }", 3043),
+    42,
+    "i64",
+    "DIFFERENCE"
+  )
+  assert_integer(
+    checked("const NEGATIVE: i64 = -5 fn probe() -> i64 { NEGATIVE }", 3044),
+    -5,
+    "i64",
+    "NEGATIVE"
+  )
+  assert_integer(
+    checked("const GROUPED: i64 = (1 + 2) * (3 + 4) fn probe() -> i64 { GROUPED }", 3045),
+    21,
+    "i64",
+    "GROUPED"
+  )
+  assert_boolean(
+    checked(
+      "const ORDERED: bool = 3 < 4 and 4 >= 4 and 1 != 2 and 2 == 2 and 5 > 1 and 1 <= 1 fn probe() -> bool { ORDERED }",
+      3046
+    ),
+    true,
+    "ORDERED"
+  )
+  assert_boolean(
+    checked("const EITHER: bool = false or not true fn probe() -> bool { EITHER }", 3047),
+    false,
+    "EITHER"
+  )
+  assert_boolean(
+    checked("const LEFT: i64 = 1 const LESS: bool = LEFT > 2 fn probe() -> bool { LESS }", 3048),
+    false,
+    "LESS"
+  )
+}
+
+test "typed constant arithmetic wraps exactly as the program would" {
+  let maximum = 9223372036854775807
+  assert_integer(
+    checked(
+      "const MAXIMUM: i64 = 9223372036854775807 const WRAPPED: i64 = MAXIMUM + 1 fn probe() -> i64 { WRAPPED }",
+      3051
+    ),
+    maximum + 1,
+    "i64",
+    "WRAPPED"
+  )
+  assert_integer(
+    checked("const SQUARE: i64 = 4294967296 * 4294967296 fn probe() -> i64 { SQUARE }", 3052),
+    4294967296 * 4294967296,
+    "i64",
+    "SQUARE"
+  )
+}
+
+test "a bool constant annotated as i64 is the integer it denotes" {
+  assert_integer(
+    checked("const TRUTH: i64 = true fn probe() -> i64 { TRUTH }", 3061),
+    1,
+    "i64",
+    "TRUTH"
+  )
+  assert_integer(
+    checked("const FALSEHOOD: i64 = 1 == 2 fn probe() -> i64 { FALSEHOOD }", 3062),
+    0,
+    "i64",
+    "FALSEHOOD"
+  )
+}
+
+test "a constant's use has exactly its annotation's type" {
+  Test.assert_str_eq(
+    category(checked("const BYTE: u8 = 3 fn probe() -> i64 { BYTE }", 3071)),
+    "type_mismatch"
+  )
+  Test.assert_str_eq(
+    category(checked("const TRUTH: i64 = true fn probe() -> bool { TRUTH }", 3072)),
+    "type_mismatch"
+  )
+  Test.assert_str_eq(
+    category(checked("const NAME: str = \"x\" fn probe() -> i64 { NAME }", 3073)),
+    "type_mismatch"
+  )
+  Test.assert_str_eq(
+    category(checked("const WIDE: i64 = 3 fn probe() -> i32 { WIDE }", 3074)),
+    "type_mismatch"
+  )
+}
+
+test "local bindings and parameters shadow module constants" {
+  Test.assert_str_eq(
+    category(
+      checked("const value: i64 = 1 fn probe() -> str { let value = \"local\" value }", 3081)
+    ),
+    "accepted"
+  )
+  Test.assert_str_eq(
+    category(checked("const value: i64 = 1 fn probe(value: str) -> str { value }", 3082)),
+    "accepted"
+  )
+}
+
+test "typed constants are values and never callees" {
+  Test.assert_str_eq(
+    category(checked("const ANSWER: i64 = 42 fn probe() -> i64 { ANSWER() }", 3091)),
+    "callable_required"
+  )
+  Test.assert_str_eq(
+    category(
+      checked_with(
+        "pub const ANSWER: i64 = 42",
+        "use fixture/constants_dep as dep fn probe() -> i64 { dep.ANSWER() }",
+        3092
+      )
+    ),
+    "callable_required"
+  )
+}
+
+test "qualified and selective imports reach another module's constants" {
+  let dependency = "pub const VALUE: i64 = 37 pub const FORWARD: i64 = LATER + 2 const LATER: i64 = 5"
+  assert_integer(
+    checked_with(
+      dependency,
+      "use fixture/constants_dep as dep fn probe() -> i64 { dep.VALUE }",
+      3101
+    ),
+    37,
+    "i64",
+    "VALUE"
+  )
+  assert_integer(
+    checked_with(
+      dependency,
+      "use fixture/constants_dep.{FORWARD} fn probe() -> i64 { FORWARD }",
+      3102
+    ),
+    7,
+    "i64",
+    "FORWARD"
+  )
+  assert_integer(
+    checked_with(
+      dependency,
+      "use fixture/constants_dep as dep const MINE: i64 = dep.VALUE + 1 fn probe() -> i64 { MINE }",
+      3103
+    ),
+    38,
+    "i64",
+    "MINE"
+  )
+  assert_integer(
+    checked_with(
+      dependency,
+      "use fixture/constants_dep.{VALUE} const MINE: i64 = VALUE * 2 fn probe() -> i64 { MINE }",
+      3104
+    ),
+    74,
+    "i64",
+    "MINE"
+  )
+}
+
+test "a private constant is not visible through its module" {
+  Test.assert_str_eq(
+    category(
+      checked_with(
+        "const HIDDEN: i64 = 5",
+        "use fixture/constants_dep as dep fn probe() -> i64 { dep.HIDDEN }",
+        3111
+      )
+    ),
+    "unknown_identifier"
+  )
+  Test.assert_str_eq(
+    category(
+      checked_with(
+        "const HIDDEN: i64 = 5",
+        "use fixture/constants_dep as dep const MINE: i64 = dep.HIDDEN fn probe() -> i64 { 1 }",
+        3112
+      )
+    ),
+    "constant/qualified_name_not_constant"
+  )
+}
+
+test "typed constants refuse initializers only running the program can evaluate" {
+  let refusals = [
+
+    ("fn compute() -> i64 { 1 } const BAD: i64 = compute()", "constant/runtime_expression"),
+    ("const BAD: i64 = if true { 1 } else { 2 }", "constant/runtime_expression"),
+    ("fn compute() -> i64 { 1 } const BAD: i64 = compute", "constant/name_not_constant"),
+    ("const BAD: i64 = ABSENT", "constant/name_not_constant"),
+    ("const BAD: bool = not 1", "constant/not_operand_not_bool"),
+    ("const BAD: i64 = 8 / 2", "constant/operator_not_audited"),
+    ("const BAD: i64 = 8 % 3", "constant/operator_not_audited"),
+    ("const BAD: i64 = 6 band 3", "constant/operator_not_constant"),
+    ("const BAD: i64 = 1 bshl 3", "constant/operator_not_constant"),
+    ("const BAD: bool = \"a\" == \"b\"", "constant/operator_not_constant"),
+    ("const BAD: f64 = 1.0 + 2.0", "constant/operator_not_constant"),
+    ("const BYTE: u8 = 1 const BAD: u8 = BYTE + BYTE", "constant/operator_not_constant"),
+    ("const BAD: bool = true and 1", "constant/operator_not_constant"),
+    ("const BAD: bool = true == false", "constant/operator_not_constant"),
+    ("const BAD: i64 = -true", "constant/operator_not_constant"),
+    ("type Box { Box } const BAD: Box = Box", "constant/runtime_type"),
+    ("const BAD: i64? = 1", "constant/runtime_type"),
+    ("const BAD: [i64; 2] = 1", "constant/runtime_type"),
+    ("const BAD: str = 1", "constant/type_mismatch"),
+    ("const BAD: u8 = 1 + 2", "constant/type_mismatch"),
+    ("const BAD: f64 = 1", "constant/type_mismatch"),
+    ("const BAD: i64 = 1.5", "constant/type_mismatch"),
+    ("const BAD: nil = 0", "constant/type_mismatch"),
+    ("const BAD: bool = 1", "constant/type_mismatch"),
+    ("const BAD: u8 = true", "constant/type_mismatch"),
+    ("const WIDE: i64 = 1 const BAD: i32 = WIDE", "constant/type_mismatch"),
+    ("const BAD: i64 = BAD", "constant/reference_cycle"),
+    (
+      "const FIRST: i64 = SECOND const BAD: i64 = FIRST const SECOND: i64 = BAD",
+      "constant/reference_cycle"
+    )
+  ]
+  -- No body names the refused constant: the whole graph is evaluated.
+  assert_refusals(list.from_slice(refusals[..]), 3200)
+}
+
+fn assert_refusals(refusals: List<(str, str)>, discriminator: i64) -[Test]> nil {
+  match refusals {
+    Nil -> nil
+    Cons((declarations, expected), rest) -> {
+      Test.assert_str_eq(
+        category(checked(str_concat(declarations, " fn probe() -> i64 { 1 }"), discriminator)),
+        expected
+      )
+      assert_refusals(rest, discriminator + 1)
+    }
+  }
+}
+
+test "a refused constant names itself, its module and its initializer's extent" {
+  let dependency = "pub const VALUE: i64 = 1 pub const BAD: i64 = VALUE + 8 / 2"
+  let rejection = program_rejection(
+    dependency,
+    "use fixture/constants_dep as dep const MINE: i64 = dep.BAD + 1 fn main() -> i64 { MINE }",
+    3301
+  )
+  Test.assert_str_eq(typed_check_stage_name(rejection.stage), "resolution")
+  Test.assert_str_eq(rejection.module, "fixture/constants_dep")
+  Test.assert_str_eq(rejection.function, "BAD")
+  Test.assert_str_eq(rejection.category, "constant/operator_not_audited")
+  assert_located(rejection, dependency, "8 / 2")
+}
+
+test "a constant reference cycle is refused at the constant it re-enters" {
+  let text = "const FIRST: i64 = SECOND const SECOND: i64 = THIRD const THIRD: i64 = FIRST"
+  let rejection = program_rejection(
+    text,
+    "use fixture/constants_dep as dep fn main() -> i64 { 1 }",
+    3311
+  )
+  Test.assert_str_eq(rejection.module, "fixture/constants_dep")
+  Test.assert_str_eq(rejection.function, "FIRST")
+  Test.assert_str_eq(rejection.category, "constant/reference_cycle")
+  assert_located(rejection, text, "FIRST")
+}
+
+test "a constant outside its annotation is refused at its initializer" {
+  let text = "const BYTE: u8 = 1 + 2"
+  let rejection = program_rejection(
+    text,
+    "use fixture/constants_dep as dep fn main() -> i64 { 1 }",
+    3321
+  )
+  Test.assert_str_eq(rejection.function, "BYTE")
+  Test.assert_str_eq(rejection.category, "constant/type_mismatch")
+  assert_located(rejection, text, "1 + 2")
+}
+
+-- Constants declared last-to-first, each one more than the next.
+fn constant_chain(count: i64) -> str {
+  let mut text = "const C0: i64 = 1"
+  let mut index = 1
+  while index < count {
+    text = str_concat(
+      i"const C{index}: i64 = C{index - 1} + 1 ",
+      text
+    )
+    index = index + 1
+  }
+  str_concat(text, i" fn probe() -> i64 {{ C{count - 1} }}")
+}
+
+fn repeated_sum(count: i64) -> str {
+  let mut text = "1"
+  let mut index = 1
+  while index < count {
+    text = str_concat(text, " + 1")
+    index = index + 1
+  }
+  text
+}
+
+test "long forward constant chains and deep initializers evaluate exactly once" {
+  assert_integer(checked(constant_chain(200), 3401), 200, "i64", "C199")
+  assert_integer(
+    checked(
+      str_concat(
+        str_concat("const TOTAL: i64 = ", repeated_sum(300)),
+        " fn probe() -> i64 { TOTAL }"
+      ),
+      3402
+    ),
+    300,
+    "i64",
+    "TOTAL"
+  )
+}
+
+test "resolution records every constant of the scope, used or not" {
+  let dependency = "pub const USED: i64 = 1 const UNUSED: i64 = USED + 41"
+  let (caller, scope) = two_modules(
+    dependency,
+    "use fixture/constants_dep as dep const MINE: bool = true fn probe() -> i64 { dep.USED }",
+    3501
+  )
+  match resolve_module_semantics(caller, scope) {
+    SemanticResolutionAccepted(resolution) -> {
+      let constants = resolution.constants()
+      Test.assert_eq_usize(semantic_constant_catalog_len(constants), 3)
+      let target = registration_scope.registration_scope_at(scope, 0)
+      let declarations = target.declarations
+      let unused = declarations.at(dense_index(1))
+      match unused.kind {
+        RegisteredConstantDeclaration(declared) -> match semantic_constant_find(
+          constants,
+          declared.name.identity
+        ) {
+          Some(constant) -> Test.assert_true(
+            match constant.value {
+              SemanticConstantInteger(42) -> true
+              _ -> false
+            }
+          )
+          None -> Test.assert_true(false)
+        }
+        _ -> Test.assert_true(false)
+      }
+    }
+    _ -> Test.assert_true(false)
+  }
+}
