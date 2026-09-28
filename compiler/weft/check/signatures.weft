@@ -14,11 +14,45 @@ use compiler/ir/data.{
   TypeParamListCons,
   TypeParamListNil
 }
-use compiler/project/identity.{FunctionIdentity, ModuleIdentity, function_identity_module}
+use compiler/package/native_abi.{
+  NativeAbiConstBytes,
+  NativeAbiConstPointer,
+  NativeAbiF32,
+  NativeAbiF64,
+  NativeAbiI16,
+  NativeAbiI32,
+  NativeAbiI64,
+  NativeAbiI8,
+  NativeAbiIsize,
+  NativeAbiMutBytes,
+  NativeAbiMutPointer,
+  NativeAbiNil,
+  NativeAbiOpaquePointer,
+  NativeAbiType,
+  NativeAbiU16,
+  NativeAbiU32,
+  NativeAbiU64,
+  NativeAbiU8,
+  NativeAbiUsize
+}
+use compiler/project/identity.{
+  DeclarationIdentity,
+  DeclaredFunctionIdentity,
+  EffectDeclaration,
+  FunctionIdentity,
+  ModuleIdentity,
+  function_identity_module
+}
 use compiler/project/identity/equality.{function_identity_eq, module_identity_eq}
 use compiler/types/graph.{*}
 use compiler/types/graph/catalog.{*}
-use compiler/weft/check/registration/catalog.{RegisteredFunction, RegisteredModule}
+use compiler/weft/check/registration/catalog.{
+  RegisteredFunction,
+  RegisteredModule,
+  RegisteredNativeFunction,
+  registered_native_for_identity
+}
+use compiler/weft/check/registration/sdk.{registration_scope_sdk_declaration}
 use compiler/weft/check/registration/scope.{RegistrationScope, registration_scope_find}
 use compiler/weft/check/semantic_types.{
   SemanticTypeProductBuilder,
@@ -40,6 +74,7 @@ use compiler/weft/check/storage.{
   dense_builder_with_capacity,
   dense_index
 }
+use stdlib/list.{Cons, List, Nil}
 use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
 
@@ -362,17 +397,24 @@ pub(package) fn semantic_signature_in_scope(
   signatures: SemanticSignatureProduct,
   catalog: SemanticTypeCatalog,
   scope: RegistrationScope,
-  wanted: FunctionIdentity
+  wanted: FunctionIdentity,
+  sdk_package_id: i64
 ) -> SemanticScopeSignatureLookup {
   match signatures.find(wanted) {
     Some(signature) -> SemanticScopeSignatureFound(signatures.with_catalog(catalog), signature)
     None -> if module_identity_eq(signatures.module(), function_identity_module(wanted)) {
-      SemanticScopeSignatureMissing(signatures)
+      semantic_native_signature_in_scope(signatures, catalog, scope, wanted, sdk_package_id)
     } else {
       match registration_scope_find(scope, function_identity_module(wanted)) {
         None -> SemanticScopeSignatureMissing(signatures)
         Some(module) -> match registered_function_for_identity(module, wanted) {
-          None -> SemanticScopeSignatureMissing(signatures)
+          None -> semantic_native_signature_in_scope(
+            signatures,
+            catalog,
+            scope,
+            wanted,
+            sdk_package_id
+          )
           Some(function) -> {
             let next_segment = catalog.next_derived_segment(
               signatures.module(),
@@ -662,6 +704,144 @@ impl SemanticSignatureProduct {
         }
         None<SemanticFunctionSignature>()
       }
+    }
+  }
+}
+
+-- A manifest-declared native function's signature: its ABI kinds as
+-- parameters and result, performing exactly the SDK's sealed `Unsafe`. No
+-- authored spelling or import can choose that effect.
+fn semantic_native_signature_in_scope(
+  signatures: SemanticSignatureProduct,
+  catalog: SemanticTypeCatalog,
+  scope: RegistrationScope,
+  wanted: FunctionIdentity,
+  sdk_package_id: i64
+) -> SemanticScopeSignatureLookup {
+  let native = match wanted {
+    DeclaredFunctionIdentity(declaration) -> match registration_scope_find(
+      scope,
+      function_identity_module(wanted)
+    ) {
+      Some(module) -> registered_native_for_identity(module, declaration)
+      None -> None<RegisteredNativeFunction>()
+    }
+    _ -> None<RegisteredNativeFunction>()
+  }
+  match native {
+    None -> SemanticScopeSignatureMissing(signatures)
+    Some(function) -> match registration_scope_sdk_declaration(
+      scope,
+      sdk_package_id,
+      "runtime/unsafe",
+      EffectDeclaration,
+      "Unsafe"
+    ) {
+      nil -> SemanticScopeSignatureMissing(signatures)
+      sealed: DeclarationIdentity -> {
+        let module = signatures.module()
+        let segment = semantic_type_derived_segment_id(
+          module,
+          catalog.next_derived_segment(module, signatures.next_type_segment())
+        )
+        let builder = semantic_type_graph_builder(segment)
+        let (builder, parameters) = semantic_native_types(
+          builder,
+          function.parameters,
+          Nil<SemanticTypeId>()
+        )
+        let (builder, parameter_list) = builder.type_list(parameters)
+        let (builder, result) = semantic_native_type(builder, function.result)
+        let (builder, no_arguments) = builder.type_list(Nil<SemanticTypeId>())
+        let (builder, atom) = builder.effect_atom(sealed, no_arguments)
+        let (builder, atoms) = builder.type_list(Nil<SemanticTypeId>().prepend(atom))
+        let (builder, effects) = builder.effect_signature(atoms, SemanticClosedEffects)
+        let (builder, type_id) = builder.function(parameter_list, result, effects)
+        let next_catalog = semantic_type_catalog_with_graph(catalog, builder.freeze())
+        let SemanticSignatureProduct(storage) = signatures
+        let type_parameters = storage.type_parameters
+        let bounds = storage.bounds
+        let signature = SemanticFunctionSignature {
+          identity: wanted,
+          type_id: type_id,
+          type_parameters_start: type_parameters.len(),
+          type_parameters_count: 0,
+          bounds_start: bounds.len(),
+          bounds_count: 0
+        }
+        SemanticScopeSignatureFound(
+          SemanticSignatureProduct(
+            SemanticSignatureProductStorage {
+              module: storage.module,
+              catalog: next_catalog,
+              next_type_segment: storage.next_type_segment,
+              functions: storage.functions,
+              external_functions: storage.external_functions.push(signature),
+              type_parameters: type_parameters,
+              bounds: bounds
+            }
+          ),
+          signature
+        )
+      }
+    }
+  }
+}
+
+fn semantic_native_types(
+  builder: owned SemanticTypeGraphBuilder,
+  kinds: List<NativeAbiType>,
+  collected: List<SemanticTypeId>
+) -> (owned SemanticTypeGraphBuilder, List<SemanticTypeId>) {
+  match kinds {
+    Nil -> (builder, collected)
+    Cons(kind, rest) -> {
+      let (builder, value) = semantic_native_type(builder, kind)
+      semantic_native_types(builder, rest, collected.append(value))
+    }
+  }
+}
+
+-- The Weft type an ABI kind crosses as: scalars as themselves, byte
+-- buffers as slices of `u8`, raw pointers to `u8`, and an opaque pointer as
+-- `* any`.
+fn semantic_native_type(
+  builder: owned SemanticTypeGraphBuilder,
+  kind: NativeAbiType
+) -> (owned SemanticTypeGraphBuilder, SemanticTypeId) {
+  match kind {
+    NativeAbiNil -> builder.primitive(SemanticNil)
+    NativeAbiI8 -> builder.primitive(SemanticI8)
+    NativeAbiU8 -> builder.primitive(SemanticU8)
+    NativeAbiI16 -> builder.primitive(SemanticI16)
+    NativeAbiU16 -> builder.primitive(SemanticU16)
+    NativeAbiI32 -> builder.primitive(SemanticI32)
+    NativeAbiU32 -> builder.primitive(SemanticU32)
+    NativeAbiI64 -> builder.primitive(SemanticI64)
+    NativeAbiU64 -> builder.primitive(SemanticU64)
+    NativeAbiIsize -> builder.primitive(SemanticIsize)
+    NativeAbiUsize -> builder.primitive(SemanticUsize)
+    NativeAbiF32 -> builder.primitive(SemanticF32)
+    NativeAbiF64 -> builder.primitive(SemanticF64)
+    NativeAbiOpaquePointer -> {
+      let (builder, pointee) = builder.top()
+      builder.pointer(pointee, SemanticImmutable)
+    }
+    NativeAbiConstPointer -> {
+      let (builder, byte) = builder.primitive(SemanticU8)
+      builder.pointer(byte, SemanticImmutable)
+    }
+    NativeAbiMutPointer -> {
+      let (builder, byte) = builder.primitive(SemanticU8)
+      builder.pointer(byte, SemanticMutable)
+    }
+    NativeAbiConstBytes -> {
+      let (builder, byte) = builder.primitive(SemanticU8)
+      builder.slice(byte, SemanticImmutable)
+    }
+    NativeAbiMutBytes -> {
+      let (builder, byte) = builder.primitive(SemanticU8)
+      builder.slice(byte, SemanticMutable)
     }
   }
 }
