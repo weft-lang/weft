@@ -1,0 +1,158 @@
+-- A resource type with Drop may have a managed representation. A managed
+-- value moved into an owned position (a tuple lane, a variant field or an
+-- owned parameter) is then a single owner chain: it must be released exactly
+-- once, whichever side holds the stake. A double release traps; every session
+-- also holds a reference to one runtime probe, whose count returns to one only
+-- when every session was released and none leaked.
+
+use runtime/rc_implicit_test.{RuntimeRcProbe, runtime_rc_probe_count, runtime_rc_probe_new}
+use stdlib/drop.{Drop}
+use stdlib/vector as vector
+use stdlib/vector.{vector_len, vector_push}
+use stdlib/vector/handles.{Vector}
+
+type Owner { Platform(i64), Scripted(i64), Tracked(RuntimeRcProbe, i64) }
+
+-- The owner representation is a managed variant, not a plain integer.
+type Session = opaque Owner
+
+fn scripted(id: i64) -> owned Session { Session(Scripted(id)) }
+
+fn session_id(session: Session) -> i64 {
+  match session {
+    Session(Scripted(id)) -> id
+    Session(Platform(id)) -> 0 - id
+    Session(Tracked(probe, id)) -> id
+  }
+}
+
+effect Sess {
+  fn open(id: i64) -> owned Session
+  fn step(session: Session) -> (owned Session, i64)
+  fn finish(session: Session) -> i64
+  fn dropped(session: Session) -> i64
+}
+
+impl Drop for Session {
+  fn drop(self) -[Sess]> i64 { Sess.dropped(self) }
+}
+
+type Holder { Holder(owned Session) }
+
+-- A managed parameter moved into a lane-returned tuple.
+fn paired(session: Session) -> (owned Session, i64) { (session, 7) }
+
+-- The same parameter also stored in a record literal, so it is not borrowable.
+fn paired_twice(session: Session, other: Session) -> (owned Session, owned Session) {
+  (session, other)
+}
+
+-- A managed parameter passed on to an owned parameter.
+fn take(session: owned Session) -[Sess]> i64 { Sess.finish(session) }
+
+fn forward(session: Session) -[Sess]> i64 { take(session) }
+
+-- A managed parameter moved into a variant field.
+fn wrapped(session: Session) -> Holder { Holder(session) }
+
+fn tuple_return_probe() -[Sess]> i64 {
+  let session: owned Session = Sess.open(1)
+  let (after, value) = paired(session)
+  Sess.finish(after) + value
+}
+
+fn tuple_pair_probe() -[Sess]> i64 {
+  let first: owned Session = Sess.open(2)
+  let second: owned Session = Sess.open(3)
+  let (left, right) = paired_twice(first, second)
+  Sess.finish(left) + Sess.finish(right)
+}
+
+fn owned_parameter_probe() -[Sess]> i64 {
+  let session: owned Session = Sess.open(4)
+  forward(session)
+}
+
+fn variant_probe() -[Sess]> i64 {
+  let session: owned Session = Sess.open(5)
+  match wrapped(session) {
+    Holder(inner) -> Sess.finish(inner)
+  }
+}
+
+fn clause_resume_probe() -[Sess]> i64 {
+  let session: owned Session = Sess.open(6)
+  let (after, value) = Sess.step(session)
+  Sess.finish(after) + value
+}
+
+fn dropped_probe() -[Sess]> i64 {
+  let session: owned Session = Sess.open(7)
+  let (after, value) = paired(session)
+  value
+}
+
+-- Interpret Sess deterministically, recording every finish and drop.
+fn run(log: Vector<i64>, probe: RuntimeRcProbe, body: () -[Sess]> i64) -> i64 {
+  handle body() {
+    Sess.open(id) -> resume(Session(Tracked(probe, id)))
+    Sess.step(session) -> resume((session, 10))
+    Sess.finish(session) -> {
+      vector_push<i64>(log, session_id(session))
+      resume(session_id(session))
+    }
+    Sess.dropped(session) -> {
+      vector_push<i64>(log, 100 + session_id(session))
+      resume(0)
+    }
+  }
+}
+
+test "a managed parameter moved into a returned tuple is released once" {
+  let log: Vector<i64> = vector.new<i64>()
+  let probe = runtime_rc_probe_new(0)
+  Test.assert_eq(run(log, probe, tuple_return_probe), 8)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(vector_len<i64>(log), 1)
+}
+
+test "several managed parameters moved into one returned tuple are each released once" {
+  let log: Vector<i64> = vector.new<i64>()
+  let probe = runtime_rc_probe_new(0)
+  Test.assert_eq(run(log, probe, tuple_pair_probe), 5)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(vector_len<i64>(log), 2)
+}
+
+test "a managed parameter passed on to an owned parameter is released once" {
+  let log: Vector<i64> = vector.new<i64>()
+  let probe = runtime_rc_probe_new(0)
+  Test.assert_eq(run(log, probe, owned_parameter_probe), 4)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(vector_len<i64>(log), 1)
+}
+
+test "a managed parameter moved into a variant field is released once" {
+  let log: Vector<i64> = vector.new<i64>()
+  let probe = runtime_rc_probe_new(0)
+  Test.assert_eq(run(log, probe, variant_probe), 5)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(vector_len<i64>(log), 1)
+}
+
+test "a handler clause resuming with its moved parameter releases it once" {
+  let log: Vector<i64> = vector.new<i64>()
+  let probe = runtime_rc_probe_new(0)
+  Test.assert_eq(run(log, probe, clause_resume_probe), 16)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(vector_len<i64>(log), 1)
+}
+
+test "an unconsumed owned tuple lane is dropped exactly once" {
+  let log: Vector<i64> = vector.new<i64>()
+  let probe = runtime_rc_probe_new(0)
+  Test.assert_eq(run(log, probe, dropped_probe), 7)
+  Test.assert_eq(runtime_rc_probe_count(probe), 1)
+  Test.assert_eq(vector_len<i64>(log), 1)
+  Test.assert_eq(vector.vector_get_in_bounds<i64>(log, 0), 107)
+}
