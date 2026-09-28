@@ -1,369 +1,542 @@
 -- Slice containment over semantic type graphs and resolved declarations.
 --
--- Nominal nodes carry identity and type arguments, not their fields. The
--- declaration catalog supplies those templates and their concrete generic
--- substitution; no checker table or authored syntax is consulted here.
--- Unknown is deliberately distinct from a proof of no slice.
+-- Nominal nodes carry identity and type arguments, not their fields. Each
+-- declaration therefore has a slice summary computed once from its own
+-- template: it always holds a slice, its shape is unknown, or a slice can
+-- arrive only through the type arguments at certain positions. An
+-- application instantiates its declaration's summary with its own
+-- arguments, so a query walks the queried type's structure rather than
+-- every declaration it reaches. Summaries of recursive declarations are the
+-- least fixed point of their fields, which also closes non-regular
+-- recursion. Unknown is deliberately distinct from a proof of no slice.
 
 use compiler/types/graph.{*}
 use compiler/types/graph/catalog.{SemanticTypeCatalog}
-use compiler/types/graph/equality.{semantic_type_catalog_equal}
 use compiler/types/graph/declarations.{
+  SemanticDeclaredLayout,
+  SemanticDeclaredRecordLayout,
+  SemanticDeclaredVariantLayout,
   SemanticRecordDeclarationLayoutMatched,
   SemanticTypeDeclarationCatalog,
   SemanticTypeDeclarationLayoutMissing,
   SemanticVariantDeclarationLayoutMatched,
   semantic_type_declaration_catalog_resolve,
+  semantic_type_declared_layout_target,
   semantic_type_declared_record_field_count,
   semantic_type_declared_record_field_type,
   semantic_type_declared_variant_case_count,
   semantic_type_declared_variant_payload_count,
   semantic_type_declared_variant_payload_type
 }
-use compiler/types/graph/substitution.{
-  SemanticTypeSubstitution,
-  semantic_type_substitution_copy,
-  semantic_type_substitution_empty,
-  semantic_type_substitution_get
-}
+use compiler/types/graph/substitution.{semantic_type_substitution_empty}
 use stdlib/list.{Cons, List, Nil}
-use stdlib/option.{None, Some}
-use stdlib/state as state
-use stdlib/state.{State}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/num/scalar.{num_scalar_usize_to_i64}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
 
 -- `Contains` is a conservative may-contain result for set intersections;
 -- `DoesNotContain` is the proof needed to omit an aggregate borrow fact.
--- Unknown covers unexpanded top/complement/associated types and non-regular
--- recursion beyond the bounded proof search.
+-- Unknown covers unexpanded top/complement/associated types and generic
+-- parameters whose instantiation is not known.
 pub(package) type SemanticSliceContainment {
   SemanticContainsSlice,
   SemanticDoesNotContainSlice,
   SemanticSliceContainmentUnknown
 }
 
-fn slice_containment_join(
-  left: SemanticSliceContainment,
-  right: SemanticSliceContainment
-) -> SemanticSliceContainment {
-  match (left, right) {
-    (SemanticContainsSlice, _) -> SemanticContainsSlice
-    (_, SemanticContainsSlice) -> SemanticContainsSlice
-    (SemanticSliceContainmentUnknown, _) -> SemanticSliceContainmentUnknown
-    (_, SemanticSliceContainmentUnknown) -> SemanticSliceContainmentUnknown
-    _ -> SemanticDoesNotContainSlice
-  }
+-- A type's slice shape relative to the type variables in scope. `Through`
+-- lists, sorted and without repeats, the argument positions a slice can
+-- arrive through; an empty list proves no slice.
+type SemanticSliceSummary {
+  SemanticSliceThrough(List<usize>),
+  SemanticSliceUnknownShape,
+  SemanticSliceAlways
 }
+
+-- Whose type variables a summary is expressed over: a query's variables are
+-- rigid and unknown; a declaration's are its own parameter positions.
+type SemanticSliceScope {
+  SemanticSliceQuery,
+  SemanticSliceDeclaration(List<SemanticTypeVariable>)
+}
+
+-- Declaration summaries known to be final, and the per-query working state
+-- of the fixed-point iteration.
+pub(package) type SemanticSliceShapes = opaque Map<i64, SemanticSliceSummary>
 
 type SemanticSliceSearch {
-  ids: List<SemanticTypeId>,
-  substitutions: List<SemanticTypeSubstitution>,
-  remaining: usize
+  settled: Map<i64, SemanticSliceSummary>,
+  approximate: Map<i64, SemanticSliceSummary>,
+  visited: Map<i64, bool>,
+  changed: bool
 }
 
-fn same_bool_list(left: List<bool>, right: List<bool>) -> bool {
+fn slice_positions_union(left: List<usize>, right: List<usize>) -> List<usize> {
+  match (left, right) {
+    (Nil, _) -> right
+    (_, Nil) -> left
+    (Cons(a, rest_a), Cons(b, rest_b)) -> if a < b {
+      Cons<usize>(a, slice_positions_union(rest_a, right))
+    } else if b < a {
+      Cons<usize>(b, slice_positions_union(left, rest_b))
+    } else {
+      Cons<usize>(a, slice_positions_union(rest_a, rest_b))
+    }
+  }
+}
+
+fn slice_positions_eq(left: List<usize>, right: List<usize>) -> bool {
   match (left, right) {
     (Nil, Nil) -> true
-    (Cons(a, rest_a), Cons(b, rest_b)) -> a == b and same_bool_list(rest_a, rest_b)
+    (Cons(a, rest_a), Cons(b, rest_b)) -> a == b and slice_positions_eq(rest_a, rest_b)
     _ -> false
   }
 }
 
-fn same_usize_list(left: List<usize>, right: List<usize>) -> bool {
+fn slice_summary_join(
+  left: SemanticSliceSummary,
+  right: SemanticSliceSummary
+) -> SemanticSliceSummary {
   match (left, right) {
-    (Nil, Nil) -> true
-    (Cons(a, rest_a), Cons(b, rest_b)) -> a == b and same_usize_list(rest_a, rest_b)
+    (SemanticSliceAlways, _) -> SemanticSliceAlways
+    (_, SemanticSliceAlways) -> SemanticSliceAlways
+    (SemanticSliceUnknownShape, _) -> SemanticSliceUnknownShape
+    (_, SemanticSliceUnknownShape) -> SemanticSliceUnknownShape
+    (SemanticSliceThrough(a), SemanticSliceThrough(b)) -> SemanticSliceThrough(
+      slice_positions_union(a, b)
+    )
+  }
+}
+
+fn slice_summary_eq(left: SemanticSliceSummary, right: SemanticSliceSummary) -> bool {
+  match (left, right) {
+    (SemanticSliceAlways, SemanticSliceAlways) -> true
+    (SemanticSliceUnknownShape, SemanticSliceUnknownShape) -> true
+    (SemanticSliceThrough(a), SemanticSliceThrough(b)) -> slice_positions_eq(a, b)
     _ -> false
   }
 }
 
-fn same_type_list(
-  types: borrow SemanticTypeCatalog,
-  left: List<SemanticTypeId>,
-  right: List<SemanticTypeId>
-) -> bool {
+fn slice_never() -> SemanticSliceSummary { SemanticSliceThrough(Nil<usize>()) }
+
+fn slice_layout_key(layout: SemanticDeclaredLayout) -> i64 {
+  let (index, kind) = match layout {
+    SemanticDeclaredRecordLayout(index) -> (index, 0)
+    SemanticDeclaredVariantLayout(index) -> (index, 1)
+  }
+  match num_scalar_usize_to_i64(index) {
+    Some(value) -> value * 2 + kind
+    None -> panic("Declaration layout index is not representable")
+  }
+}
+
+fn slice_variable_eq(left: SemanticTypeVariable, right: SemanticTypeVariable) -> bool {
   match (left, right) {
-    (Nil, Nil) -> true
-    (Cons(a, rest_a), Cons(b, rest_b)) -> semantic_type_catalog_equal(types, a, b) and
-      same_type_list(types, rest_a, rest_b)
+    (SemanticParameterVariable(a), SemanticParameterVariable(b)) -> a == b
+    (SemanticSelfVariable, SemanticSelfVariable) -> true
     _ -> false
   }
 }
 
-fn same_substitution(
-  types: borrow SemanticTypeCatalog,
-  left: borrow SemanticTypeSubstitution,
-  right: borrow SemanticTypeSubstitution
-) -> bool {
-  let {
-    variable_self: left_self,
-    variable_ids: left_ids,
-    values: left_values,
-    associated_variable_self: _,
-    associated_variable_ids: left_associated,
-    associated_declarations: _,
-    associated_values: _,
-  } = left
-  let {
-    variable_self: right_self,
-    variable_ids: right_ids,
-    values: right_values,
-    associated_variable_self: _,
-    associated_variable_ids: right_associated,
-    associated_declarations: _,
-    associated_values: _,
-  } = right
-  -- Associated substitutions are not yet normalized for equality. Failing
-  -- the comparison leaves a bounded unknown rather than a false no-slice.
-  left_associated.len() == 0 and right_associated.len() == 0 and
-    same_bool_list(left_self, right_self) and
-    same_usize_list(left_ids, right_ids) and
-    same_type_list(types, left_values, right_values)
+fn slice_variable_position(
+  variables: List<SemanticTypeVariable>,
+  wanted: SemanticTypeVariable,
+  index: usize
+) -> Option<usize> {
+  match variables {
+    Nil -> None<usize>()
+    Cons(variable, rest) -> if slice_variable_eq(variable, wanted) { Some(index) }
+    else { slice_variable_position(rest, wanted, index + 1) }
+  }
 }
 
-fn slice_containment_seen(
+-- The type variables a declaration's template applies, in argument order.
+fn slice_template_variables(
   types: borrow SemanticTypeCatalog,
+  template: SemanticTypeId
+) -> Option<List<SemanticTypeVariable>> {
+  match types.graph_for(template) {
+    None -> None<List<SemanticTypeVariable>>()
+    Some(graph) -> match semantic_type_graph_node(graph, template) {
+      SemanticNamedNode(_, _, _, arguments) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        let count = semantic_type_list_len(lists, arguments)
+        let mut variables = Nil<SemanticTypeVariable>()
+        let mut index = count
+        while index > 0 {
+          index = index - 1
+          let argument = semantic_type_graph_list_type_id(
+            graph,
+            semantic_type_list_edge(lists, arguments, index)
+          )
+          match types.graph_for(argument) {
+            Some(argument_graph) -> match semantic_type_graph_node(argument_graph, argument) {
+              SemanticVariableNode(variable) -> { variables = variables.prepend(variable) }
+              _ -> return None<List<SemanticTypeVariable>>()
+            }
+            None -> return None<List<SemanticTypeVariable>>()
+          }
+        }
+        Some(variables)
+      }
+      _ -> None<List<SemanticTypeVariable>>()
+    }
+  }
+}
+
+-- The summary of each argument an application passes at `positions`.
+fn slice_arguments(
   search: SemanticSliceSearch,
-  wanted: SemanticTypeId,
-  substitution: borrow SemanticTypeSubstitution
-) -> bool {
-  match (search.ids, search.substitutions) {
-    (Nil, Nil) -> false
-    (Cons(head, remaining_ids), Cons(prior, remaining_substitutions)) ->
-      (semantic_type_id_eq(head, wanted) and same_substitution(types, prior, substitution)) or
-      slice_containment_seen(
-        types,
-        SemanticSliceSearch {
-          ids: remaining_ids,
-          substitutions: remaining_substitutions,
-          remaining: search.remaining
-        },
-        wanted,
-        substitution
-      )
-    _ -> false
-  }
-}
-
-fn slice_containment_type(
   types: borrow SemanticTypeCatalog,
   declarations: borrow SemanticTypeDeclarationCatalog,
+  scope: borrow SemanticSliceScope,
   value: SemanticTypeId,
-  substitution: borrow SemanticTypeSubstitution,
+  positions: List<usize>,
   depth: usize
-) -[State<SemanticSliceSearch>]> SemanticSliceContainment {
-  if depth >= 256 { return SemanticSliceContainmentUnknown }
-  let search = State<SemanticSliceSearch>.get()
-  if slice_containment_seen(types, search, value, substitution) {
-    return SemanticDoesNotContainSlice
-  }
-  -- Global visitation prevents sibling branches of a recursive declaration
-  -- from expanding the same instantiated graph again. Exhaustion is a
-  -- may-contain result, never an absence proof.
-  if search.remaining == 0 { return SemanticContainsSlice }
-  State<SemanticSliceSearch>.put(
-    SemanticSliceSearch {
-      ids: search.ids.prepend(value),
-      substitutions: search.substitutions.prepend(
-        semantic_type_substitution_copy(substitution)
-      ),
-      remaining: search.remaining - 1
-    }
-  )
+) -> (SemanticSliceSearch, SemanticSliceSummary) {
   let graph = match types.graph_for(value) {
     Some(found) -> found
-    None -> return SemanticSliceContainmentUnknown
+    None -> return (search, SemanticSliceUnknownShape)
   }
-  let next_trail = depth + 1
   match semantic_type_graph_node(graph, value) {
-    SemanticSliceNode(_, _) -> SemanticContainsSlice
-    SemanticUnionNode(left, right) -> slice_containment_join(
-      slice_containment_type(types, declarations, left, substitution, next_trail),
-      slice_containment_type(types, declarations, right, substitution, next_trail)
+    SemanticNamedNode(_, _, _, arguments) -> {
+      let lists = semantic_type_graph_type_lists_local(graph)
+      let count = semantic_type_list_len(lists, arguments)
+      let mut state = search
+      let mut summary = slice_never()
+      let mut remaining = positions
+      loop {
+        match remaining {
+          Nil -> break
+          Cons(position, rest) -> {
+            remaining = rest
+            if position >= count { return (state, SemanticSliceUnknownShape) }
+            let argument = semantic_type_graph_list_type_id(
+              graph,
+              semantic_type_list_edge(lists, arguments, position)
+            )
+            let (next, found) = slice_type(state, types, declarations, scope, argument, depth)
+            state = next
+            summary = slice_summary_join(summary, found)
+          }
+        }
+      }
+      (state, summary)
+    }
+    _ -> (search, SemanticSliceUnknownShape)
+  }
+}
+
+-- The join of a layout's field or payload types, over its own variables.
+fn slice_layout_fields(
+  search: SemanticSliceSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  layout: SemanticDeclaredLayout,
+  scope: borrow SemanticSliceScope
+) -> (SemanticSliceSearch, SemanticSliceSummary) {
+  let mut state = search
+  let mut summary = slice_never()
+  match layout {
+    SemanticDeclaredRecordLayout(index) -> {
+      let count = match semantic_type_declared_record_field_count(declarations, index) {
+        Some(value) -> value
+        None -> return (state, SemanticSliceUnknownShape)
+      }
+      let mut field: usize = 0
+      while field < count {
+        let field_type = match semantic_type_declared_record_field_type(
+          declarations,
+          index,
+          field
+        ) {
+          Some(value) -> value
+          None -> return (state, SemanticSliceUnknownShape)
+        }
+        let (next, found) = slice_type(state, types, declarations, scope, field_type, 0)
+        state = next
+        summary = slice_summary_join(summary, found)
+        field = field + 1
+      }
+    }
+    SemanticDeclaredVariantLayout(index) -> {
+      let cases = match semantic_type_declared_variant_case_count(declarations, index) {
+        Some(value) -> value
+        None -> return (state, SemanticSliceUnknownShape)
+      }
+      let mut case: usize = 0
+      while case < cases {
+        let payloads = match semantic_type_declared_variant_payload_count(
+          declarations,
+          index,
+          case
+        ) {
+          Some(value) -> value
+          None -> return (state, SemanticSliceUnknownShape)
+        }
+        let mut payload: usize = 0
+        while payload < payloads {
+          let payload_type = match semantic_type_declared_variant_payload_type(
+            declarations,
+            index,
+            case,
+            payload
+          ) {
+            Some(value) -> value
+            None -> return (state, SemanticSliceUnknownShape)
+          }
+          let (next, found) = slice_type(state, types, declarations, scope, payload_type, 0)
+          state = next
+          summary = slice_summary_join(summary, found)
+          payload = payload + 1
+        }
+        case = case + 1
+      }
+    }
+  }
+  (state, summary)
+}
+
+-- A declaration's summary over its own parameter positions. A layout
+-- already visited in this pass contributes its current approximation, so a
+-- recursive declaration reads its previous iterate.
+fn slice_layout(
+  search: SemanticSliceSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  layout: SemanticDeclaredLayout
+) -> (SemanticSliceSearch, SemanticSliceSummary) {
+  let key = slice_layout_key(layout)
+  match search.settled.get(key) {
+    Some(summary) -> return (search, summary)
+    None -> nil
+  }
+  let approximation = match search.approximate.get(key) {
+    Some(summary) -> summary
+    None -> slice_never()
+  }
+  match search.visited.get(key) {
+    Some(_) -> return (search, approximation)
+    None -> nil
+  }
+  let variables = match semantic_type_declared_layout_target(declarations, layout) {
+    Some(template) -> slice_template_variables(types, template)
+    None -> None<List<SemanticTypeVariable>>()
+  }
+  let scope = match variables {
+    Some(found) -> SemanticSliceDeclaration(found)
+    None -> return (search, SemanticSliceUnknownShape)
+  }
+  let { settled, approximate, visited, changed } = search
+  let marked = SemanticSliceSearch {
+    settled: settled,
+    approximate: approximate,
+    visited: visited.insert(key, true),
+    changed: changed
+  }
+  let (state, summary) = slice_layout_fields(marked, types, declarations, layout, scope)
+  if slice_summary_eq(summary, approximation) { (state, summary) }
+  else {
+    let { settled, approximate, visited, changed: _ } = state
+    (
+      SemanticSliceSearch {
+        settled: settled,
+        approximate: approximate.insert(key, summary),
+        visited: visited,
+        changed: true
+      },
+      summary
     )
-    SemanticIntersectionNode(left, right) -> slice_containment_join(
-      slice_containment_type(types, declarations, left, substitution, next_trail),
-      slice_containment_type(types, declarations, right, substitution, next_trail)
+  }
+}
+
+fn slice_named(
+  search: SemanticSliceSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  scope: borrow SemanticSliceScope,
+  value: SemanticTypeId,
+  depth: usize
+) -> (SemanticSliceSearch, SemanticSliceSummary) {
+  let empty = semantic_type_substitution_empty()
+  let layout = match semantic_type_declaration_catalog_resolve(types, declarations, value, empty) {
+    SemanticRecordDeclarationLayoutMatched(index, _) -> SemanticDeclaredRecordLayout(index)
+    SemanticVariantDeclarationLayoutMatched(index, _) -> SemanticDeclaredVariantLayout(index)
+    SemanticTypeDeclarationLayoutMissing -> return (search, SemanticSliceUnknownShape)
+  }
+  match slice_layout(search, types, declarations, layout) {
+    (state, SemanticSliceThrough(positions)) -> slice_arguments(
+      state,
+      types,
+      declarations,
+      scope,
+      value,
+      positions,
+      depth
+    )
+    (state, summary) -> (state, summary)
+  }
+}
+
+fn slice_pair(
+  search: SemanticSliceSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  scope: borrow SemanticSliceScope,
+  left: SemanticTypeId,
+  right: SemanticTypeId,
+  depth: usize
+) -> (SemanticSliceSearch, SemanticSliceSummary) {
+  let (state, first) = slice_type(search, types, declarations, scope, left, depth)
+  let (state, second) = slice_type(state, types, declarations, scope, right, depth)
+  (state, slice_summary_join(first, second))
+}
+
+fn slice_type(
+  search: SemanticSliceSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  scope: borrow SemanticSliceScope,
+  value: SemanticTypeId,
+  depth: usize
+) -> (SemanticSliceSearch, SemanticSliceSummary) {
+  -- Graph structure is finite; the bound only guards a malformed graph.
+  if depth >= 256 { return (search, SemanticSliceUnknownShape) }
+  let graph = match types.graph_for(value) {
+    Some(found) -> found
+    None -> return (search, SemanticSliceUnknownShape)
+  }
+  let next = depth + 1
+  match semantic_type_graph_node(graph, value) {
+    SemanticSliceNode(_, _) -> (search, SemanticSliceAlways)
+    SemanticUnionNode(left, right) -> slice_pair(
+      search,
+      types,
+      declarations,
+      scope,
+      left,
+      right,
+      next
+    )
+    SemanticIntersectionNode(left, right) -> slice_pair(
+      search,
+      types,
+      declarations,
+      scope,
+      left,
+      right,
+      next
     )
     -- A complement can contain slices even when its operand does not.
-    SemanticComplementNode(_) -> SemanticSliceContainmentUnknown
-    SemanticTopNode -> SemanticSliceContainmentUnknown
-    SemanticWeakNode(inner) -> slice_containment_type(
+    SemanticComplementNode(_) -> (search, SemanticSliceUnknownShape)
+    SemanticTopNode -> (search, SemanticSliceUnknownShape)
+    SemanticWeakNode(inner) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticRcNode(inner) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticAtomicNode(inner) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticUniqueNode(inner) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticOwnedNode(inner) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticPointerNode(inner, _) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticBorrowNode(inner, _) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticArrayNode(inner, _) -> slice_type(search, types, declarations, scope, inner, next)
+    SemanticContinuationNode(parameter, result) -> slice_pair(
+      search,
       types,
       declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticRcNode(inner) -> slice_containment_type(
-      types,
-      declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticAtomicNode(inner) -> slice_containment_type(
-      types,
-      declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticUniqueNode(inner) -> slice_containment_type(
-      types,
-      declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticOwnedNode(inner) -> slice_containment_type(
-      types,
-      declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticPointerNode(inner, _) -> slice_containment_type(
-      types,
-      declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticBorrowNode(inner, _) -> slice_containment_type(
-      types,
-      declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticArrayNode(inner, _) -> slice_containment_type(
-      types,
-      declarations,
-      inner,
-      substitution,
-      next_trail
-    )
-    SemanticContinuationNode(parameter, result) -> slice_containment_join(
-      slice_containment_type(types, declarations, parameter, substitution, next_trail),
-      slice_containment_type(types, declarations, result, substitution, next_trail)
+      scope,
+      parameter,
+      result,
+      next
     )
     SemanticRecordNode(fields, _, _) -> {
       let records = semantic_type_graph_records_local(graph)
+      let mut state = search
+      let mut summary = slice_never()
       let mut field: usize = 0
-      let mut found = SemanticDoesNotContainSlice
       while field < semantic_type_record_field_count(records, fields) {
         let edge = semantic_type_record_field_edge(records, fields, field)
         let field_type = semantic_type_graph_record_field_type_id(graph, edge)
-        found = slice_containment_join(
-          found,
-          slice_containment_type(types, declarations, field_type, substitution, next_trail)
-        )
+        let (after, found) = slice_type(state, types, declarations, scope, field_type, next)
+        state = after
+        summary = slice_summary_join(summary, found)
         field = field + 1
       }
-      found
+      (state, summary)
     }
     SemanticNamedNode(_, role, representation, _) -> match role {
-      SemanticPayloadlessVariantType -> SemanticDoesNotContainSlice
-      SemanticOpaqueType -> slice_containment_type(
-        types,
-        declarations,
-        representation,
-        substitution,
-        next_trail
-      )
-      SemanticNominalType -> match semantic_type_declaration_catalog_resolve(
-        types,
-        declarations,
-        value,
-        substitution
-      ) {
-        SemanticRecordDeclarationLayoutMatched(layout, concrete) -> {
-          let mut field: usize = 0
-          let mut found = SemanticDoesNotContainSlice
-          let count = match semantic_type_declared_record_field_count(declarations, layout) {
-            Some(value) -> value
-            None -> return SemanticSliceContainmentUnknown
-          }
-          while field < count {
-            let field_type = match semantic_type_declared_record_field_type(
-              declarations,
-              layout,
-              field
-            ) {
-              Some(value) -> value
-              None -> return SemanticSliceContainmentUnknown
-            }
-            found = slice_containment_join(
-              found,
-              slice_containment_type(types, declarations, field_type, concrete, next_trail)
-            )
-            field = field + 1
-          }
-          found
-        }
-        SemanticVariantDeclarationLayoutMatched(layout, concrete) -> {
-          let mut case: usize = 0
-          let mut found = SemanticDoesNotContainSlice
-          let count = match semantic_type_declared_variant_case_count(declarations, layout) {
-            Some(value) -> value
-            None -> return SemanticSliceContainmentUnknown
-          }
-          while case < count {
-            let payloads = match semantic_type_declared_variant_payload_count(
-              declarations,
-              layout,
-              case
-            ) {
-              Some(value) -> value
-              None -> return SemanticSliceContainmentUnknown
-            }
-            let mut payload: usize = 0
-            while payload < payloads {
-              let payload_type = match semantic_type_declared_variant_payload_type(
-                declarations,
-                layout,
-                case,
-                payload
-              ) {
-                Some(value) -> value
-                None -> return SemanticSliceContainmentUnknown
-              }
-              found = slice_containment_join(
-                found,
-                slice_containment_type(types, declarations, payload_type, concrete, next_trail)
-              )
-              payload = payload + 1
-            }
-            case = case + 1
-          }
-          found
-        }
-        SemanticTypeDeclarationLayoutMissing -> SemanticSliceContainmentUnknown
+      SemanticPayloadlessVariantType -> (search, slice_never())
+      SemanticOpaqueType -> slice_type(search, types, declarations, scope, representation, next)
+      SemanticNominalType -> slice_named(search, types, declarations, scope, value, next)
+    }
+    SemanticVariantNode(_, parent) -> slice_type(search, types, declarations, scope, parent, next)
+    SemanticVariableNode(variable) -> match scope {
+      SemanticSliceQuery -> (search, SemanticSliceUnknownShape)
+      SemanticSliceDeclaration(variables) -> match slice_variable_position(variables, variable, 0) {
+        Some(position) -> (search, SemanticSliceThrough(Nil<usize>().prepend(position)))
+        None -> (search, SemanticSliceUnknownShape)
       }
     }
-    SemanticVariantNode(_, parent) -> slice_containment_type(
-      types,
-      declarations,
-      parent,
-      substitution,
-      next_trail
-    )
-    SemanticVariableNode(variable) -> match semantic_type_substitution_get(
-      substitution,
-      variable
-    ) {
-      Some(concrete) -> slice_containment_type(
-        types,
-        declarations,
-        concrete,
-        substitution,
-        next_trail
-      )
-      None -> SemanticSliceContainmentUnknown
-    }
-    SemanticAssociatedNode(_, _) -> SemanticSliceContainmentUnknown
-    _ -> SemanticDoesNotContainSlice
+    SemanticAssociatedNode(_, _) -> (search, SemanticSliceUnknownShape)
+    _ -> (search, slice_never())
   }
+}
+
+-- One query: iterate every reached declaration to its least fixed point,
+-- then keep the converged summaries as final.
+fn slice_query(
+  shapes: SemanticSliceShapes,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  value: SemanticTypeId
+) -> (SemanticSliceShapes, SemanticSliceSummary) {
+  let settled = match shapes { SemanticSliceShapes(known) -> known }
+  let scope = SemanticSliceQuery
+  let mut approximate = map.new<i64, SemanticSliceSummary>()
+  loop {
+    let search = SemanticSliceSearch {
+      settled: settled,
+      approximate: approximate,
+      visited: map.new<i64, bool>(),
+      changed: false
+    }
+    let (state, summary) = slice_type(search, types, declarations, scope, value, 0)
+    if not state.changed {
+      let converged = state.approximate.fold(
+        settled,
+        (known: Map<i64, SemanticSliceSummary>, key: i64, found: SemanticSliceSummary) =>
+          known.insert(key, found)
+      )
+      return (SemanticSliceShapes(converged), summary)
+    }
+    approximate = state.approximate
+  }
+}
+
+fn slice_containment(summary: SemanticSliceSummary) -> SemanticSliceContainment {
+  match summary {
+    SemanticSliceAlways -> SemanticContainsSlice
+    SemanticSliceUnknownShape -> SemanticSliceContainmentUnknown
+    SemanticSliceThrough(Nil) -> SemanticDoesNotContainSlice
+    -- A query's own variables are rigid, so a position cannot survive it.
+    SemanticSliceThrough(_) -> SemanticSliceContainmentUnknown
+  }
+}
+
+pub(package) fn semantic_slice_shapes() -> SemanticSliceShapes {
+  SemanticSliceShapes(map.new<i64, SemanticSliceSummary>())
+}
+
+-- Slice containment of `value`, reusing and extending the declaration
+-- summaries `shapes` already holds for the same catalogs.
+pub(package) fn semantic_slice_shapes_containment(
+  shapes: SemanticSliceShapes,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  value: SemanticTypeId
+) -> (SemanticSliceShapes, SemanticSliceContainment) {
+  let (next, summary) = slice_query(shapes, types, declarations, value)
+  (next, slice_containment(summary))
 }
 
 pub(package) fn semantic_type_slice_containment(
@@ -371,20 +544,11 @@ pub(package) fn semantic_type_slice_containment(
   declarations: SemanticTypeDeclarationCatalog,
   value: SemanticTypeId
 ) -> SemanticSliceContainment {
-  let substitution = semantic_type_substitution_empty()
-  let initial = SemanticSliceSearch {
-    ids: Nil<SemanticTypeId>(),
-    substitutions: Nil<SemanticTypeSubstitution>(),
-    remaining: 4096
-  }
-  let search: () -[State<SemanticSliceSearch>]> SemanticSliceContainment = () =>
-    slice_containment_type(
-      types,
-      declarations,
-      value,
-      substitution,
-      0
-    )
-  let (result, _) = state.run(initial, search)
-  result
+  let (_, containment) = semantic_slice_shapes_containment(
+    semantic_slice_shapes(),
+    types,
+    declarations,
+    value
+  )
+  containment
 }
