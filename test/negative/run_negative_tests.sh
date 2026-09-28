@@ -87,6 +87,10 @@ check_rejects staging_site_interpolated_source test/negative/staging_site_interp
 check_rejects staging_site_escaped_source test/negative/staging_site_escaped_source.weft 'error[E1010]:' 1
 check_rejects staging_site_computed_source test/negative/staging_site_computed_source.weft 'error[E1010]:' 1
 check_rejects staging_site_through_lambda test/negative/staging_site_through_lambda.weft 'error[E1010]:' 1
+check_rejects authority_platform_export_import test/negative/authority_platform_export_import.weft "error[E4009]: import 'runtime_dir_list' reaches platform authority" 1
+check_rejects authority_platform_export_alias test/negative/authority_platform_export_alias.weft "error[E4009]: module member 'clock.runtime_platform_now_nanos' reaches platform authority" 1
+check_rejects authority_interpreter_member test/negative/authority_interpreter_member.weft "error[E4009]: import 'runtime_safe_path_string' reaches platform authority" 1
+check_rejects authority_interpreter_wildcard test/negative/authority_interpreter_wildcard.weft "error[E4009]: import 'runtime/safe_file_core' reaches platform authority" 1
 check_rejects raw_boundary_named_member test/negative/raw_boundary_named_member.weft "error[E4008]: import 'mem_load64_at' reaches raw memory" 1
 check_rejects raw_boundary_startup_environment test/negative/raw_boundary_startup_environment.weft "error[E4008]: import 'runtime_env_startup_environment' reaches raw memory" 1
 check_rejects raw_boundary_process_leaf test/negative/raw_boundary_process_leaf.weft "error[E4008]: import 'runtime_proc_run_safe' reaches raw memory" 1

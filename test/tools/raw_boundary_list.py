@@ -30,19 +30,29 @@ MANIFEST = "weft.pkg"
 SOURCE_ROOTS = ("compiler", "runtime", "stdlib", "tools", "test", "examples", "module_fixtures")
 
 
+def table_entries(source, marker):
+    """The string entries of the array literal in the function after `marker`."""
+    body = source.split(marker)[1]
+    array = body.split("[", 1)[1].split("]", 1)[0]
+    return re.findall(r'"([^"]+)"', array)
+
+
 def listed_paths(source):
-    listing = source.split("pub(package) fn raw_boundary_transitional")[1]
-    return re.findall(r'"([^"]+)"', listing.split("]", 1)[0])
+    return table_entries(source, "pub(package) fn raw_boundary_transitional")
 
 
 def safe_exports(source):
-    table = source.split("pub(package) fn raw_boundary_safe_export")[1]
-    return set(re.findall(r'"([^"]+)"', table.split("]", 1)[0]))
+    return set(table_entries(source, "pub(package) fn raw_boundary_safe_export"))
+
+
+def platform_exports(source):
+    """Platform authority is memory-safe: it keeps a file off the list, and the
+    checker's interpreter rule governs it instead."""
+    return set(table_entries(source, "pub(package) fn raw_boundary_platform_export"))
 
 
 def safe_handlers(source):
-    table = source.split("pub(package) fn raw_boundary_safe_handler")[1]
-    return set(re.findall(r'"([^"]+)"', table.split("]", 1)[0]))
+    return set(table_entries(source, "pub(package) fn raw_boundary_safe_handler"))
 
 
 def trusted_modules():
@@ -126,7 +136,7 @@ def fail(message):
 def main():
     source = open(POLICY, encoding="utf-8").read()
     paths = listed_paths(source)
-    safe = safe_exports(source)
+    safe = safe_exports(source) | platform_exports(source)
     handlers = safe_handlers(source)
     trusted = trusted_modules()
     if "--compute" in sys.argv[1:]:
@@ -138,6 +148,18 @@ def main():
                 if reaches_raw_memory(open(path, encoding="utf-8").read(), trusted, safe, handlers):
                     print(logical)
         return
+    # Every table the compiler bisects must stay sorted and free of duplicates.
+    for name, marker in (
+        ("safe exports", "pub(package) fn raw_boundary_safe_export"),
+        ("platform exports", "pub(package) fn raw_boundary_platform_export"),
+        ("platform interpreters", "pub(package) fn raw_boundary_platform_interpreter"),
+        ("safe handlers", "pub(package) fn raw_boundary_safe_handler"),
+    ):
+        entries = table_entries(source, marker)
+        if not entries or entries != sorted(entries) or len(set(entries)) != len(entries):
+            fail(name + " are not sorted and unique")
+    if set(safe_exports(source)) & set(platform_exports(source)):
+        fail("an export is both safe and platform authority")
     if not paths:
         fail("no transitional paths found")
     if paths != sorted(paths):

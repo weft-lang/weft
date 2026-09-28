@@ -107,7 +107,10 @@ pub(package) type ScopeIssueStatus {
   ScopeImportAmbiguous,
   --- Strict code binding or re-exporting raw memory outside the raw
   --- boundary's allowance.
-  ScopeImportRawMemory
+  ScopeImportRawMemory,
+  --- Strict code other than a platform interpreter binding platform
+  --- authority, or anyone re-exporting it.
+  ScopeImportPlatformAuthority
 }
 
 pub(package) type ScopeIssue {
@@ -132,6 +135,9 @@ pub(package) type QualifiedScopeLookup {
   --- A raw member of a trusted runtime module, used from strict code outside
   --- the raw boundary's allowance.
   QualifiedScopeSealed(ScopeCandidate),
+  --- Platform authority used from strict code other than a platform
+  --- interpreter.
+  QualifiedScopeAuthority(ScopeCandidate),
   QualifiedScopeAmbiguous(ScopeCandidate, Option<ScopeCandidate>),
   QualifiedScopeMissing
 }
@@ -604,10 +610,33 @@ fn module_logical_path(identity: ModuleIdentity) -> str {
   }
 }
 
--- The raw boundary's view of one import edge, decided once per edge: whether
--- the importer may be refused a raw binding, and whether the target is a
--- trusted module, whose exports are raw unless audited safe.
-type RawImport { refusable: bool, target_trusted: bool }
+-- Which tier of the boundary a module belongs to: the trusted runtime ring,
+-- whose exports are raw unless audited; a platform interpreter, whose members
+-- carry platform authority; or ordinary code.
+type BoundaryTier {
+  RingTier,
+  InterpreterTier,
+  OrdinaryTier
+}
+
+-- The boundary's view of one import edge or qualified use: whether the
+-- importer may be refused at all, whether it re-exports what it binds,
+-- whether it is a platform interpreter of the target's package, and the
+-- target's tier.
+type RawImport {
+  refusable: bool,
+  reexported: bool,
+  importer_interpreter: bool,
+  target_module: ModuleIdentity,
+  target: BoundaryTier
+}
+
+-- What the boundary decides for one candidate.
+type BoundaryVerdict {
+  BoundaryAllowed,
+  BoundaryRawSealed,
+  BoundaryAuthoritySealed
+}
 
 fn authority_trusted(authority: SourceAuthority) -> bool {
   match authority {
@@ -616,43 +645,65 @@ fn authority_trusted(authority: SourceAuthority) -> bool {
   }
 }
 
+-- A module's tier, from its registered authority and logical path.
+fn boundary_tier(target: ModuleIdentity, trusted: bool) -> BoundaryTier {
+  let path = module_logical_path(target)
+  if raw_boundary_trusted_runtime(trusted, path) { RingTier }
+  else if not trusted and raw_boundary_platform_interpreter(path) { InterpreterTier }
+  else { OrdinaryTier }
+}
+
 fn raw_access(
   importer: ModuleIdentity,
   importer_trusted: bool,
   reexported: bool,
-  target_trusted: bool
+  target: ModuleIdentity,
+  tier: BoundaryTier
 ) -> RawImport {
+  let importer_path = module_logical_path(importer)
   RawImport {
-    refusable: raw_boundary_import_refused(
-      importer_trusted,
-      module_logical_path(importer),
-      reexported
-    ),
-    target_trusted: target_trusted
+    refusable: raw_boundary_import_refused(importer_trusted, importer_path, reexported),
+    reexported: reexported,
+    -- Interpreter rights hold only within the package that names the
+    -- interpreter, so a module elsewhere at the same path gains nothing.
+    importer_interpreter: not importer_trusted and
+      raw_boundary_platform_interpreter(importer_path) and
+      module_identity_package(importer) == module_identity_package(target),
+    target_module: target,
+    target: tier
   }
 }
 
-fn raw_import(edge: ResolvedImport, importer_trusted: bool, target_trusted: bool) -> RawImport {
+fn raw_import(edge: ResolvedImport, importer_trusted: bool, tier: BoundaryTier) -> RawImport {
   raw_access(
     edge.importer,
     importer_trusted,
     visibility_rank(edge.visibility) > 0,
-    target_trusted
+    edge.target,
+    tier
   )
 }
 
--- The raw boundary's view of a use in `caller` of something reached through a
+-- The boundary's view of a use in `caller` of something reached through a
 -- qualifier naming `target`. The use itself is decided, never the alias that
--- names the module. Only modules under runtime/ can be ring code, so any other
--- target is decided from its path without consulting authorities.
+-- names the module. Only ring and interpreter paths can seal anything, so any
+-- other target is decided from its path without consulting authorities.
 fn raw_use(
   scope: borrow RegistrationScope,
   caller: ModuleIdentity,
   target: ModuleIdentity
 ) -> RawImport {
   let target_path = module_logical_path(target)
-  if not raw_boundary_ring_path(target_path) {
-    return RawImport { refusable: false, target_trusted: false }
+  if not raw_boundary_ring_path(target_path) and not raw_boundary_platform_interpreter(
+    target_path
+  ) {
+    return RawImport {
+      refusable: false,
+      reexported: false,
+      importer_interpreter: false,
+      target_module: target,
+      target: OrdinaryTier
+    }
   }
   match scope {
     RegistrationScope((modules, _, _, _, _)) -> {
@@ -661,7 +712,13 @@ fn raw_use(
       -- A qualifier that resolved names registered modules; anything else is
       -- refused rather than trusted.
       if caller_index < 0 or target_index < 0 {
-        return RawImport { refusable: true, target_trusted: true }
+        return RawImport {
+          refusable: true,
+          reexported: false,
+          importer_interpreter: false,
+          target_module: target,
+          target: RingTier
+        }
       }
       raw_access(
         caller,
@@ -669,50 +726,125 @@ fn raw_use(
           persistent_get_in_bounds<RegisteredModule>(modules, caller_index).authority
         ),
         false,
-        raw_boundary_trusted_runtime(
+        target,
+        boundary_tier(
+          target,
           authority_trusted(
             persistent_get_in_bounds<RegisteredModule>(modules, target_index).authority
-          ),
-          target_path
+          )
         )
       )
     }
   }
 }
 
-fn qualified_member_sealed(
+fn qualified_member_verdict(
+  scope: borrow RegistrationScope,
+  caller: ModuleIdentity,
+  target: ModuleIdentity,
+  member: ScopeCandidate
+) -> BoundaryVerdict {
+  boundary_verdict(raw_use(scope, caller, target), member)
+}
+
+fn qualified_member_admitted(
   scope: borrow RegistrationScope,
   caller: ModuleIdentity,
   target: ModuleIdentity,
   member: ScopeCandidate
 ) -> bool {
-  raw_import_refuses(raw_use(scope, caller, target), member)
+  match qualified_member_verdict(scope, caller, target, member) {
+    BoundaryAllowed -> true
+    _ -> false
+  }
+}
+
+fn qualified_from_verdict(
+  verdict: BoundaryVerdict,
+  member: ScopeCandidate
+) -> QualifiedScopeLookup {
+  match verdict {
+    BoundaryAllowed -> QualifiedScopeResolved(member)
+    BoundaryRawSealed -> QualifiedScopeSealed(member)
+    BoundaryAuthoritySealed -> QualifiedScopeAuthority(member)
+  }
 }
 
 --- Whether strict `caller` may not install the handler implementation of
 --- `target`: a trusted runtime module whose handler is not audited safe.
+--- Interpreter handlers are strict code, so installing one is always safe.
 pub(package) fn registration_scope_handler_sealed(
   scope: borrow RegistrationScope,
   caller: ModuleIdentity,
   target: ModuleIdentity
 ) -> bool {
   let raw = raw_use(scope, caller, target)
-  raw.refusable and raw.target_trusted and
-    not raw_boundary_safe_handler(module_logical_path(target))
+  let ring = match raw.target {
+    RingTier -> true
+    _ -> false
+  }
+  raw.refusable and ring and not raw_boundary_safe_handler(module_logical_path(target))
 }
 
--- Whether the boundary refuses a candidate: a trusted module reached as a
--- member, or a trusted export outside its module's safe surface. A strict module
--- re-exports only safe exports, so a declaration re-exported through the
--- target keeps the safe surface of the module that declared it.
-fn raw_import_refuses(raw: RawImport, candidate: ScopeCandidate) -> bool {
-  if not raw.refusable or not raw.target_trusted { return false }
+-- What the boundary decides for a candidate reached across one edge or use.
+-- A ring export is safe, platform authority or raw; an interpreter's members
+-- carry authority unless audited safe. An interpreter may bind authority
+-- privately but never pass it on, and nothing strict re-exports either. A
+-- declaration re-exported through the target keeps the tier of the module
+-- that declared it.
+fn boundary_verdict(raw: RawImport, candidate: ScopeCandidate) -> BoundaryVerdict {
+  if not raw.refusable { return BoundaryAllowed }
   match candidate.target {
-    ScopeModuleTarget(_) -> true
-    ScopeDeclarationTarget(name) -> not raw_boundary_safe_export(
-      module_logical_path(declaration_identity_module(name.identity)),
-      required_text(declaration_identity_name(name.identity))
-    )
+    ScopeModuleTarget(_) -> match raw.target {
+      RingTier -> BoundaryRawSealed
+      InterpreterTier -> if raw.importer_interpreter and not raw.reexported { BoundaryAllowed }
+      else { BoundaryAuthoritySealed }
+      OrdinaryTier -> BoundaryAllowed
+    }
+    ScopeDeclarationTarget(name) -> {
+      let declaring = declaration_identity_module(name.identity)
+      declaration_verdict(
+        raw,
+        declaration_tier(raw, declaring),
+        module_logical_path(declaring),
+        required_text(declaration_identity_name(name.identity))
+      )
+    }
+  }
+}
+
+-- The tier of the module that declared a candidate. The target's own
+-- declarations take its tier. A declaration re-exported through the target
+-- keeps its declaring module's: an interpreter's by path, a ring module's only
+-- when reached through the ring, and ordinary code's otherwise.
+fn declaration_tier(raw: RawImport, declaring: ModuleIdentity) -> BoundaryTier {
+  let path = module_logical_path(declaring)
+  if module_identity_eq(declaring, raw.target_module) { raw.target }
+  else if raw_boundary_platform_interpreter(path) { InterpreterTier }
+  else if raw_boundary_ring_path(path) {
+    match raw.target {
+      RingTier -> RingTier
+      _ -> OrdinaryTier
+    }
+  } else { OrdinaryTier }
+}
+
+fn declaration_verdict(
+  raw: RawImport,
+  tier: BoundaryTier,
+  module: str,
+  member: str
+) -> BoundaryVerdict {
+  let authority_admitted = raw.importer_interpreter and not raw.reexported
+  match tier {
+    OrdinaryTier -> BoundaryAllowed
+    RingTier -> if raw_boundary_safe_export(module, member) { BoundaryAllowed }
+    else if raw_boundary_platform_export(module, member) {
+      if authority_admitted { BoundaryAllowed } else { BoundaryAuthoritySealed }
+    } else { BoundaryRawSealed }
+    InterpreterTier -> if authority_admitted or raw_boundary_safe_export(module, member) {
+      BoundaryAllowed
+    } else { BoundaryAuthoritySealed }
   }
 }
 
@@ -727,12 +859,16 @@ fn import_candidate(
   origin: Option<Span>,
   issue_location: Option<Span>
 ) -> nil {
-  if raw_import_refuses(raw, candidate) {
+  let verdict = boundary_verdict(raw, candidate)
+  if match verdict { BoundaryAllowed -> false, _ -> true } {
     add_issue(
       issues,
       edge,
       spelling,
-      ScopeImportRawMemory,
+      match verdict {
+        BoundaryAuthoritySealed -> ScopeImportPlatformAuthority
+        _ -> ScopeImportRawMemory
+      },
       issue_location,
       Some(candidate),
       None
@@ -838,19 +974,33 @@ fn add_wildcard_import(
   edge: ResolvedImport,
   raw: RawImport
 ) -> nil {
-  -- A wildcard cannot select around raw exports, so a trusted module refuses
-  -- the whole import once.
-  if raw.refusable and raw.target_trusted {
-    add_issue(
-      issues,
-      edge,
-      module_logical_path(edge.target),
-      ScopeImportRawMemory,
-      edge.location,
-      None,
-      None
-    )
-    return nil
+  -- A wildcard cannot select around raw exports or platform authority, so a
+  -- ring module, or an interpreter imported by anything but a private
+  -- interpreter, refuses the whole import once.
+  let refusal = if not raw.refusable { None<ScopeIssueStatus>() }
+  else {
+    match raw.target {
+      RingTier -> Some(ScopeImportRawMemory)
+      InterpreterTier -> if raw.importer_interpreter and not raw.reexported {
+        None<ScopeIssueStatus>()
+      } else { Some(ScopeImportPlatformAuthority) }
+      OrdinaryTier -> None<ScopeIssueStatus>()
+    }
+  }
+  match refusal {
+    Some(status) -> {
+      add_issue(
+        issues,
+        edge,
+        module_logical_path(edge.target),
+        status,
+        edge.location,
+        None,
+        None
+      )
+      return nil
+    }
+    None -> nil
   }
   let count = persistent_vector_len<ScopeEntry>(target_entries)
   for index in 0..count {
@@ -1082,11 +1232,11 @@ fn build_module(
                 authority_trusted(
                   vector_get_in_bounds<RegisteredModule>(modules, index).authority
                 ),
-                raw_boundary_trusted_runtime(
+                boundary_tier(
+                  edge.target,
                   authority_trusted(
                     vector_get_in_bounds<RegisteredModule>(modules, target_index).authority
-                  ),
-                  module_logical_path(edge.target)
+                  )
                 )
               )
             )
@@ -1418,9 +1568,9 @@ pub(package) fn registration_scope_lookup_qualified_span(
           QualifiedScopeAmbiguous(primary, conflict)
         ScopeNameResolved(member) -> if not candidate_visible_from(member, target, caller) {
           QualifiedScopeInvisible(member)
-        } else if qualified_member_sealed(scope, caller, target, member) {
-          QualifiedScopeSealed(member)
-        } else { QualifiedScopeResolved(member) }
+        } else {
+          qualified_from_verdict(qualified_member_verdict(scope, caller, target, member), member)
+        }
       }
       _ -> QualifiedScopeMissing
     }
@@ -1477,9 +1627,12 @@ pub(package) fn registration_scope_qualified_from_lookup(
     ScopeNameAmbiguous(primary, conflict) -> QualifiedScopeAmbiguous(primary, conflict)
     ScopeNameResolved(candidate) -> if not candidate_visible_from(candidate, target, caller) {
       QualifiedScopeInvisible(candidate)
-    } else if qualified_member_sealed(scope, caller, target, candidate) {
-      QualifiedScopeSealed(candidate)
-    } else { QualifiedScopeResolved(candidate) }
+    } else {
+      qualified_from_verdict(
+        qualified_member_verdict(scope, caller, target, candidate),
+        candidate
+      )
+    }
   }
 }
 
@@ -1520,7 +1673,7 @@ pub(package) fn registration_scope_qualified_declaration_from_lookup(
   }
   match selected {
     Some((name, declaration)) -> if candidate_visible_from(declaration, target, caller) and
-      not qualified_member_sealed(scope, caller, target, declaration) {
+      qualified_member_admitted(scope, caller, target, declaration) {
         Some(name)
       } else { None<RegisteredName>() }
     None -> None<RegisteredName>()
