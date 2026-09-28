@@ -1,0 +1,287 @@
+-- The sealed Sendable predicate on the typed path: structural facts decide
+-- bounds, sealed SDK declarations follow their exact identity, generic
+-- bodies rely on their own bounds, and no module may declare the name.
+
+use compiler/project/identity.{ModuleIdentity, named_module_identity}
+use compiler/source/input.{source_from_text}
+use compiler/types/graph/conformance.{SemanticConformance}
+use compiler/weft/check/body/producer.{
+  CheckedBodiesAccepted,
+  CheckedBodiesRejected,
+  check_registered_bodies
+}
+use compiler/weft/check/registration/catalog as registration
+use compiler/weft/check/registration/catalog.{RegisteredModule}
+use compiler/weft/check/registration/scope as registration_scope
+use compiler/weft/check/registration/scope.{RegistrationScope}
+use compiler/weft/check/rejection.{checked_body_producer_issue_category}
+use compiler/weft/check/resolution.{
+  SemanticDeclarationResolutionIssue,
+  SemanticResolutionAccepted,
+  SemanticResolutionRejected,
+  resolve_module_semantics
+}
+use compiler/weft/check/semantic_types.{SemanticReservedSealedPredicate}
+use compiler/weft/grammar.{ParsedWeftSource, WeftParser}
+use stdlib/diagnostic.{Diagnose}
+use stdlib/grammar.{Grammar, Parsed}
+use stdlib/list as list
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{Option}
+use stdlib/panic.{panic}
+use stdlib/string.{str_concat}
+use stdlib/test.{Test}
+
+fn parse(text: str) -[Test]> ParsedWeftSource {
+  let result = handle WeftParser().parse(source_from_text(text).all()) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false); resume(0) }
+    Diagnose.error(message, location) -> { Test.assert_true(false); resume(0) }
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  }
+  match result {
+    Parsed(syntax) -> syntax
+    _ -> panic("expected complete authored syntax")
+  }
+}
+
+fn registered(text: str, module: ModuleIdentity) -[Test]> RegisteredModule {
+  let parsed = parse(text)
+  registration.register(parsed.declarations, parsed.source.source(), module)
+}
+
+-- Check one module's bodies. No implementation grants Sendable, so the
+-- oracle refuses every other trait query.
+fn checked_in(module: RegisteredModule, scope: RegistrationScope, discriminator: i64) -[Test]> str
+{
+  match resolve_module_semantics(module, scope) {
+    SemanticResolutionAccepted(resolution) -> {
+      let result = handle check_registered_bodies(module, scope, resolution, discriminator) {
+        SemanticConformance.conforms(_, concrete, trait_atom) -> resume(false)
+      }
+      match result {
+        CheckedBodiesAccepted(_) -> "accepted"
+        CheckedBodiesRejected(issue) -> checked_body_producer_issue_category(issue)
+      }
+    }
+    SemanticResolutionRejected(
+      SemanticDeclarationResolutionIssue(
+        _,
+        SemanticReservedSealedPredicate,
+      )
+    ) -> "reserved_sealed_predicate"
+    _ -> "unresolved"
+  }
+}
+
+fn outcome(text: str, name: str, discriminator: i64) -[Test]> str {
+  let module = registered(text, named_module_identity(name, discriminator))
+  let builder = registration_scope.registration_builder()
+  registration_scope.registration_builder_add(builder, module)
+  checked_in(module, registration_scope.registration_builder_freeze(builder), discriminator)
+}
+
+-- The consumer's first import is the SDK's vector handles, registered in the
+-- SDK package so their exact identities are sealed.
+fn outcome_with_handles(text: str, name: str, discriminator: i64) -[Test]> str {
+  let handles = registered(
+    "pub type Vector<T> { } pub type PersistentVector<T> { }",
+    named_module_identity("stdlib/vector/handles", discriminator)
+  )
+  let consumer = registered(
+    str_concat("use stdlib/vector/handles.{Vector, PersistentVector} ", text),
+    named_module_identity(name, discriminator)
+  )
+  let edge = registration_scope.resolved_import(
+    consumer,
+    consumer.syntax.imports.get(0).unwrap(),
+    handles.identity,
+    false
+  )
+  let modules = [handles, consumer]
+  let imports = [edge]
+  let scope = registration_scope.registration_scope_build(
+    list.from_slice(modules[..]),
+    list.from_slice(imports[..])
+  )
+  checked_in(consumer, scope, discriminator)
+}
+
+-- Each argument's outcome under `require`, from consecutive discriminators.
+fn assert_requirements(
+  declarations: str,
+  arguments: List<str>,
+  name: str,
+  discriminator: i64,
+  expected: str
+) -[Test]> nil {
+  match arguments {
+    Nil -> nil
+    Cons(argument, rest) -> {
+      Test.assert_str_eq(
+        outcome(str_concat(declarations, require(argument)), name, discriminator),
+        expected
+      )
+      assert_requirements(declarations, rest, name, discriminator + 1, expected)
+    }
+  }
+}
+
+fn require(argument: str) -> str {
+  "fn require<T: Sendable>() -> i64 { 1 } "
+    |> str_concat("fn probe() -> i64 { require<")
+    |> str_concat(argument)
+    |> str_concat(">() } ")
+}
+
+test "sendable bounds accept structurally sendable arguments" {
+  let accepted = [
+    "i64",
+    "str",
+    "bool",
+    "(i64, str)",
+    "[i64; 4]",
+    "Point",
+    "Choice<str>",
+    "Chain<i64>",
+    "Id",
+    "i64 | nil",
+  ]
+  let declarations = "type Point { x: i64, y: i64 } type Choice<T> { Chosen(T), Empty } "
+    |> str_concat("type Chain<T> { Link(T, Chain<T>), End } type Id = opaque i64 ")
+  assert_requirements(
+    declarations,
+    list.from_slice(accepted[..]),
+    "fixture/sendable_accepts",
+    2001,
+    "accepted"
+  )
+}
+
+test "sendable bounds refuse what a type alone cannot prove" {
+  -- Dynamic values, a function type without its concrete captures, a
+  -- slice without scoped provenance, an open record, and data holding any.
+  let refused = ["any", "(i64) -> i64", "[i64]", "{ x: i64, .. }", "Holder"]
+  let declarations = "type Holder { value: any } "
+  assert_requirements(
+    declarations,
+    list.from_slice(refused[..]),
+    "fixture/sendable_refuses",
+    2021,
+    "generic_bound_rejected"
+  )
+}
+
+test "generic bodies rely on their own sendable bounds" {
+  let chain = "type Chain<T> { Link(T, Chain<T>), End } fn require<T: Sendable>() -> i64 { 1 } "
+  Test.assert_str_eq(
+    outcome(
+      str_concat(chain, "fn relay<U: Sendable>() -> i64 { require<U>() }"),
+      "fixture/sendable_relay_variable",
+      2031
+    ),
+    "accepted"
+  )
+  -- A bound variable inside a larger argument is sendable too.
+  Test.assert_str_eq(
+    outcome(
+      str_concat(chain, "fn relay<U: Sendable>() -> i64 { require<Chain<U>>() }"),
+      "fixture/sendable_relay_compound",
+      2032
+    ),
+    "accepted"
+  )
+  Test.assert_str_eq(
+    outcome(
+      str_concat(chain, "fn relay<U>() -> i64 { require<U>() }"),
+      "fixture/sendable_relay_unbounded",
+      2033
+    ),
+    "generic_bound_rejected"
+  )
+  Test.assert_str_eq(
+    outcome(
+      str_concat(chain, "fn relay<U>() -> i64 { require<Chain<U>>() }"),
+      "fixture/sendable_relay_unbounded_compound",
+      2034
+    ),
+    "generic_bound_rejected"
+  )
+}
+
+test "sendable-bounded data is constructed only from sendable arguments" {
+  let slot = "type Slot<T: Sendable> { Filled(T), Vacant } type Box<T: Sendable> { value: T } "
+  Test.assert_str_eq(
+    outcome(
+      str_concat(slot, "fn make(x: i64) -> Slot<i64> { Filled(x) }"),
+      "fixture/sendable_variant_accepts",
+      2041
+    ),
+    "accepted"
+  )
+  Test.assert_str_eq(
+    outcome(
+      str_concat(slot, "fn make(x: any) -> Slot<any> { Filled(x) }"),
+      "fixture/sendable_variant_refuses",
+      2042
+    ),
+    "generic_bound_rejected"
+  )
+  -- Inside a body bounded by Sendable, its own variable satisfies the bound.
+  Test.assert_str_eq(
+    outcome(
+      str_concat(slot, "fn make<U: Sendable>(x: U) -> Box<U> { Box { value: x } }"),
+      "fixture/sendable_record_relays",
+      2043
+    ),
+    "accepted"
+  )
+}
+
+test "sealed SDK declarations follow their exact identity" {
+  Test.assert_str_eq(
+    outcome_with_handles(require("Vector<i64>"), "fixture/sendable_vector", 2051),
+    "generic_bound_rejected"
+  )
+  Test.assert_str_eq(
+    outcome_with_handles(
+      "type Envelope<T> { value: T } " |> str_concat(require("Envelope<Vector<i64>>")),
+      "fixture/sendable_nested_vector",
+      2052
+    ),
+    "generic_bound_rejected"
+  )
+  -- A persistent vector is sendable exactly when its elements are.
+  Test.assert_str_eq(
+    outcome_with_handles(
+      require("PersistentVector<str>"),
+      "fixture/sendable_persistent_elements",
+      2053
+    ),
+    "accepted"
+  )
+  Test.assert_str_eq(
+    outcome_with_handles(
+      require("PersistentVector<Vector<i64>>"),
+      "fixture/sendable_persistent_mutable_element",
+      2054
+    ),
+    "generic_bound_rejected"
+  )
+  -- A same-spelled user type is ordinary data: its fields decide.
+  Test.assert_str_eq(
+    outcome(
+      "type Vector<T> { first: T } " |> str_concat(require("Vector<i64>")),
+      "fixture/sendable_same_named_vector",
+      2055
+    ),
+    "accepted"
+  )
+}
+
+test "no module may declare the sealed predicate" {
+  Test.assert_str_eq(
+    outcome("trait Sendable { } fn main() -> i64 { 0 }", "fixture/sendable_reserved", 2061),
+    "reserved_sealed_predicate"
+  )
+}

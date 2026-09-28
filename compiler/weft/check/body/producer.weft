@@ -605,6 +605,13 @@ use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
 use stdlib/source.{Source, Span}
 use compiler/weft/check/body/extent.{checked_authored_extent}
+use compiler/weft/check/sendable.{checked_sdk_declaration, checked_sendable_identities}
+use compiler/types/graph/sendable.{
+  SemanticSendableIdentities,
+  semantic_sendability_proved,
+  semantic_type_is_sendable_atom,
+  semantic_type_sendability
+}
 
 pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerTypeRejected(SemanticTypeResolutionIssue),
@@ -795,6 +802,8 @@ type CheckedBodyPrimitiveTypes {
   variant_applications: SemanticVariantApplicationCatalog,
   effect_applications: SemanticEffectApplicationCatalog,
   resolution: SemanticResolutionProduct,
+  -- The SDK declarations whose Sendable fact follows their exact identity.
+  sendable: SemanticSendableIdentities,
   never_type: SemanticTypeId,
   integer: SemanticTypeId,
   usize_type: SemanticTypeId,
@@ -829,7 +838,8 @@ fn checked_body_types_with_catalog(
     boolean: types.boolean,
     nil_type: types.nil_type,
     float64: types.float64,
-    float32: types.float32
+    float32: types.float32,
+    sendable: types.sendable
   }
 }
 
@@ -855,7 +865,8 @@ fn checked_body_types_with_applications(
     boolean: types.boolean,
     nil_type: types.nil_type,
     float64: types.float64,
-    float32: types.float32
+    float32: types.float32,
+    sendable: types.sendable
   }
 }
 
@@ -1509,7 +1520,8 @@ fn checked_body_primitive_types(
                       boolean: boolean,
                       nil_type: nil_type,
                       float64: float64,
-                      float32: float32
+                      float32: float32,
+                      sendable: checked_sendable_identities(scope, sdk_package_id)
                     }
                   )
                   (_, SemanticTypeRejected(issue)) -> CheckedBodyPrimitivesRejected(issue)
@@ -9678,32 +9690,7 @@ fn checked_body_standard_declaration(
   namespace: DeclarationNamespace,
   name: str
 ) -> DeclarationIdentity? {
-  let mut selected: DeclarationIdentity? = nil
-  if types.sdk_package_id <= 0 { return nil }
-  let mut index: usize = 0
-  while index < registration_scope_len(scope) {
-    let module = registration_scope_at(scope, __u64_to_i64(__usize_to_u64(index)))
-    match module.identity {
-      NamedModuleIdentity(path, _) -> if path == module_path and
-        module_identity_package(module.identity) == types.sdk_package_id {
-          match registration_scope_find_declaration(
-            scope,
-            module.identity,
-            namespace,
-            name
-          ) {
-            Some(name) -> match selected {
-              nil -> { selected = name.identity }
-              other: DeclarationIdentity -> return nil
-            }
-            None -> nil
-          }
-        } else { nil }
-      _ -> nil
-    }
-    index = index + 1
-  }
-  selected
+  checked_sdk_declaration(scope, types.sdk_package_id, module_path, namespace, name)
 }
 
 fn checked_body_function_effect_declaration(
@@ -13033,6 +13020,67 @@ fn checked_body_owner_assumptions(
       }
       assumptions
     }
+  }
+}
+
+-- The owner's type variables its signature bounds by the sealed Sendable
+-- predicate: its body may rely on them being sendable.
+fn checked_body_owner_sendable_variables(
+  types: CheckedBodyPrimitiveTypes,
+  catalog: borrow SemanticTypeCatalog,
+  owner: FunctionIdentity
+) -> List<SemanticTypeVariable> {
+  let mut variables = Nil<SemanticTypeVariable>()
+  for assumption in checked_body_owner_assumptions(types, owner) {
+    if semantic_type_is_sendable_atom(catalog, assumption.trait_atom) {
+      variables = variables.prepend(assumption.variable)
+    } else { nil }
+  }
+  variables
+}
+
+-- Whether a type argument satisfies a declared bound. A rigid variable
+-- satisfies the bounds its owner declares. The sealed Sendable predicate is
+-- decided from the argument's structure, with the owner's Sendable-bounded
+-- variables assumed; a type alone never proves a closure's captures or a
+-- slice's provenance. Any other bound is a conformance query.
+fn checked_body_bound_holds(
+  types: CheckedBodyPrimitiveTypes,
+  catalog: SemanticTypeCatalog,
+  owner: FunctionIdentity,
+  argument: SemanticTypeId,
+  trait_atom: SemanticTypeId
+) -[SemanticConformance]> bool {
+  let local = match catalog.graph_for(argument) {
+    Some(graph) -> match semantic_type_graph_node(graph, argument) {
+      SemanticVariableNode(variable) -> checked_body_local_bound_from(
+        types,
+        catalog,
+        owner,
+        variable,
+        trait_atom,
+        0
+      )
+      _ -> None<SemanticTypeId>()
+    }
+    None -> None<SemanticTypeId>()
+  }
+  match local {
+    Some(_) -> true
+    None -> if semantic_type_is_sendable_atom(catalog, trait_atom) {
+      let resolution = types.resolution
+      let declarations = resolution.declarations()
+      let identities = types.sendable
+      semantic_sendability_proved(
+        semantic_type_sendability(
+          catalog,
+          declarations,
+          identities,
+          checked_body_owner_sendable_variables(types, catalog, owner),
+          argument
+        )
+      )
+    } else { semantic_type_is_subtype(catalog, argument, trait_atom) }
   }
 }
 
@@ -17974,7 +18022,7 @@ fn checked_body_generic_bounds(
               product
             )
           }
-          None -> if semantic_type_is_subtype(catalog, concrete, trait_atom) {
+          None -> if checked_body_bound_holds(types, catalog, owner, concrete, trait_atom) {
             match semantic_conformance_catalog_witness(
               catalog,
               conformances,
@@ -18835,7 +18883,7 @@ fn checked_body_constructor_finish(
       CheckedBodyProducerConstructorArityMismatch(payload_count, provided)
     )
   } else {
-    match checked_body_constructor_bounds(state.types(), types, declaration, result_type) {
+    match checked_body_constructor_bounds(state.types(), types, owner, declaration, result_type) {
       CheckedConstructorBoundsRejected(catalog, issue) -> CheckedBodyExprRejected(
         state.with_types(catalog),
         issue
@@ -18883,6 +18931,7 @@ type CheckedConstructorBounds {
 fn checked_body_constructor_bounds(
   catalog: SemanticTypeCatalog,
   types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
   visible: DeclarationIdentity,
   result_type: SemanticTypeId
 ) -[SemanticConformance]> CheckedConstructorBounds {
@@ -18897,6 +18946,7 @@ fn checked_body_constructor_bounds(
         match
         checked_body_declared_bounds(
           checked_body_types_with_catalog(types, catalog),
+          owner,
           SemanticDeclaredVariantLayout(layout),
           substitution
         ) {
@@ -18967,6 +19017,7 @@ fn checked_body_constructor_reference_parameters(
 fn checked_body_constructor_reference_finish(
   state: owned CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
   visible: DeclarationIdentity,
   result_type: SemanticTypeId,
   payload_count: usize,
@@ -19007,7 +19058,7 @@ fn checked_body_constructor_reference_finish(
   ) {
     CheckedBodyExprRejected(state, CheckedBodyProducerCallableRequired(expected))
   } else {
-    match checked_body_constructor_bounds(catalog, types, visible, result_type) {
+    match checked_body_constructor_bounds(catalog, types, owner, visible, result_type) {
       CheckedConstructorBoundsRejected(catalog, issue) -> CheckedBodyExprRejected(
         state.with_types(catalog),
         issue
@@ -19024,6 +19075,7 @@ fn checked_body_constructor_reference_finish(
 fn checked_body_constructor_function_value(
   state: owned CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
   visible: DeclarationIdentity,
   name: Span,
   range: CheckedSourceRange,
@@ -19045,6 +19097,7 @@ fn checked_body_constructor_function_value(
           checked_body_constructor_reference_finish(
             state,
             types,
+            owner,
             visible,
             semantic_function_result(catalog, expected),
             payload_count,
@@ -19069,6 +19122,7 @@ fn checked_body_constructor_function_value(
           ) -> checked_body_constructor_reference_finish(
             state,
             types,
+            owner,
             visible,
             result_type,
             payload_count,
@@ -19356,6 +19410,7 @@ fn checked_body_constructor_solved_call(
                 CheckedInferredGenericValid -> match checked_body_constructor_bounds(
                   state.types(),
                   next_types,
+                  owner,
                   visible,
                   result_type
                 ) {
@@ -19419,6 +19474,7 @@ fn checked_body_constructor_value(
           SemanticFunctionNode(_, _, _) -> checked_body_constructor_function_value(
             state,
             types,
+            owner,
             visible,
             name,
             name_range,
@@ -22500,6 +22556,8 @@ type CheckedDeclaredBounds {
 
 fn checked_body_declared_bound_at(
   product: SemanticTypeProductBuilder,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
   declarations: borrow SemanticTypeDeclarationCatalog,
   layout: SemanticDeclaredLayout,
   substitution: borrow SemanticTypeSubstitution,
@@ -22524,9 +22582,11 @@ fn checked_body_declared_bound_at(
             trait_template
           )
           let catalog = semantic_type_product_catalog(product)
-          if semantic_type_is_subtype(catalog, argument, trait_atom) {
+          if checked_body_bound_holds(types, catalog, owner, argument, trait_atom) {
             checked_body_declared_bound_at(
               product,
+              types,
+              owner,
               declarations,
               layout,
               substitution,
@@ -22545,6 +22605,7 @@ fn checked_body_declared_bound_at(
 
 fn checked_body_declared_bounds(
   types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
   layout: SemanticDeclaredLayout,
   substitution: borrow SemanticTypeSubstitution
 ) -[SemanticConformance]> CheckedDeclaredBounds {
@@ -22560,13 +22621,23 @@ fn checked_body_declared_bounds(
         catalog,
         catalog.next_derived_segment(types.module.identity, resolution.next_type_segment())
       )
-      checked_body_declared_bound_at(product, declarations, layout, substitution, 0, count)
+      checked_body_declared_bound_at(
+        product,
+        types,
+        owner,
+        declarations,
+        layout,
+        substitution,
+        0,
+        count
+      )
     }
   }
 }
 
 fn checked_body_nominal_record_bounds(
   types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
   declaration: DeclarationIdentity,
   template: SemanticTypeId,
   layout: usize,
@@ -22596,6 +22667,7 @@ fn checked_body_nominal_record_bounds(
         )
         SemanticTypePatternMatched(substitution) -> match checked_body_declared_bounds(
           types,
+          owner,
           record_layout,
           substitution
         ) {
@@ -22619,6 +22691,7 @@ fn checked_body_nominal_record_bounds(
 fn checked_body_nominal_record_resolve(
   catalog: SemanticTypeCatalog,
   types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
   declaration: DeclarationIdentity,
   template: SemanticTypeId,
   layout: usize,
@@ -22630,6 +22703,7 @@ fn checked_body_nominal_record_resolve(
   match candidate {
     Some(concrete) -> checked_body_nominal_record_bounds(
       checked_body_types_with_catalog(types, catalog),
+      owner,
       declaration,
       template,
       layout,
@@ -22668,6 +22742,7 @@ fn checked_body_nominal_record_resolve(
             )
             checked_body_nominal_record_bounds(
               checked_body_nominal_record_materialize(types, product, concrete),
+              owner,
               declaration,
               template,
               layout,
@@ -22740,6 +22815,7 @@ fn checked_body_nominal_record_literal(
             match checked_body_nominal_record_resolve(
               state.types(),
               ready_types,
+              owner,
               declaration,
               template,
               layout,

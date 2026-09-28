@@ -1,0 +1,859 @@
+-- Structural Sendable facts over semantic type graphs.
+--
+-- `Sendable` is a sealed structural predicate, not an open trait: no module
+-- declares it and no implementation grants it (kernel §2.7, §8.5). Its atom
+-- carries a compiler-owned identity and a query decides it from the shape of
+-- the type. Scalars, strings, closed immutable records, tuples and variants,
+-- fixed arrays and the immutable persistent collections compose
+-- structurally. Mutable containers, runtime tokens, raw pointers,
+-- continuations, owned resources, open records and `any` are refused. A pure
+-- function type is only a candidate: a concrete closure must prove its
+-- captures. An immutable slice additionally needs scoped-join provenance.
+--
+-- Each declaration has a fact computed once from its own template: refused,
+-- unknown, or sendable when the arguments at certain positions are, together
+-- with the boundary work its values need. An application instantiates its
+-- declaration's fact with its own arguments. Recursive declarations take the
+-- greatest fixed point: immutable recursive data is sendable unless some
+-- component refuses it.
+
+use compiler/project/identity.{
+  DeclarationIdentity,
+  ModuleDeclarationIdentity,
+  NamedModuleIdentity,
+  TraitDeclaration
+}
+use compiler/project/identity/equality.{declaration_identity_eq}
+use compiler/source/input.{source_from_text}
+use compiler/types/graph.{*}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/declarations.{
+  SemanticDeclaredLayout,
+  SemanticDeclaredRecordLayout,
+  SemanticDeclaredVariantLayout,
+  SemanticRecordDeclarationLayoutMatched,
+  SemanticTypeDeclarationCatalog,
+  SemanticTypeDeclarationLayoutMissing,
+  SemanticVariantDeclarationLayoutMatched,
+  semantic_type_declaration_catalog_resolve,
+  semantic_type_declared_layout_target,
+  semantic_type_declared_record_field_count,
+  semantic_type_declared_record_field_type,
+  semantic_type_declared_variant_case_count,
+  semantic_type_declared_variant_payload_count,
+  semantic_type_declared_variant_payload_type
+}
+use compiler/types/graph/effects.{semantic_function_is_pure}
+use compiler/types/graph/substitution.{semantic_type_substitution_empty}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/num/scalar.{num_scalar_usize_to_i64}
+use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+
+-- The compiler-owned identity of the sealed predicate. Its module path is
+-- not a path any module can have.
+pub(package) fn semantic_sendable_declaration() -> DeclarationIdentity {
+  let source = source_from_text("Sendable")
+  ModuleDeclarationIdentity(
+    NamedModuleIdentity("<sealed>", 0),
+    TraitDeclaration,
+    source.span(__i64_to_usize(0), __i64_to_usize(8)).unwrap()
+  )
+}
+
+-- Whether a declaration is the sealed predicate, compared by shape so no
+-- source is built per query.
+fn semantic_declaration_is_sendable(declaration: DeclarationIdentity) -> bool {
+  match declaration {
+    ModuleDeclarationIdentity(module, namespace, name) -> match (module, namespace) {
+      (NamedModuleIdentity(path, module_package), TraitDeclaration) -> path == "<sealed>" and
+        module_package == 0 and match name.text() {
+          Some(text) -> text == "Sendable",
+          None -> false
+        }
+      _ -> false
+    }
+    _ -> false
+  }
+}
+
+-- Whether a type is the sealed predicate's atom.
+pub(package) fn semantic_type_is_sendable_atom(
+  types: borrow SemanticTypeCatalog,
+  value: SemanticTypeId
+) -> bool {
+  match types.graph_for(value) {
+    None -> false
+    Some(graph) -> match semantic_type_graph_node(graph, value) {
+      SemanticTraitNode(declaration, _) -> semantic_declaration_is_sendable(declaration)
+      _ -> false
+    }
+  }
+}
+
+-- How an SDK declaration's Sendable fact follows its exact identity rather
+-- than its representation, which would otherwise look sendable.
+pub(package) type SemanticSealedKind {
+  -- A mutable container, such as an empty handle record.
+  SemanticSealedMutableContainer,
+  -- An immutable persistent collection: sendable when its arguments are.
+  SemanticSealedPersistentCollection,
+  -- A runtime token, such as an opaque integer.
+  SemanticSealedRuntimeToken
+}
+
+pub(package) type SemanticSealedDeclaration {
+  declaration: DeclarationIdentity,
+  kind: SemanticSealedKind
+}
+
+-- The sealed SDK declarations the program contains.
+pub(package) type SemanticSendableIdentities = opaque List<SemanticSealedDeclaration>
+
+pub(package) fn semantic_sendable_identities(
+  entries: List<SemanticSealedDeclaration>
+) -> SemanticSendableIdentities {
+  SemanticSendableIdentities(entries)
+}
+
+fn send_sealed_kind(
+  identities: borrow SemanticSendableIdentities,
+  declaration: DeclarationIdentity
+) -> Option<SemanticSealedKind> {
+  match identities {
+    SemanticSendableIdentities(entries) -> {
+      for entry in entries {
+        if declaration_identity_eq(entry.declaration, declaration) { return Some(entry.kind) }
+        else { nil }
+      }
+      None<SemanticSealedKind>()
+    }
+  }
+}
+
+pub(package) type SemanticSendabilityReason {
+  SemanticSendDynamic,
+  SemanticSendEffectfulFunction,
+  SemanticSendRawPointer,
+  SemanticSendContinuation,
+  SemanticSendMutableSlice,
+  SemanticSendOwnedResource,
+  SemanticSendMutableState,
+  SemanticSendRuntimeToken,
+  SemanticSendOpenRecord,
+  SemanticSendTypeEvidence,
+  SemanticSendUnknownNominal,
+  SemanticSendUnsupportedType
+}
+
+-- Boundary work a structurally sendable value still needs: transitive
+-- one-way promotion of its managed graph, a proof of a concrete closure's
+-- captures, or scoped-join provenance for a slice.
+pub(package) type SemanticSendableNeeds {
+  promotion: bool,
+  capture_proof: bool,
+  scoped_borrow: bool
+}
+
+pub(package) type SemanticSendability {
+  SemanticSendable(SemanticSendableNeeds),
+  SemanticSendabilityUnknown(SemanticSendabilityReason, SemanticTypeId),
+  SemanticNotSendable(SemanticSendabilityReason, SemanticTypeId)
+}
+
+-- A fact relative to the type variables in scope: sendable when the
+-- arguments at `positions` are, with `needs`.
+type SemanticSendSummary {
+  SemanticSendThrough(SemanticSendableNeeds, List<usize>),
+  SemanticSendUnknown(SemanticSendabilityReason, SemanticTypeId),
+  SemanticSendRefused(SemanticSendabilityReason, SemanticTypeId)
+}
+
+type SemanticSendScope {
+  SemanticSendQuery(List<SemanticTypeVariable>),
+  SemanticSendDeclaration(List<SemanticTypeVariable>)
+}
+
+type SemanticSendSearch {
+  settled: Map<i64, SemanticSendSummary>,
+  approximate: Map<i64, SemanticSendSummary>,
+  visited: Map<i64, bool>,
+  changed: bool
+}
+
+fn send_no_needs() -> SemanticSendableNeeds {
+  SemanticSendableNeeds { promotion: false, capture_proof: false, scoped_borrow: false }
+}
+
+fn send_needs_join(
+  left: SemanticSendableNeeds,
+  right: SemanticSendableNeeds
+) -> SemanticSendableNeeds {
+  SemanticSendableNeeds {
+    promotion: left.promotion or right.promotion,
+    capture_proof: left.capture_proof or right.capture_proof,
+    scoped_borrow: left.scoped_borrow or right.scoped_borrow
+  }
+}
+
+fn send_needs_eq(left: SemanticSendableNeeds, right: SemanticSendableNeeds) -> bool {
+  left.promotion == right.promotion and left.capture_proof == right.capture_proof and
+    left.scoped_borrow == right.scoped_borrow
+}
+
+fn send_yes() -> SemanticSendSummary {
+  SemanticSendThrough(send_no_needs(), Nil<usize>())
+}
+
+fn send_yes_with(needs: SemanticSendableNeeds) -> SemanticSendSummary {
+  SemanticSendThrough(needs, Nil<usize>())
+}
+
+fn send_promotion() -> SemanticSendableNeeds {
+  SemanticSendableNeeds { promotion: true, capture_proof: false, scoped_borrow: false }
+}
+
+fn send_positions_union(left: List<usize>, right: List<usize>) -> List<usize> {
+  match (left, right) {
+    (Nil, _) -> right
+    (_, Nil) -> left
+    (Cons(a, rest_a), Cons(b, rest_b)) -> if a < b {
+      Cons<usize>(a, send_positions_union(rest_a, right))
+    } else if b < a {
+      Cons<usize>(b, send_positions_union(left, rest_b))
+    } else {
+      Cons<usize>(a, send_positions_union(rest_a, rest_b))
+    }
+  }
+}
+
+fn send_positions_contain(positions: List<usize>, wanted: usize) -> bool {
+  match positions {
+    Nil -> false
+    Cons(position, rest) -> position == wanted or send_positions_contain(rest, wanted)
+  }
+}
+
+fn send_positions_eq(left: List<usize>, right: List<usize>) -> bool {
+  match (left, right) {
+    (Nil, Nil) -> true
+    (Cons(a, rest_a), Cons(b, rest_b)) -> a == b and send_positions_eq(rest_a, rest_b)
+    _ -> false
+  }
+}
+
+-- A refusal wins over an unknown, which wins over sendable.
+fn send_join(left: SemanticSendSummary, right: SemanticSendSummary) -> SemanticSendSummary {
+  match (left, right) {
+    (SemanticSendRefused(_, _), _) -> left
+    (_, SemanticSendRefused(_, _)) -> right
+    (SemanticSendUnknown(_, _), _) -> left
+    (_, SemanticSendUnknown(_, _)) -> right
+    (SemanticSendThrough(a_needs, a_positions), SemanticSendThrough(b_needs, b_positions)) ->
+      SemanticSendThrough(
+        send_needs_join(a_needs, b_needs),
+        send_positions_union(a_positions, b_positions)
+      )
+  }
+}
+
+fn send_with_needs(
+  summary: SemanticSendSummary,
+  needs: SemanticSendableNeeds
+) -> SemanticSendSummary {
+  match summary {
+    SemanticSendThrough(own, positions) -> SemanticSendThrough(
+      send_needs_join(own, needs),
+      positions
+    )
+    other -> other
+  }
+}
+
+fn send_summary_eq(left: SemanticSendSummary, right: SemanticSendSummary) -> bool {
+  match (left, right) {
+    (SemanticSendThrough(a_needs, a_positions), SemanticSendThrough(b_needs, b_positions)) ->
+      send_needs_eq(a_needs, b_needs) and send_positions_eq(a_positions, b_positions)
+    (SemanticSendUnknown(_, _), SemanticSendUnknown(_, _)) -> true
+    (SemanticSendRefused(_, _), SemanticSendRefused(_, _)) -> true
+    _ -> false
+  }
+}
+
+fn send_layout_key(layout: SemanticDeclaredLayout) -> i64 {
+  let (index, kind) = match layout {
+    SemanticDeclaredRecordLayout(index) -> (index, 0)
+    SemanticDeclaredVariantLayout(index) -> (index, 1)
+  }
+  match num_scalar_usize_to_i64(index) {
+    Some(value) -> value * 2 + kind
+    None -> panic("Declaration layout index is not representable")
+  }
+}
+
+fn send_variable_eq(left: SemanticTypeVariable, right: SemanticTypeVariable) -> bool {
+  match (left, right) {
+    (SemanticParameterVariable(a), SemanticParameterVariable(b)) -> a == b
+    (SemanticSelfVariable, SemanticSelfVariable) -> true
+    _ -> false
+  }
+}
+
+fn send_variable_position(
+  variables: List<SemanticTypeVariable>,
+  wanted: SemanticTypeVariable,
+  index: usize
+) -> Option<usize> {
+  match variables {
+    Nil -> None<usize>()
+    Cons(variable, rest) -> if send_variable_eq(variable, wanted) { Some(index) }
+    else { send_variable_position(rest, wanted, index + 1) }
+  }
+}
+
+-- The type variables a declaration's template applies, in argument order.
+fn send_template_variables(
+  types: borrow SemanticTypeCatalog,
+  template: SemanticTypeId
+) -> Option<List<SemanticTypeVariable>> {
+  match types.graph_for(template) {
+    None -> None<List<SemanticTypeVariable>>()
+    Some(graph) -> match semantic_type_graph_node(graph, template) {
+      SemanticNamedNode(_, _, _, arguments) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        let mut variables = Nil<SemanticTypeVariable>()
+        let mut index = semantic_type_list_len(lists, arguments)
+        while index > 0 {
+          index = index - 1
+          let argument = semantic_type_graph_list_type_id(
+            graph,
+            semantic_type_list_edge(lists, arguments, index)
+          )
+          match types.graph_for(argument) {
+            Some(argument_graph) -> match semantic_type_graph_node(argument_graph, argument) {
+              SemanticVariableNode(variable) -> { variables = variables.prepend(variable) }
+              _ -> return None<List<SemanticTypeVariable>>()
+            }
+            None -> return None<List<SemanticTypeVariable>>()
+          }
+        }
+        Some(variables)
+      }
+      _ -> None<List<SemanticTypeVariable>>()
+    }
+  }
+}
+
+-- The joined facts of an application's arguments at `positions`, or of
+-- every argument when a persistent collection requires them all.
+fn send_arguments(
+  search: SemanticSendSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  identities: borrow SemanticSendableIdentities,
+  scope: borrow SemanticSendScope,
+  value: SemanticTypeId,
+  positions: Option<List<usize>>
+) -> (SemanticSendSearch, SemanticSendSummary) {
+  let graph = match types.graph_for(value) {
+    Some(found) -> found
+    None -> return (search, SemanticSendRefused(SemanticSendUnsupportedType, value))
+  }
+  match semantic_type_graph_node(graph, value) {
+    SemanticNamedNode(_, _, _, arguments) -> {
+      let lists = semantic_type_graph_type_lists_local(graph)
+      let count = semantic_type_list_len(lists, arguments)
+      let mut state = search
+      let mut summary = send_yes()
+      let mut index: usize = 0
+      while index < count {
+        let wanted = match positions {
+          None -> true
+          Some(listed) -> send_positions_contain(listed, index)
+        }
+        if wanted {
+          let argument = semantic_type_graph_list_type_id(
+            graph,
+            semantic_type_list_edge(lists, arguments, index)
+          )
+          let (next, found) = send_type(
+            state,
+            types,
+            declarations,
+            identities,
+            scope,
+            argument,
+            0
+          )
+          state = next
+          summary = send_join(summary, found)
+        } else { nil }
+        index = index + 1
+      }
+      (state, summary)
+    }
+    _ -> (search, SemanticSendRefused(SemanticSendUnsupportedType, value))
+  }
+}
+
+fn send_layout_fields(
+  search: SemanticSendSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  identities: borrow SemanticSendableIdentities,
+  layout: SemanticDeclaredLayout,
+  scope: borrow SemanticSendScope,
+  offender: SemanticTypeId
+) -> (SemanticSendSearch, SemanticSendSummary) {
+  let mut state = search
+  let mut summary = send_yes_with(send_promotion())
+  match layout {
+    SemanticDeclaredRecordLayout(index) -> {
+      let count = match semantic_type_declared_record_field_count(declarations, index) {
+        Some(value) -> value
+        None -> return (state, SemanticSendRefused(SemanticSendUnknownNominal, offender))
+      }
+      let mut field: usize = 0
+      while field < count {
+        let field_type = match semantic_type_declared_record_field_type(
+          declarations,
+          index,
+          field
+        ) {
+          Some(value) -> value
+          None -> return (state, SemanticSendRefused(SemanticSendUnknownNominal, offender))
+        }
+        let (next, found) = send_type(
+          state,
+          types,
+          declarations,
+          identities,
+          scope,
+          field_type,
+          0
+        )
+        state = next
+        summary = send_join(summary, found)
+        field = field + 1
+      }
+    }
+    SemanticDeclaredVariantLayout(index) -> {
+      let cases = match semantic_type_declared_variant_case_count(declarations, index) {
+        Some(value) -> value
+        None -> return (state, SemanticSendRefused(SemanticSendUnknownNominal, offender))
+      }
+      let mut case: usize = 0
+      while case < cases {
+        let payloads = match semantic_type_declared_variant_payload_count(
+          declarations,
+          index,
+          case
+        ) {
+          Some(value) -> value
+          None -> return (state, SemanticSendRefused(SemanticSendUnknownNominal, offender))
+        }
+        let mut payload: usize = 0
+        while payload < payloads {
+          let payload_type = match semantic_type_declared_variant_payload_type(
+            declarations,
+            index,
+            case,
+            payload
+          ) {
+            Some(value) -> value
+            None -> return (state, SemanticSendRefused(SemanticSendUnknownNominal, offender))
+          }
+          let (next, found) = send_type(
+            state,
+            types,
+            declarations,
+            identities,
+            scope,
+            payload_type,
+            0
+          )
+          state = next
+          summary = send_join(summary, found)
+          payload = payload + 1
+        }
+        case = case + 1
+      }
+    }
+  }
+  (state, summary)
+}
+
+-- A declaration's fact over its own parameter positions. A layout already
+-- visited in this pass contributes its current approximation, so recursive
+-- data reads its previous iterate, starting from sendable.
+fn send_layout(
+  search: SemanticSendSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  identities: borrow SemanticSendableIdentities,
+  layout: SemanticDeclaredLayout,
+  offender: SemanticTypeId
+) -> (SemanticSendSearch, SemanticSendSummary) {
+  let key = send_layout_key(layout)
+  match search.settled.get(key) {
+    Some(summary) -> return (search, summary)
+    None -> nil
+  }
+  let approximation = match search.approximate.get(key) {
+    Some(summary) -> summary
+    None -> send_yes()
+  }
+  match search.visited.get(key) {
+    Some(_) -> return (search, approximation)
+    None -> nil
+  }
+  let variables = match semantic_type_declared_layout_target(declarations, layout) {
+    Some(template) -> send_template_variables(types, template)
+    None -> None<List<SemanticTypeVariable>>()
+  }
+  let scope = match variables {
+    Some(found) -> SemanticSendDeclaration(found)
+    None -> return (search, SemanticSendRefused(SemanticSendUnknownNominal, offender))
+  }
+  let { settled, approximate, visited, changed } = search
+  let marked = SemanticSendSearch {
+    settled: settled,
+    approximate: approximate,
+    visited: visited.insert(key, true),
+    changed: changed
+  }
+  let (state, summary) = send_layout_fields(
+    marked,
+    types,
+    declarations,
+    identities,
+    layout,
+    scope,
+    offender
+  )
+  if send_summary_eq(summary, approximation) { (state, summary) }
+  else {
+    let { settled, approximate, visited, changed: _ } = state
+    (
+      SemanticSendSearch {
+        settled: settled,
+        approximate: approximate.insert(key, summary),
+        visited: visited,
+        changed: true
+      },
+      summary
+    )
+  }
+}
+
+fn send_named(
+  search: SemanticSendSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  identities: borrow SemanticSendableIdentities,
+  scope: borrow SemanticSendScope,
+  value: SemanticTypeId,
+  declaration: DeclarationIdentity,
+  role: SemanticNamedRole,
+  representation: SemanticTypeId,
+  depth: usize
+) -> (SemanticSendSearch, SemanticSendSummary) {
+  match send_sealed_kind(identities, declaration) {
+    Some(SemanticSealedMutableContainer) -> (
+      search,
+      SemanticSendRefused(SemanticSendMutableState, value)
+    )
+    Some(SemanticSealedRuntimeToken) -> (
+      search,
+      SemanticSendRefused(SemanticSendRuntimeToken, value)
+    )
+    Some(SemanticSealedPersistentCollection) -> {
+      let (state, arguments) = send_arguments(
+        search,
+        types,
+        declarations,
+        identities,
+        scope,
+        value,
+        None<List<usize>>()
+      )
+      (state, send_with_needs(arguments, send_promotion()))
+    }
+    None -> {
+      match role {
+        SemanticPayloadlessVariantType -> (search, send_yes())
+        -- Opaque identity is a typing boundary, not a fact boundary: transport
+        -- follows the substituted representation, as layout does.
+        SemanticOpaqueType -> send_type(
+          search,
+          types,
+          declarations,
+          identities,
+          scope,
+          representation,
+          depth
+        )
+        SemanticNominalType -> {
+          let empty = semantic_type_substitution_empty()
+          let layout = match semantic_type_declaration_catalog_resolve(
+            types,
+            declarations,
+            value,
+            empty
+          ) {
+            SemanticRecordDeclarationLayoutMatched(index, _) -> SemanticDeclaredRecordLayout(
+              index
+            )
+            SemanticVariantDeclarationLayoutMatched(index, _) -> SemanticDeclaredVariantLayout(
+              index
+            )
+            SemanticTypeDeclarationLayoutMissing -> return (
+              search,
+              SemanticSendRefused(SemanticSendUnknownNominal, value)
+            )
+          }
+          match send_layout(search, types, declarations, identities, layout, value) {
+            (state, SemanticSendThrough(needs, positions)) -> {
+              let (state, arguments) = send_arguments(
+                state,
+                types,
+                declarations,
+                identities,
+                scope,
+                value,
+                Some(positions)
+              )
+              (state, send_with_needs(arguments, needs))
+            }
+            (state, summary) -> (state, summary)
+          }
+        }
+      }
+    }
+  }
+}
+
+fn send_pair(
+  search: SemanticSendSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  identities: borrow SemanticSendableIdentities,
+  scope: borrow SemanticSendScope,
+  left: SemanticTypeId,
+  right: SemanticTypeId,
+  depth: usize
+) -> (SemanticSendSearch, SemanticSendSummary) {
+  let (state, first) = send_type(search, types, declarations, identities, scope, left, depth)
+  let (state, second) = send_type(state, types, declarations, identities, scope, right, depth)
+  (state, send_join(first, second))
+}
+
+fn send_type(
+  search: SemanticSendSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  identities: borrow SemanticSendableIdentities,
+  scope: borrow SemanticSendScope,
+  value: SemanticTypeId,
+  depth: usize
+) -> (SemanticSendSearch, SemanticSendSummary) {
+  -- Graph structure is finite; the bound only guards a malformed graph.
+  if depth >= 256 { return (search, SemanticSendUnknown(SemanticSendUnsupportedType, value)) }
+  let graph = match types.graph_for(value) {
+    Some(found) -> found
+    None -> return (search, SemanticSendRefused(SemanticSendUnsupportedType, value))
+  }
+  let next = depth + 1
+  match semantic_type_graph_node(graph, value) {
+    SemanticBottomNode -> (search, send_yes())
+    SemanticTopNode -> (search, SemanticSendRefused(SemanticSendDynamic, value))
+    SemanticPrimitiveNode(primitive) -> match primitive {
+      SemanticStr -> (search, send_yes_with(send_promotion()))
+      _ -> (search, send_yes())
+    }
+    SemanticUnionNode(left, right) -> send_pair(
+      search,
+      types,
+      declarations,
+      identities,
+      scope,
+      left,
+      right,
+      next
+    )
+    SemanticIntersectionNode(left, right) -> send_pair(
+      search,
+      types,
+      declarations,
+      identities,
+      scope,
+      left,
+      right,
+      next
+    )
+    SemanticComplementNode(_) -> (search, SemanticSendUnknown(SemanticSendTypeEvidence, value))
+    SemanticContinuationNode(_, _) -> (
+      search,
+      SemanticSendRefused(SemanticSendContinuation, value)
+    )
+    SemanticWeakNode(inner) -> {
+      let (state, found) = send_type(search, types, declarations, identities, scope, inner, next)
+      (state, send_with_needs(found, send_promotion()))
+    }
+    SemanticRcNode(inner) -> {
+      let (state, found) = send_type(search, types, declarations, identities, scope, inner, next)
+      (state, send_with_needs(found, send_promotion()))
+    }
+    SemanticAtomicNode(inner) -> {
+      let (state, found) = send_type(search, types, declarations, identities, scope, inner, next)
+      (state, send_with_needs(found, send_promotion()))
+    }
+    SemanticUniqueNode(inner) -> send_type(
+      search,
+      types,
+      declarations,
+      identities,
+      scope,
+      inner,
+      next
+    )
+    SemanticOwnedNode(_) -> (search, SemanticSendRefused(SemanticSendOwnedResource, value))
+    SemanticPointerNode(_, _) -> (search, SemanticSendRefused(SemanticSendRawPointer, value))
+    SemanticBorrowNode(_, _) -> (search, SemanticSendRefused(SemanticSendUnsupportedType, value))
+    SemanticSliceNode(inner, mutability) -> match mutability {
+      SemanticMutable -> (search, SemanticSendRefused(SemanticSendMutableSlice, value))
+      SemanticImmutable -> {
+        let (state, found) = send_type(
+          search,
+          types,
+          declarations,
+          identities,
+          scope,
+          inner,
+          next
+        )
+        (
+          state,
+          send_with_needs(
+            found,
+            SemanticSendableNeeds { promotion: false, capture_proof: false, scoped_borrow: true }
+          )
+        )
+      }
+    }
+    SemanticArrayNode(inner, _) -> {
+      let (state, found) = send_type(search, types, declarations, identities, scope, inner, next)
+      (state, send_with_needs(found, send_promotion()))
+    }
+    SemanticFunctionNode(_, _, _) -> if semantic_function_is_pure(types, value) {
+      (
+        search,
+        send_yes_with(
+          SemanticSendableNeeds { promotion: false, capture_proof: true, scoped_borrow: false }
+        )
+      )
+    } else { (search, SemanticSendRefused(SemanticSendEffectfulFunction, value)) }
+    SemanticRecordNode(fields, _, openness) -> match openness {
+      SemanticOpenRecord -> (search, SemanticSendRefused(SemanticSendOpenRecord, value))
+      SemanticClosedRecord -> {
+        let records = semantic_type_graph_records_local(graph)
+        let mut state = search
+        let mut summary = send_yes()
+        let mut field: usize = 0
+        while field < semantic_type_record_field_count(records, fields) {
+          let edge = semantic_type_record_field_edge(records, fields, field)
+          let field_type = semantic_type_graph_record_field_type_id(graph, edge)
+          let (after, found) = send_type(
+            state,
+            types,
+            declarations,
+            identities,
+            scope,
+            field_type,
+            next
+          )
+          state = after
+          summary = send_join(summary, found)
+          field = field + 1
+        }
+        (state, summary)
+      }
+    }
+    SemanticNamedNode(declaration, role, representation, _) -> send_named(
+      search,
+      types,
+      declarations,
+      identities,
+      scope,
+      value,
+      declaration,
+      role,
+      representation,
+      next
+    )
+    SemanticVariantNode(_, parent) -> send_type(
+      search,
+      types,
+      declarations,
+      identities,
+      scope,
+      parent,
+      next
+    )
+    SemanticVariableNode(variable) -> match scope {
+      SemanticSendQuery(assumed) -> match send_variable_position(assumed, variable, 0) {
+        Some(_) -> (search, send_yes())
+        None -> (search, SemanticSendUnknown(SemanticSendTypeEvidence, value))
+      }
+      SemanticSendDeclaration(variables) -> match send_variable_position(variables, variable, 0) {
+        Some(position) -> (
+          search,
+          SemanticSendThrough(send_no_needs(), Nil<usize>().prepend(position))
+        )
+        None -> (search, SemanticSendUnknown(SemanticSendTypeEvidence, value))
+      }
+    }
+    _ -> (search, SemanticSendUnknown(SemanticSendTypeEvidence, value))
+  }
+}
+
+-- The Sendable fact of `value`. Rigid variables in `assumed` are proved by
+-- their lexical bound; any other variable still needs evidence.
+pub(package) fn semantic_type_sendability(
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  identities: borrow SemanticSendableIdentities,
+  assumed: List<SemanticTypeVariable>,
+  value: SemanticTypeId
+) -> SemanticSendability {
+  let scope = SemanticSendQuery(assumed)
+  let mut approximate = map.new<i64, SemanticSendSummary>()
+  loop {
+    let search = SemanticSendSearch {
+      settled: map.new<i64, SemanticSendSummary>(),
+      approximate: approximate,
+      visited: map.new<i64, bool>(),
+      changed: false
+    }
+    let (state, summary) = send_type(search, types, declarations, identities, scope, value, 0)
+    if not state.changed {
+      return match summary {
+        SemanticSendThrough(needs, _) -> SemanticSendable(needs)
+        SemanticSendUnknown(reason, offender) -> SemanticSendabilityUnknown(reason, offender)
+        SemanticSendRefused(reason, offender) -> SemanticNotSendable(reason, offender)
+      }
+    }
+    approximate = state.approximate
+  }
+}
+
+-- Whether a type alone proves Sendable: structurally sendable with no
+-- boundary work only a concrete value could discharge.
+pub(package) fn semantic_sendability_proved(fact: SemanticSendability) -> bool {
+  match fact {
+    SemanticSendable(needs) -> not needs.capture_proof and not needs.scoped_borrow
+    _ -> false
+  }
+}
