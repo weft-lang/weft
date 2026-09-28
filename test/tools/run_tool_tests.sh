@@ -1223,7 +1223,7 @@ for stdlib_doc_module in "${stdlib_doc_modules[@]}"; do
     assert_contains "doc_stdlib_diagnostic_schema_public_surface" "$(<"$tmp_out")" "Public API items: 62. Documented: 62."
     assert_contains "doc_stdlib_diagnostic_schema_finite_range" "$(<"$tmp_out")" "DiagnosticSourceRange(DiagnosticSource, usize, usize)"
   elif [ "$stdlib_doc_name" = "diagnostic/registry" ]; then
-    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 58. Documented: 58."
+    assert_contains "doc_stdlib_diagnostic_registry_surface" "$(<"$tmp_out")" "Public API items: 59. Documented: 59."
     assert_contains "doc_stdlib_diagnostic_registry_missing_source" "$(<"$tmp_out")" "pub fn module_source_unavailable() -> DiagnosticCode"
     assert_contains "doc_stdlib_diagnostic_registry_length" "$(<"$tmp_out")" "pub fn len() -> usize"
     assert_contains "doc_stdlib_diagnostic_registry_lookup" "$(<"$tmp_out")" "pub fn get(index: usize) -> Option<DiagnosticRegistryEntry>"
@@ -1576,6 +1576,38 @@ run_weft_compile_guarded "$WEFT" run "$run_self_source" < /dev/null > "$tmp_out"
 run_self_path=$(<"$tmp_out")
 assert_contains "run_product_runs_from_private_temporary" "$run_self_path" "/tmp/weft-exec-"
 assert_equals "run_removes_temporary_executable" "$(test -e "$run_self_path"; echo $?)" "1"
+
+# A strict program built into an executable reads its arguments through Env,
+# so its entry point declares no parameters. Checking alone is unaffected.
+strict_entry_source="$tmp_scratch_dir/strict_entry.weft"
+printf 'fn main(argc: i64, argv: i64) -> i64 { argc }\n' > "$strict_entry_source"
+for strict_entry_command in build run compile; do
+  set +e
+  if [ "$strict_entry_command" = build ]; then
+    run_weft_compile_guarded "$WEFT" build "$strict_entry_source" -o "$tmp_scratch_dir/strict_entry_product" > "$tmp_out" 2> "$tmp_err"
+  elif [ "$strict_entry_command" = run ]; then
+    run_weft_compile_guarded "$WEFT" run "$strict_entry_source" < /dev/null > "$tmp_out" 2> "$tmp_err"
+  else
+    run_weft_compile_guarded "$WEFT" compile "$strict_entry_source" > "$tmp_out" 2> "$tmp_err"
+  fi
+  strict_entry_status=$?
+  set -e
+  assert_equals "${strict_entry_command}_refuses_strict_entry_parameters_status" "$strict_entry_status" "1"
+  assert_contains "${strict_entry_command}_refuses_strict_entry_parameters" "$(<"$tmp_err")" "error[E1013]: the entry point \`main\` of a strict program takes no parameters"
+done
+set +e
+run_weft_compile_guarded "$WEFT" check "$strict_entry_source" > "$tmp_out" 2> "$tmp_err"
+strict_entry_check_status=$?
+set -e
+assert_equals "check_accepts_main_with_parameters" "$strict_entry_check_status" "0"
+strict_entry_program="$tmp_scratch_dir/strict_entry_program.weft"
+printf -- '-- Expected exit code: 0\nfn main(argc: i64) -> i64 { 0 }\n' > "$strict_entry_program"
+set +e
+run_weft_compile_guarded "$WEFT" test "$strict_entry_program" < /dev/null > "$tmp_out" 2> "$tmp_err"
+strict_entry_test_status=$?
+set -e
+assert_equals "test_refuses_strict_program_entry_parameters_status" "$strict_entry_test_status" "1"
+assert_contains "test_refuses_strict_program_entry_parameters" "$(<"$tmp_err")$(<"$tmp_out")" "error[E1013]"
 
 project_init_out=$(cd "$tmp_project_target_dir" && "$WEFT_ABS" pkg init project 2>&1)
 assert_contains "project_target_init_writes_manifest" "$project_init_out" "pkg: wrote weft.pkg"
