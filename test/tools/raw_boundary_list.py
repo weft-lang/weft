@@ -21,7 +21,7 @@ import sys
 
 # Lower this with every entry that leaves the list. Never raise it: strict code
 # that needs raw memory it does not reach today needs an honest trusted leaf.
-CEILING = 469
+CEILING = 468
 
 POLICY = "compiler/source/raw_boundary.weft"
 TRUST = "compiler/source/trust.weft"

@@ -88,6 +88,8 @@ check_rejects staging_site_escaped_source test/negative/staging_site_escaped_sou
 check_rejects staging_site_computed_source test/negative/staging_site_computed_source.weft 'error[E1010]:' 1
 check_rejects staging_site_through_lambda test/negative/staging_site_through_lambda.weft 'error[E1010]:' 1
 check_rejects raw_boundary_named_member test/negative/raw_boundary_named_member.weft "error[E4008]: import 'mem_load64_at' reaches raw memory" 1
+check_rejects raw_boundary_startup_environment test/negative/raw_boundary_startup_environment.weft "error[E4008]: import 'runtime_env_startup_environment' reaches raw memory" 1
+check_rejects raw_boundary_process_leaf test/negative/raw_boundary_process_leaf.weft "error[E4008]: import 'runtime_proc_run_safe' reaches raw memory" 1
 check_rejects raw_boundary_module_alias test/negative/raw_boundary_module_alias.weft "error[E4008]: import 'buffer' reaches raw memory" 1
 check_rejects raw_boundary_wildcard test/negative/raw_boundary_wildcard.weft "error[E4008]: import 'runtime/alloc' reaches raw memory" 1
 check_rejects raw_boundary_function_value test/negative/raw_boundary_function_value.weft "error[E4008]: import 'memory' reaches raw memory" 1

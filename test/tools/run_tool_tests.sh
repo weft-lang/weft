@@ -773,7 +773,7 @@ stdlib_doc_modules=(
   stdlib/console.weft stdlib/file.weft stdlib/dir.weft stdlib/unicode.weft
   stdlib/test.weft stdlib/math.weft stdlib/time.weft
   stdlib/time/monotonic.weft stdlib/time/wall.weft
-  stdlib/time/sleep.weft stdlib/time/calendar.weft stdlib/env.weft
+  stdlib/time/sleep.weft stdlib/time/calendar.weft stdlib/env.weft stdlib/env/fixed.weft
   stdlib/process.weft
   stdlib/json.weft stdlib/random.weft
   stdlib/test/property.weft stdlib/test/property/protocol.weft
@@ -1527,8 +1527,8 @@ assert_equals "run_forwards_product_exit_status" "$run_exit" "42"
 assert_equals "run_product_stdout_is_inherited" "$(<"$tmp_out")" ""
 assert_equals "run_product_stderr_is_inherited" "$(<"$tmp_err")" ""
 
-# Products that read the argument vector install their platform handler from
-# it, so they live in listed fixtures rather than scratch files.
+# Products that install a runtime platform handler through an alias live in
+# listed fixtures: strict scratch files may not alias a trusted runtime module.
 run_args_source="test/fixtures/run_product/arguments.weft"
 run_weft_compile_guarded "$WEFT" run "$run_args_source" -- alpha "two words" > "$tmp_out" 2> "$tmp_err"
 assert_equals "run_forwards_exact_product_arguments_stdout" "$(<"$tmp_out")" ""

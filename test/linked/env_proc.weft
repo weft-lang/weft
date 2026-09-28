@@ -1,13 +1,19 @@
 -- test/linked/env_proc.weft — Env/Proc capability effects: real spawns
--- through the trusted platform handler, and handler mocks proving the
--- capabilities are ordinary effects that tests can intercept.
+-- through the trusted platform handlers, the fixed Env handler, and handler
+-- mocks proving the capabilities are ordinary effects that tests can
+-- intercept.
 
 use compiler/storage.{*}
-use runtime/alloc.{alloc_zeroed}
-use runtime/memory.{mem_copy, mem_store64_at}
+use test/linked_support/env_conformance.{
+  env_conformance_arguments,
+  env_conformance_check,
+  env_conformance_environment
+}
 use runtime/env as env_handler
 use runtime/process as process_handler
+use runtime/process_environment as child_environment
 use stdlib/env.{Env}
+use stdlib/env/fixed as fixed_env
 use stdlib/string.{*}
 use stdlib/list.{*}
 use stdlib/process.{*}
@@ -38,17 +44,80 @@ fn spawn_sh_exit(code_text: str) -[Proc]> i64 {
 }
 
 test "proc_platform_true_exits_zero" {
-  Test.assert_eq(with process_handler(2, env_fixture_argv()) { spawn_true() }, 0)
+  Test.assert_eq(with process_handler() { spawn_true() }, 0)
 }
 
 test "proc_platform_false_exits_one" {
-  Test.assert_eq(with process_handler(2, env_fixture_argv()) { spawn_false() }, 1)
+  Test.assert_eq(with process_handler() { spawn_false() }, 1)
 }
 
 test "proc_platform_sh_argument_marshalling" {
   -- The exit code round-trips through the marshalled -c argument, so a
   -- wrong char** layout cannot pass this.
-  Test.assert_eq(with process_handler(2, env_fixture_argv()) { spawn_sh_exit("42") }, 42)
+  Test.assert_eq(with process_handler() { spawn_sh_exit("42") }, 42)
+}
+
+-- The environment a child observes, one entry per line, as `env` prints it.
+fn observed_environment() -[Proc]> str {
+  match Proc.wait(Proc.spawn("/usr/bin/env", Nil<str>())) {
+    ProcCompleted(ProcExited(0), stdout_text, stderr_text) -> stdout_text
+    _ -> "<env failed>"
+  }
+}
+
+test "proc_explicit_environment_gives_children_exactly_its_entries" {
+  let entries = Cons<str>(
+    "WEFT_ENV_PRESENT=fixture",
+    Cons<str>(
+      "WEFT_ENV_EMPTY=",
+      Cons<str>("WEFT_ENV_DUP=first", Cons<str>("WEFT_ENV_DUP=second", Nil<str>()))
+    )
+  )
+  Test.assert_str_eq(
+    with child_environment(entries) { observed_environment() },
+    "WEFT_ENV_PRESENT=fixture\nWEFT_ENV_EMPTY=\nWEFT_ENV_DUP=first\nWEFT_ENV_DUP=second\n"
+  )
+}
+
+test "proc_explicit_empty_environment_gives_children_none" {
+  Test.assert_str_eq(with child_environment(Nil<str>()) { observed_environment() }, "")
+}
+
+test "proc_explicit_environment_governs_sessions_and_path_search" {
+  -- `sh` resolves `printenv` through the explicit PATH alone.
+  let entries = Cons<str>("PATH=/usr/bin:/bin", Cons<str>("WEFT_ENV_SESSION=seen", Nil<str>()))
+  let output = with child_environment(entries) {
+    let session = Proc.open_session(
+      "/bin/sh",
+      Cons<str>("-c", Cons<str>("printenv WEFT_ENV_SESSION", Nil<str>())),
+      __i64_to_usize(4096)
+    )
+    Proc.session_finish(session)
+  }
+  match output {
+    ProcCompleted(ProcExited(status), stdout_text, stderr_text) -> {
+      Test.assert_eq(status, 0)
+      Test.assert_str_eq(stdout_text, "seen\n")
+    }
+    _ -> Test.assert_eq(0, 1)
+  }
+}
+
+test "proc_explicit_environment_is_innermost_over_the_platform_handler" {
+  let seen = with process_handler() {
+    with child_environment(Cons<str>("WEFT_ENV_INNER=1", Nil<str>())) { observed_environment() }
+  }
+  Test.assert_str_eq(seen, "WEFT_ENV_INNER=1\n")
+}
+
+test "proc_platform_children_inherit_the_startup_environment" {
+  -- The test runner always starts roots with a search path.
+  let path = with env_handler() { Env.var("PATH") }
+  let inherited = with process_handler() { observed_environment() }
+  match path {
+    nil -> Test.assert_eq(0, 1)
+    value: str -> Test.assert_eq(str_contains(inherited, i"PATH={value}\n"), 1)
+  }
 }
 
 fn count_probe() -[Env]> i64 {
@@ -60,12 +129,6 @@ fn arg_len_probe(index: i64) -[Env]> i64 {
     nil -> 0 - 1
     value: str -> __str_len(value)
   }
-}
-
-fn env_fixture_cstr(value: str) -> i64 {
-  let result = alloc_zeroed(__str_len(value) + 1)
-  mem_copy(result, __str_ptr(value), __str_len(value))
-  result
 }
 
 test "env_mock_injects_arguments" {
@@ -86,24 +149,42 @@ test "env_mock_injects_arguments" {
   Test.assert_eq(missing, 0 - 1)
 }
 
-fn env_fixture_argv() -> i64 {
-  let argv = alloc_zeroed(56)
-  mem_store64_at(argv, 0, env_fixture_cstr("env-probe"))
-  mem_store64_at(argv, 8, env_fixture_cstr(""))
-  mem_store64_at(argv, 16, 0)
-  mem_store64_at(argv, 24, env_fixture_cstr("X"))
-  mem_store64_at(argv, 32, env_fixture_cstr("WEFT_ENV_PRESENT=fixture"))
-  mem_store64_at(argv, 40, env_fixture_cstr("WEFT_ENV_EMPTY="))
-  mem_store64_at(argv, 48, 0)
-  argv
+fn fixed_arguments() -> List<str> { Cons<str>("env-probe", Cons<str>("", Nil<str>())) }
+
+fn fixed_environment() -> List<str> {
+  Cons<str>("X", Cons<str>("WEFT_ENV_PRESENT=fixture", Cons<str>("WEFT_ENV_EMPTY=", Nil<str>())))
 }
 
-test "env_platform_distinguishes_empty_arguments_from_missing_indices" {
-  let argv = env_fixture_argv()
-  Test.assert_eq(with env_handler(2, argv) { arg_len_probe(0) }, 9)
-  Test.assert_eq(with env_handler(2, argv) { arg_len_probe(1) }, 0)
-  Test.assert_eq(with env_handler(2, argv) { arg_len_probe(2) }, 0 - 1)
-  Test.assert_eq(with env_handler(2, argv) { arg_len_probe(0 - 1) }, 0 - 1)
+test "env_fixed_reports_the_shared_contract_cases" {
+  Test.assert_eq(
+    with fixed_env(
+      Cons<str>("env-probe", env_conformance_arguments()),
+      env_conformance_environment()
+    ) {
+      env_conformance_check()
+    },
+    0
+  )
+}
+
+test "env_fixed_distinguishes_empty_arguments_from_missing_indices" {
+  Test.assert_eq(with fixed_env(fixed_arguments(), fixed_environment()) { count_probe() }, 2)
+  Test.assert_eq(with fixed_env(fixed_arguments(), fixed_environment()) { arg_len_probe(0) }, 9)
+  Test.assert_eq(with fixed_env(fixed_arguments(), fixed_environment()) { arg_len_probe(1) }, 0)
+  Test.assert_eq(
+    with fixed_env(fixed_arguments(), fixed_environment()) { arg_len_probe(2) },
+    0 - 1
+  )
+  Test.assert_eq(
+    with fixed_env(fixed_arguments(), fixed_environment()) { arg_len_probe(0 - 1) },
+    0 - 1
+  )
+}
+
+test "env_fixed_with_no_startup_reports_nothing" {
+  Test.assert_eq(with fixed_env(Nil<str>(), Nil<str>()) { count_probe() }, 0)
+  Test.assert_eq(with fixed_env(Nil<str>(), Nil<str>()) { arg_len_probe(0) }, 0 - 1)
+  Test.assert_eq(with fixed_env(Nil<str>(), Nil<str>()) { env_var_len("PATH") }, 0 - 1)
 }
 
 fn env_var_len(name: str) -[Env]> i64 {
@@ -113,31 +194,53 @@ fn env_var_len(name: str) -[Env]> i64 {
   }
 }
 
-test "env_platform_reads_present_variable" {
-  let len = with env_handler(2, env_fixture_argv()) {
-    env_var_len("WEFT_ENV_PRESENT")
-  }
-  Test.assert_eq(len, 7)
+test "env_fixed_reads_present_empty_and_missing_variables" {
+  Test.assert_eq(
+    with fixed_env(fixed_arguments(), fixed_environment()) { env_var_len("WEFT_ENV_PRESENT") },
+    7
+  )
+  Test.assert_eq(
+    with fixed_env(fixed_arguments(), fixed_environment()) { env_var_len("WEFT_ENV_EMPTY") },
+    0
+  )
+  Test.assert_eq(
+    with fixed_env(fixed_arguments(), fixed_environment()) {
+      env_var_len("WEFT_4I_DEFINITELY_MISSING_7C43F1")
+    },
+    0 - 1
+  )
 }
 
-test "env_platform_preserves_present_empty_variable" {
-  let len = with env_handler(2, env_fixture_argv()) {
-    env_var_len("WEFT_ENV_EMPTY")
-  }
-  Test.assert_eq(len, 0)
+test "env_fixed_rejects_empty_equals_and_nul_names" {
+  Test.assert_eq(
+    with fixed_env(fixed_arguments(), fixed_environment()) { env_var_len("") },
+    0 - 1
+  )
+  Test.assert_eq(
+    with fixed_env(fixed_arguments(), fixed_environment()) {
+      env_var_len("WEFT_ENV_PRESENT=fixture")
+    },
+    0 - 1
+  )
+  Test.assert_eq(
+    with fixed_env(Nil<str>(), Cons<str>("A\0B=1", Nil<str>())) { env_var_len("A\0B") },
+    0 - 1
+  )
 }
 
-test "env_platform_reports_missing_variable_as_nil" {
-  let len = with env_handler(2, env_fixture_argv()) {
-    env_var_len("WEFT_4I_DEFINITELY_MISSING_7C43F1")
-  }
-  Test.assert_eq(len, 0 - 1)
+test "env_platform_reads_the_recorded_startup_arguments" {
+  let count = with env_handler() { count_probe() }
+  Test.assert_true(count >= 1)
+  Test.assert_true(with env_handler() { arg_len_probe(0) } > 0)
+  Test.assert_eq(with env_handler() { arg_len_probe(count) }, 0 - 1)
+  Test.assert_eq(with env_handler() { arg_len_probe(0 - 1) }, 0 - 1)
 }
 
-test "env_platform_rejects_empty_and equals-containing names" {
-  let argv = env_fixture_argv()
-  Test.assert_eq(with env_handler(2, argv) { env_var_len("") }, 0 - 1)
-  Test.assert_eq(with env_handler(2, argv) { env_var_len("WEFT_ENV_PRESENT=fixture") }, 0 - 1)
+test "env_platform_rejects_empty_equals_and_nul_names" {
+  Test.assert_eq(with env_handler() { env_var_len("") }, 0 - 1)
+  Test.assert_eq(with env_handler() { env_var_len("PATH=/usr/bin") }, 0 - 1)
+  Test.assert_eq(with env_handler() { env_var_len("PATH\0") }, 0 - 1)
+  Test.assert_eq(with env_handler() { env_var_len("WEFT_4I_DEFINITELY_MISSING_7C43F1") }, 0 - 1)
 }
 
 fn env_var_mock_probe() -[Env]> i64 {
@@ -163,7 +266,17 @@ fn env_residual_probe() -[Env, EnvProbe]> i64 {
 }
 
 test "env_platform_handler_preserves_residual_effects" {
-  let got = handle with env_handler(2, env_fixture_argv()) {
+  let count = with env_handler() { count_probe() }
+  let got = handle with env_handler() {
+    env_residual_probe()
+  } {
+    EnvProbe.inspect(value) -> resume(value + 40)
+  }
+  Test.assert_eq(got, count + 40)
+}
+
+test "env_fixed_handler_preserves_residual_effects" {
+  let got = handle with fixed_env(fixed_arguments(), fixed_environment()) {
     env_residual_probe()
   } {
     EnvProbe.inspect(value) -> resume(value + 40)
