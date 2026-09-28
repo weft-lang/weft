@@ -1527,8 +1527,7 @@ assert_equals "run_forwards_product_exit_status" "$run_exit" "42"
 assert_equals "run_product_stdout_is_inherited" "$(<"$tmp_out")" ""
 assert_equals "run_product_stderr_is_inherited" "$(<"$tmp_err")" ""
 
-# Products that install a runtime platform handler through an alias live in
-# listed fixtures: strict scratch files may not alias a trusted runtime module.
+# Products that read their startup through the platform handlers.
 run_args_source="test/fixtures/run_product/arguments.weft"
 run_weft_compile_guarded "$WEFT" run "$run_args_source" -- alpha "two words" > "$tmp_out" 2> "$tmp_err"
 assert_equals "run_forwards_exact_product_arguments_stdout" "$(<"$tmp_out")" ""

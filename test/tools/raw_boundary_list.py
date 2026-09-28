@@ -2,10 +2,11 @@
 """The raw boundary's transitional list only shrinks.
 
 Every listed logical path must name an existing strict file that still reaches
-raw memory: it binds a trusted runtime module by wildcard or alias, names a
-trusted export outside that module's audited safe surface, or uses the
-__str_ptr/__str_len intrinsics. A file therefore leaves the list together with
-its last raw binding. The list must stay sorted and free of duplicates,
+raw memory: it binds a trusted runtime module by wildcard, names a trusted
+export outside that module's audited safe surface by selection or through a
+module alias, installs an unaudited handler of a trusted runtime module, or
+uses the __str_ptr/__str_len intrinsics. A file therefore leaves the list
+together with its last raw binding. The list must stay sorted and free of duplicates,
 because the compiler searches it by bisection. Its length is pinned to
 CEILING: an entry that leaves the list lowers the ceiling with it, and the
 ceiling never rises. Prints one summary line; exits nonzero on the first
@@ -21,7 +22,7 @@ import sys
 
 # Lower this with every entry that leaves the list. Never raise it: strict code
 # that needs raw memory it does not reach today needs an honest trusted leaf.
-CEILING = 468
+CEILING = 462
 
 POLICY = "compiler/source/raw_boundary.weft"
 TRUST = "compiler/source/trust.weft"
@@ -36,6 +37,11 @@ def listed_paths(source):
 
 def safe_exports(source):
     table = source.split("pub(package) fn raw_boundary_safe_export")[1]
+    return set(re.findall(r'"([^"]+)"', table.split("]", 1)[0]))
+
+
+def safe_handlers(source):
+    table = source.split("pub(package) fn raw_boundary_safe_handler")[1]
     return set(re.findall(r'"([^"]+)"', table.split("]", 1)[0]))
 
 
@@ -61,18 +67,33 @@ def trusted_root(path):
     return path in re.findall(r'"([^"]+\.weft)"', body)
 
 
-def reaches_raw_memory(text, trusted, safe):
+def alias_reaches_raw_memory(text, module, alias, safe, handlers):
+    """Each qualified use and handler installation through an alias is decided
+    on its own, as the checker decides it."""
+    for member in re.findall(r"\b" + re.escape(alias) + r"\.([A-Za-z_][A-Za-z0-9_]*)", text):
+        if module + "." + member not in safe:
+            return True
+    installs = r"(?:\bwith\s+|\bdefault\s+handler\s+)" + re.escape(alias) + r"\s*[<(]"
+    return re.search(installs, text) is not None and module not in handlers
+
+
+def reaches_raw_memory(text, trusted, safe, handlers):
     text = re.sub(r'r#"[\s\S]*?"#', '""', text)
     text = re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', text)
     text = re.sub(r"--[^\n]*", "", text)
     for match in re.finditer(
-        r"(?m)^\s*(?:pub(?:\(package\))? )?use ([a-z_]+/[a-z0-9_/]+)(\.\{([^}]*)\}|\s+as\s+\w+)?",
+        r"(?m)^\s*(?:pub(?:\(package\))? )?use ([a-z_]+/[a-z0-9_/]+)(\.\{([^}]*)\}|\s+as\s+(\w+))?",
         text,
     ):
         module = match.group(1)
         if module not in trusted:
             continue
         selection = match.group(3)
+        alias = match.group(4)
+        if alias is not None:
+            if alias_reaches_raw_memory(text, module, alias, safe, handlers):
+                return True
+            continue
         if selection is None or selection.strip() == "*":
             return True
         names = re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", re.sub(r"\bas\s+\w+", "", selection))
@@ -106,6 +127,7 @@ def main():
     source = open(POLICY, encoding="utf-8").read()
     paths = listed_paths(source)
     safe = safe_exports(source)
+    handlers = safe_handlers(source)
     trusted = trusted_modules()
     if "--compute" in sys.argv[1:]:
         for directory in SOURCE_ROOTS:
@@ -113,7 +135,7 @@ def main():
                 logical = logical_path(path)
                 if logical in trusted or trusted_root(path) or refused_by_design(logical):
                     continue
-                if reaches_raw_memory(open(path, encoding="utf-8").read(), trusted, safe):
+                if reaches_raw_memory(open(path, encoding="utf-8").read(), trusted, safe, handlers):
                     print(logical)
         return
     if not paths:
@@ -130,7 +152,7 @@ def main():
         text = source_text(path)
         if text is None:
             fail("listed path " + path + " has no source file")
-        if not reaches_raw_memory(text, trusted, safe):
+        if not reaches_raw_memory(text, trusted, safe, handlers):
             fail("listed path " + path + " no longer reaches raw memory; remove it")
     print("raw boundary list: sorted, and every entry still reaches raw memory")
 

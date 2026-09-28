@@ -90,20 +90,24 @@ check_rejects staging_site_through_lambda test/negative/staging_site_through_lam
 check_rejects raw_boundary_named_member test/negative/raw_boundary_named_member.weft "error[E4008]: import 'mem_load64_at' reaches raw memory" 1
 check_rejects raw_boundary_startup_environment test/negative/raw_boundary_startup_environment.weft "error[E4008]: import 'runtime_env_startup_environment' reaches raw memory" 1
 check_rejects raw_boundary_process_leaf test/negative/raw_boundary_process_leaf.weft "error[E4008]: import 'runtime_proc_run_safe' reaches raw memory" 1
-check_rejects raw_boundary_module_alias test/negative/raw_boundary_module_alias.weft "error[E4008]: import 'buffer' reaches raw memory" 1
+check_rejects raw_boundary_module_alias test/negative/raw_boundary_module_alias.weft "error[E4008]: module member 'buffer.buf_len' reaches raw memory" 1
 check_rejects raw_boundary_wildcard test/negative/raw_boundary_wildcard.weft "error[E4008]: import 'runtime/alloc' reaches raw memory" 1
-check_rejects raw_boundary_function_value test/negative/raw_boundary_function_value.weft "error[E4008]: import 'memory' reaches raw memory" 1
+check_rejects raw_boundary_function_value test/negative/raw_boundary_function_value.weft "error[E4008]: module member 'memory.mem_load8_at' reaches raw memory" 1
 check_rejects raw_boundary_reexport test/negative/raw_boundary_reexport.weft "error[E4008]: import 'mem_store8_at' reaches raw memory" 1
 check_rejects raw_boundary_through_wrapper test/negative/raw_boundary_through_wrapper.weft "raw_boundary_wrapper.weft: line 5, col 21: error[E4008]: import 'mem_load8_at' reaches raw memory" 1
 check_rejects raw_boundary_string_member test/negative/raw_boundary_string_member.weft "error[E4008]: import 'runtime_str_from_bytes_copy' reaches raw memory" 1
 check_rejects raw_boundary_string_wildcard test/negative/raw_boundary_string_wildcard.weft "error[E4008]: import 'runtime/string' reaches raw memory" 1
-check_rejects raw_boundary_string_alias test/negative/raw_boundary_string_alias.weft "error[E4008]: import 'text' reaches raw memory" 1
+check_rejects raw_boundary_string_alias test/negative/raw_boundary_string_alias.weft "error[E4008]: module member 'text.runtime_str_ptr' reaches raw memory" 1
 check_rejects raw_boundary_string_mixed_selection test/negative/raw_boundary_string_mixed_selection.weft "line 1, col 38: error[E4008]: import 'runtime_str_ptr' reaches raw memory" 1
 check_rejects raw_boundary_string_intrinsic test/negative/raw_boundary_string_intrinsic.weft "type error: string address intrinsics are sealed to trusted runtime/platform code" 1
 check_rejects raw_boundary_syscall_address test/negative/raw_boundary_syscall_address.weft "error[E4008]: import 'sys_write' reaches raw memory" 1
 check_rejects raw_boundary_storage_handle test/negative/raw_boundary_storage_handle.weft "error[E4008]: import 'vector_storage_data' reaches raw memory" 1
 check_rejects raw_boundary_trusted_wildcard test/negative/raw_boundary_trusted_wildcard.weft "error[E4008]: import 'runtime/tcp' reaches raw memory" 1
-check_rejects raw_boundary_trusted_alias test/negative/raw_boundary_trusted_alias.weft "error[E4008]: import 'descriptors' reaches raw memory" 1
+check_rejects raw_boundary_qualified_type test/negative/raw_boundary_qualified_type.weft "error[E4008]: module member 'process.RuntimeProcEnvironment' reaches raw memory" 1
+check_rejects raw_boundary_sealed_handler test/negative/raw_boundary_sealed_handler.weft "error[E4008]: handler of module 'probe' reaches raw memory" 1
+check_rejects raw_boundary_sealed_default_handler test/negative/raw_boundary_sealed_default_handler.weft "error[E4008]: handler of module 'probe' reaches raw memory" 1
+check_rejects raw_boundary_reexported_alias test/negative/raw_boundary_reexported_alias.weft "error[E4008]: module member 'alloc.alloc_zeroed' reaches raw memory" 1
+check_rejects env_handler_startup_arguments_retired test/negative/env_handler_startup_arguments_retired.weft "type error: handler constructor arity mismatch" 1
 check_rejects grammar_raw_source_requires_trust test/negative/grammar_raw_source_requires_trust.weft 'Unsafe is sealed to trusted runtime/platform code' 1
 check_rejects checked_grammar_impl_effect_identity test/negative/checked_grammar_impl_effect_identity.weft 'impl method effect mismatch' 1
 check_rejects checked_grammar_requires_host_effect test/negative/checked_grammar_requires_host_effect.weft 'error[E2001]: effect `TypeCheck<G.Identity>` is not available in this context' 1

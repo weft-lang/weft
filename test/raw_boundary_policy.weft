@@ -1,12 +1,17 @@
 -- The raw-memory boundary classifies raw modules and members, and decides
 -- which strict modules may bind or re-export them.
 
-use compiler/project/identity.{named_module_identity}
+use compiler/project/identity.{ValueDeclaration, named_module_identity}
 use compiler/source/input.{source_from_text}
 use compiler/source/raw_boundary.{*}
 use compiler/source/trust.{SourceAuthority, StrictSourceAuthority, TrustedSourceAuthority}
 use compiler/weft/check/registration/catalog as registration_catalog
 use compiler/weft/check/registration/catalog.{RegisteredModule}
+use compiler/weft/check/registration/handler.{
+  RegisteredHandlerImplementationSealed,
+  RegisteredHandlerSelected,
+  registration_scope_select_handler
+}
 use compiler/weft/check/registration/scope as registration_scope
 use compiler/weft/check/registration/scope.{
   RegistrationScope,
@@ -14,10 +19,16 @@ use compiler/weft/check/registration/scope.{
   ScopeImportRawMemory
 }
 use compiler/weft/grammar.{WeftParser, ParsedWeftSource}
+use runtime/descriptor_io as descriptors
+use runtime/dns as platform_dns
+use runtime/env as platform_env
+use runtime/rc as runtime_rc
+use runtime/string as runtime_string
 use runtime/string.{runtime_str_byte_at, runtime_str_len}
 use runtime/syscall.{sys_socket_af_inet}
 use runtime/terminal.{terminal_color_mode_always, terminal_color_policy}
 use stdlib/diagnostic.{Diagnose}
+use stdlib/env.{Env}
 use stdlib/grammar.{Grammar, Parsed}
 use stdlib/list as list
 use stdlib/list.{List, Nil, Cons}
@@ -36,6 +47,30 @@ test "only trusted modules under runtime form the raw ring" {
   Test.assert_false(raw_boundary_trusted_runtime(true, "stdlib/runtime/memory"))
   Test.assert_false(raw_boundary_trusted_runtime(true, "runtimes/memory"))
   Test.assert_false(raw_boundary_trusted_runtime(true, "runtime"))
+}
+
+test "only paths under runtime can hold ring code" {
+  Test.assert_true(raw_boundary_ring_path("runtime/env"))
+  Test.assert_true(raw_boundary_ring_path("runtime/"))
+  Test.assert_false(raw_boundary_ring_path("runtime"))
+  Test.assert_false(raw_boundary_ring_path("runtimes/env"))
+  Test.assert_false(raw_boundary_ring_path("stdlib/runtime/env"))
+  Test.assert_false(raw_boundary_ring_path(""))
+}
+
+test "strict code installs only audited runtime handlers" {
+  Test.assert_true(raw_boundary_safe_handler("runtime/dns"))
+  Test.assert_true(raw_boundary_safe_handler("runtime/env"))
+  Test.assert_true(raw_boundary_safe_handler("runtime/process"))
+  Test.assert_true(raw_boundary_safe_handler("runtime/process_environment"))
+  -- Unaudited handlers and near neighbours of audited paths are not safe.
+  Test.assert_false(raw_boundary_safe_handler("runtime/raw_boundary_probe_test"))
+  Test.assert_false(raw_boundary_safe_handler("runtime/proc"))
+  Test.assert_false(raw_boundary_safe_handler("runtime/processes"))
+  Test.assert_false(raw_boundary_safe_handler("runtime/env.Env"))
+  Test.assert_false(raw_boundary_safe_handler("runtime/dn"))
+  Test.assert_false(raw_boundary_safe_handler("runtime/process_environments"))
+  Test.assert_false(raw_boundary_safe_handler(""))
 }
 
 test "trusted exports are raw unless they belong to the audited safe surface" {
@@ -263,15 +298,16 @@ fn boundary_target(target: usize, trusted: bool) -[Test]> RegisteredModule {
 -- only a trusted runtime target's exports can be raw; a trusted importer is never
 -- refused, a strict re-export always is, and a strict private import is
 -- refused unless its path is listed. A refused selection reports each raw
--- member it names; a refused wildcard or module alias reports once.
+-- member it names and a refused wildcard reports once. A module alias binds
+-- no member, so it is never refused itself.
 fn boundary_expected_issues(case: BoundaryCase) -> usize {
   let zero: usize = 0
   let one: usize = 1
   let refused = if case.trusted { false } else if case.visibility > 0 { true } else {
     not case.listed
   }
-  if not refused or not case.target_trusted or case.target == 2 { return zero }
-  if case.form != 0 { return one }
+  if not refused or not case.target_trusted or case.target == 2 or case.form == 2 { return zero }
+  if case.form == 1 { return one }
   let mut count: usize = 0
   let mut index: usize = 0
   while index < 8 {
@@ -281,6 +317,39 @@ fn boundary_expected_issues(case: BoundaryCase) -> usize {
     index = index + 1
   }
   count
+}
+
+-- A use through a module alias is decided in the module that makes it, whatever
+-- the alias's own visibility: only trusted and listed importers may reach raw
+-- members.
+fn boundary_expected_sealed(case: BoundaryCase, index: usize) -> bool {
+  not case.trusted and not case.listed and case.target_trusted and case.target != 2 and
+    (case.target != 0 or index % 2 == 0)
+}
+
+fn boundary_qualified_uses_follow_policy(
+  case: BoundaryCase,
+  scope: RegistrationScope,
+  importer: RegisteredModule
+) -> bool {
+  if case.form != 2 { return true }
+  let mut index: usize = 0
+  while index < 8 {
+    let found = registration_scope.registration_scope_lookup_qualified_declaration(
+      scope,
+      importer.identity,
+      "boundary_module",
+      ValueDeclaration,
+      boundary_member(index)
+    )
+    let sealed = match found {
+      Some(_) -> false
+      None -> true
+    }
+    if sealed != boundary_expected_sealed(case, index) { return false }
+    index = index + 1
+  }
+  true
 }
 
 fn boundary_raw_issues(scope: RegistrationScope) -> usize {
@@ -318,10 +387,11 @@ fn boundary_refusals_follow_policy(draws: List<usize>) -[Test]> bool {
   let scope = registration_scope.registration_scope_build(list.from_slice(modules[..]), edges)
   let raw = boundary_raw_issues(scope)
   raw == boundary_expected_issues(case) and
-    registration_scope.registration_scope_issue_count(scope) == raw
+    registration_scope.registration_scope_issue_count(scope) == raw and
+    boundary_qualified_uses_follow_policy(case, scope, importer)
 }
 
-test "generated imports are refused exactly where the raw boundary policy says" {
+test "generated imports and qualified uses are refused exactly where the policy says" {
   let draw = prop.usize_below(256).expect("the draw domain is nonempty")
   let lengths = prop.lengths(8, 8).expect("a case takes eight draws")
   let config = prop.config(random.seed(0x5241574252445259), 300, 16, 0, 200).expect(
@@ -338,4 +408,100 @@ test "unlisted strict code keeps the safe runtime string members" {
 test "unlisted strict code binds audited safe exports of trusted modules" {
   Test.assert_eq(terminal_color_policy(0, terminal_color_mode_always()), 1)
   Test.assert_eq(sys_socket_af_inet(), 2)
+}
+
+-- A handler module at `path`, trusted or strict, and a module that installs its
+-- handler through an alias.
+fn handler_seal_case(
+  importer_authority: SourceAuthority,
+  importer_path: str,
+  target_trusted: bool,
+  path: str
+) -[Test]> bool {
+  let target = boundary_module(
+    "pub effect Probe { fn value() -> i64 } pub implements Probe() { Probe.value() -> resume(1) }",
+    path,
+    if target_trusted { TrustedSourceAuthority } else { StrictSourceAuthority }
+  )
+  let text = str_concat("use ", str_concat(path, " as probe fn main() -> i64 { 0 }"))
+  let importer = boundary_module(text, importer_path, importer_authority)
+  let edges = importer.syntax.imports.map<ResolvedImport>(
+    declaration => registration_scope.resolved_import(
+      importer,
+      declaration,
+      target.identity,
+      false
+    )
+  )
+  let modules = [importer, target]
+  let scope = registration_scope.registration_scope_build(list.from_slice(modules[..]), edges)
+  -- The alias follows "use <path> as ".
+  let alias_start = str_len(path) + 8
+  let alias = match importer.source.span(
+    __i64_to_usize(alias_start),
+    __i64_to_usize(alias_start + 5)
+  ) {
+    Some(span) -> span
+    None -> panic("the generated alias span is in bounds")
+  }
+  let sealed = registration_scope.registration_scope_handler_sealed(
+    scope,
+    importer.identity,
+    target.identity
+  )
+  let selected = match registration_scope_select_handler(scope, importer.identity, alias) {
+    RegisteredHandlerSelected(_, _) -> 1
+    RegisteredHandlerImplementationSealed -> 2
+    _ -> 3
+  }
+  Test.assert_eq(
+    registration_scope.registration_scope_issue_count(scope).to_u64().to_i64_checked().unwrap(),
+    0
+  )
+  Test.assert_eq(selected, if sealed { 2 } else { 1 })
+  sealed
+}
+
+test "handler installations through aliases are sealed exactly where the policy says" {
+  let paths = ["runtime/dns", "runtime/raw_boundary_probe_test", "stdlib/handler_probe"]
+  let importers = [
+    (TrustedSourceAuthority, "runtime/rc"),
+    (StrictSourceAuthority, "compiler/pipeline"),
+    (StrictSourceAuthority, "test/handler_probe")
+  ]
+  let mut path_index: usize = 0
+  while path_index < paths.len {
+    let mut importer_index: usize = 0
+    while importer_index < importers.len {
+      match importers[importer_index] {
+        (authority, importer_path) -> {
+          for target_trusted in [false, true] {
+            -- Only an unlisted strict importer installing an unaudited handler
+            -- of a trusted runtime module is sealed.
+            let expected = importer_index == 2 and target_trusted and path_index == 1
+            Test.assert_eq(
+              if handler_seal_case(authority, importer_path, target_trusted, paths[path_index]) {
+                1
+              } else { 0 },
+              if expected { 1 } else { 0 }
+            )
+          }
+        }
+      }
+      importer_index = importer_index + 1
+    }
+    path_index = path_index + 1
+  }
+}
+
+test "unlisted strict code uses audited safe members through module aliases" {
+  Test.assert_eq(runtime_string.runtime_str_len("boundary"), 8)
+  Test.assert_lt(descriptors.descriptor_close(0 - 1), 0)
+  let identity: runtime_rc.RuntimeIdentity = runtime_rc.rc_identity_new()
+  Test.assert_true(runtime_rc.rc_identity_equal(identity, identity))
+}
+
+test "unlisted strict code installs audited runtime handlers through module aliases" {
+  Test.assert_ge(with platform_env() { Env.arg_count() }, 1)
+  Test.assert_eq(with platform_dns() { 7 }, 7)
 }

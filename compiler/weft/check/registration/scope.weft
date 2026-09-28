@@ -129,6 +129,9 @@ pub(package) type ScopeLookup {
 pub(package) type QualifiedScopeLookup {
   QualifiedScopeResolved(ScopeCandidate),
   QualifiedScopeInvisible(ScopeCandidate),
+  --- A raw member of a trusted runtime module, used from strict code outside
+  --- the raw boundary's allowance.
+  QualifiedScopeSealed(ScopeCandidate),
   QualifiedScopeAmbiguous(ScopeCandidate, Option<ScopeCandidate>),
   QualifiedScopeMissing
 }
@@ -613,19 +616,93 @@ fn authority_trusted(authority: SourceAuthority) -> bool {
   }
 }
 
-fn raw_import(edge: ResolvedImport, importer_trusted: bool, target_trusted: bool) -> RawImport {
+fn raw_access(
+  importer: ModuleIdentity,
+  importer_trusted: bool,
+  reexported: bool,
+  target_trusted: bool
+) -> RawImport {
   RawImport {
     refusable: raw_boundary_import_refused(
       importer_trusted,
-      module_logical_path(edge.importer),
-      visibility_rank(edge.visibility) > 0
+      module_logical_path(importer),
+      reexported
     ),
     target_trusted: target_trusted
   }
 }
 
--- Whether the boundary refuses a candidate: a trusted module bound under a
--- name, or a trusted export outside its module's safe surface. A strict module
+fn raw_import(edge: ResolvedImport, importer_trusted: bool, target_trusted: bool) -> RawImport {
+  raw_access(
+    edge.importer,
+    importer_trusted,
+    visibility_rank(edge.visibility) > 0,
+    target_trusted
+  )
+}
+
+-- The raw boundary's view of a use in `caller` of something reached through a
+-- qualifier naming `target`. The use itself is decided, never the alias that
+-- names the module. Only modules under runtime/ can be ring code, so any other
+-- target is decided from its path without consulting authorities.
+fn raw_use(
+  scope: borrow RegistrationScope,
+  caller: ModuleIdentity,
+  target: ModuleIdentity
+) -> RawImport {
+  let target_path = module_logical_path(target)
+  if not raw_boundary_ring_path(target_path) {
+    return RawImport { refusable: false, target_trusted: false }
+  }
+  match scope {
+    RegistrationScope((modules, _, _, _, _)) -> {
+      let caller_index = persistent_module_index(modules, caller)
+      let target_index = persistent_module_index(modules, target)
+      -- A qualifier that resolved names registered modules; anything else is
+      -- refused rather than trusted.
+      if caller_index < 0 or target_index < 0 {
+        return RawImport { refusable: true, target_trusted: true }
+      }
+      raw_access(
+        caller,
+        authority_trusted(
+          persistent_get_in_bounds<RegisteredModule>(modules, caller_index).authority
+        ),
+        false,
+        raw_boundary_trusted_runtime(
+          authority_trusted(
+            persistent_get_in_bounds<RegisteredModule>(modules, target_index).authority
+          ),
+          target_path
+        )
+      )
+    }
+  }
+}
+
+fn qualified_member_sealed(
+  scope: borrow RegistrationScope,
+  caller: ModuleIdentity,
+  target: ModuleIdentity,
+  member: ScopeCandidate
+) -> bool {
+  raw_import_refuses(raw_use(scope, caller, target), member)
+}
+
+--- Whether strict `caller` may not install the handler implementation of
+--- `target`: a trusted runtime module whose handler is not audited safe.
+pub(package) fn registration_scope_handler_sealed(
+  scope: borrow RegistrationScope,
+  caller: ModuleIdentity,
+  target: ModuleIdentity
+) -> bool {
+  let raw = raw_use(scope, caller, target)
+  raw.refusable and raw.target_trusted and
+    not raw_boundary_safe_handler(module_logical_path(target))
+}
+
+-- Whether the boundary refuses a candidate: a trusted module reached as a
+-- member, or a trusted export outside its module's safe surface. A strict module
 -- re-exports only safe exports, so a declaration re-exported through the
 -- target keeps the safe surface of the module that declared it.
 fn raw_import_refuses(raw: RawImport, candidate: ScopeCandidate) -> bool {
@@ -839,29 +916,19 @@ fn add_import(
   raw: RawImport
 ) -> nil {
   match edge.binding {
-    ResolvedModuleImport(alias) -> if raw.refusable and raw.target_trusted {
-      add_issue(
-        issues,
-        edge,
-        required_text(alias),
-        ScopeImportRawMemory,
-        Some(alias),
-        None,
-        None
-      )
-    } else {
-      add_binding(
-        entries,
-        edge.importer,
-        required_text(alias),
-        ScopeCandidate {
-          target: ScopeModuleTarget(edge.target),
-          visibility: edge.visibility,
-          weak: edge.weak,
-          origin: Some(alias)
-        }
-      )
-    }
+    -- An alias binds no member, so each use through it is decided where it
+    -- is made.
+    ResolvedModuleImport(alias) -> add_binding(
+      entries,
+      edge.importer,
+      required_text(alias),
+      ScopeCandidate {
+        target: ScopeModuleTarget(edge.target),
+        visibility: edge.visibility,
+        weak: edge.weak,
+        origin: Some(alias)
+      }
+    )
     ResolvedSymbolImport(selections) -> for selection in selections {
       match selection {
         ResolvedImportWildcard -> add_wildcard_import(
@@ -1349,9 +1416,11 @@ pub(package) fn registration_scope_lookup_qualified_span(
         ScopeNameMissing -> QualifiedScopeMissing
         ScopeNameAmbiguous(primary, conflict) ->
           QualifiedScopeAmbiguous(primary, conflict)
-        ScopeNameResolved(member) -> if candidate_visible_from(member, target, caller) {
-          QualifiedScopeResolved(member)
-        } else { QualifiedScopeInvisible(member) }
+        ScopeNameResolved(member) -> if not candidate_visible_from(member, target, caller) {
+          QualifiedScopeInvisible(member)
+        } else if qualified_member_sealed(scope, caller, target, member) {
+          QualifiedScopeSealed(member)
+        } else { QualifiedScopeResolved(member) }
       }
       _ -> QualifiedScopeMissing
     }
@@ -1398,6 +1467,7 @@ pub(package) fn registration_scope_declaration_from_lookup(
 }
 
 pub(package) fn registration_scope_qualified_from_lookup(
+  scope: borrow RegistrationScope,
   lookup: ScopeLookup,
   target: ModuleIdentity,
   caller: ModuleIdentity
@@ -1405,13 +1475,16 @@ pub(package) fn registration_scope_qualified_from_lookup(
   match lookup {
     ScopeNameMissing -> QualifiedScopeMissing
     ScopeNameAmbiguous(primary, conflict) -> QualifiedScopeAmbiguous(primary, conflict)
-    ScopeNameResolved(candidate) -> if candidate_visible_from(candidate, target, caller) {
-      QualifiedScopeResolved(candidate)
-    } else { QualifiedScopeInvisible(candidate) }
+    ScopeNameResolved(candidate) -> if not candidate_visible_from(candidate, target, caller) {
+      QualifiedScopeInvisible(candidate)
+    } else if qualified_member_sealed(scope, caller, target, candidate) {
+      QualifiedScopeSealed(candidate)
+    } else { QualifiedScopeResolved(candidate) }
   }
 }
 
 pub(package) fn registration_scope_qualified_declaration_from_lookup(
+  scope: borrow RegistrationScope,
   lookup: ScopeLookup,
   namespace: DeclarationNamespace,
   target: ModuleIdentity,
@@ -1446,9 +1519,10 @@ pub(package) fn registration_scope_qualified_declaration_from_lookup(
     } else { None<(RegisteredName, ScopeCandidate)>() }
   }
   match selected {
-    Some((name, declaration)) -> if candidate_visible_from(declaration, target, caller) {
-      Some(name)
-    } else { None<RegisteredName>() }
+    Some((name, declaration)) -> if candidate_visible_from(declaration, target, caller) and
+      not qualified_member_sealed(scope, caller, target, declaration) {
+        Some(name)
+      } else { None<RegisteredName>() }
     None -> None<RegisteredName>()
   }
 }
@@ -1487,6 +1561,7 @@ pub(package) fn registration_scope_lookup_qualified_declaration(
   match registration_scope_lookup(scope, caller, qualifier) {
     ScopeNameResolved(candidate) -> match candidate.target {
       ScopeModuleTarget(target) -> registration_scope_qualified_declaration_from_lookup(
+        scope,
         registration_scope_lookup(scope, target, spelling),
         namespace,
         target,
@@ -1508,6 +1583,7 @@ pub(package) fn registration_scope_lookup_qualified_declaration_span(
   match registration_scope_lookup_span(scope, caller, qualifier) {
     ScopeNameResolved(candidate) -> match candidate.target {
       ScopeModuleTarget(target) -> registration_scope_qualified_declaration_from_lookup(
+        scope,
         registration_scope_lookup_span(scope, target, spelling),
         namespace,
         target,
