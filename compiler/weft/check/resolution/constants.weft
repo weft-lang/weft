@@ -47,6 +47,11 @@ use compiler/types/graph/catalog.{SemanticTypeCatalog}
 use compiler/types/graph/subtyping.{semantic_primitive_subtype}
 use compiler/weft/check/body/extent.{checked_authored_extent}
 use compiler/weft/check/body/graph.{CheckedSourceRange}
+use compiler/weft/check/literal.{
+  checked_integer_literal_fits,
+  checked_integer_literal_magnitude,
+  checked_negated_integer_literal
+}
 use compiler/weft/check/registration/catalog.{
   RegisteredConstant,
   RegisteredConstantDeclaration,
@@ -68,7 +73,7 @@ use compiler/weft/check/semantic_types.{
   semantic_type_product_catalog
 }
 use compiler/weft/check/storage.{dense_index}
-use compiler/weft/syntax/numeric.{numeric_float_literal_value}
+use compiler/weft/syntax/numeric.{IntegerMagnitude, numeric_float_literal_value}
 use stdlib/list.{Cons, List, Nil}
 use stdlib/option.{None, Option, Some}
 use stdlib/source.{Source}
@@ -122,7 +127,10 @@ pub(package) type SemanticConstantIssue {
     SemanticPrimitive,
     CheckedSourceRange
   ),
-  SemanticConstantTypeRejected(DeclarationIdentity, SemanticTypeResolutionIssue)
+  SemanticConstantTypeRejected(DeclarationIdentity, SemanticTypeResolutionIssue),
+  -- An integer literal whose authored magnitude the primitive it meets
+  -- cannot hold.
+  SemanticConstantLiteralOutOfRange(DeclarationIdentity, SemanticPrimitive, CheckedSourceRange)
 }
 
 pub(package) type SemanticConstantsResolution {
@@ -143,7 +151,7 @@ type SemanticConstantContext {
 -- An initializer's value. An unsuffixed literal takes the type of the
 -- annotation it meets; every other value already has its primitive.
 type SemanticConstantOperand {
-  SemanticIntegerLiteralOperand(i64),
+  SemanticIntegerLiteralOperand(i64, IntegerMagnitude),
   SemanticFloatLiteralOperand(Source, i64, i64),
   SemanticTypedOperand(SemanticPrimitive, SemanticConstantValue)
 }
@@ -170,6 +178,7 @@ type SemanticConstantPrimitiveResult {
 type SemanticConstantAdmission {
   SemanticConstantAdmitted(SemanticConstantValue),
   SemanticConstantOutsideAnnotation(SemanticPrimitive),
+  SemanticConstantBeyondAnnotation,
   SemanticConstantUnrepresentable
 }
 
@@ -360,6 +369,14 @@ fn semantic_constant_resolve(
                     semantic_constant_range(entry, initializer)
                   )
                 )
+                SemanticConstantBeyondAnnotation -> SemanticConstantFailed(
+                  product,
+                  SemanticConstantLiteralOutOfRange(
+                    identity,
+                    primitive,
+                    semantic_constant_range(entry, initializer)
+                  )
+                )
                 SemanticConstantUnrepresentable -> SemanticConstantFailed(
                   product,
                   SemanticConstantRefused(
@@ -438,9 +455,13 @@ fn semantic_constant_admit(
   annotation: SemanticPrimitive
 ) -> SemanticConstantAdmission {
   match operand {
-    SemanticIntegerLiteralOperand(value) -> if semantic_integer_primitive(annotation) {
+    SemanticIntegerLiteralOperand(value, magnitude) -> if not semantic_integer_primitive(
+      annotation
+    ) {
+      SemanticConstantOutsideAnnotation(SemanticI64)
+    } else if checked_integer_literal_fits(annotation, magnitude, false) {
       SemanticConstantAdmitted(SemanticConstantInteger(value))
-    } else { SemanticConstantOutsideAnnotation(SemanticI64) }
+    } else { SemanticConstantBeyondAnnotation }
     SemanticFloatLiteralOperand(source, start, length) -> {
       let float32 = match annotation {
         SemanticF32 -> Some(true)
@@ -615,10 +636,13 @@ fn semantic_constant_operand(
   expression: Expr
 ) -> SemanticConstantOperandResult {
   match expression {
-    IntLit(value, _, _) -> SemanticConstantOperandEvaluated(
+    IntLit(value, start, length) -> SemanticConstantOperandEvaluated(
       product,
       resolved,
-      SemanticIntegerLiteralOperand(value)
+      SemanticIntegerLiteralOperand(
+        value,
+        checked_integer_literal_magnitude(entry.module.source, value, start, length)
+      )
     )
     FloatLit(start, length, _) -> SemanticConstantOperandEvaluated(
       product,
@@ -691,17 +715,36 @@ fn semantic_constant_operand(
         expression
       )
     }
-    BinOp(operator, left, right) -> semantic_constant_binary(
-      product,
-      context,
-      resolved,
-      visiting,
-      entry,
-      expression,
-      operator,
-      left,
-      right
-    )
+    BinOp(operator, left, right) -> match checked_negated_integer_literal(expression) {
+      -- A negated literal is its negative magnitude as an `i64`.
+      Some((value, start, length)) -> if checked_integer_literal_fits(
+        SemanticI64,
+        checked_integer_literal_magnitude(entry.module.source, value, start, length),
+        true
+      ) {
+        semantic_typed_operand(product, resolved, SemanticI64, SemanticConstantInteger(0 - value))
+      } else {
+        SemanticConstantOperandFailed(
+          product,
+          SemanticConstantLiteralOutOfRange(
+            entry.constant.name.identity,
+            SemanticI64,
+            semantic_constant_range(entry, expression)
+          )
+        )
+      }
+      None -> semantic_constant_binary(
+        product,
+        context,
+        resolved,
+        visiting,
+        entry,
+        expression,
+        operator,
+        left,
+        right
+      )
+    }
     -- Negation is the audited `0 - operand`.
     Negate(operand, _) -> semantic_constant_binary(
       product,
@@ -725,7 +768,7 @@ fn semantic_constant_operand(
 
 fn semantic_operand_i64(operand: SemanticConstantOperand) -> Option<i64> {
   match operand {
-    SemanticIntegerLiteralOperand(value) -> Some(value)
+    SemanticIntegerLiteralOperand(value, _) -> Some(value)
     SemanticTypedOperand(SemanticI64, SemanticConstantInteger(value)) -> Some(value)
     _ -> None<i64>()
   }
@@ -795,19 +838,53 @@ fn semantic_constant_binary(
         issue
       )
       SemanticConstantOperandEvaluated(product, resolved, rhs) ->
-        match semantic_constant_apply(operator, lhs, rhs) {
-          Some(value) -> SemanticConstantOperandEvaluated(product, resolved, value)
-          None -> semantic_constant_refused(
+        if not semantic_literal_fits_i64(
+          lhs
+        ) {
+          SemanticConstantOperandFailed(
             product,
-            entry,
-            match operator {
-              4 -> SemanticConstantOperatorUnaudited
-              11 -> SemanticConstantOperatorUnaudited
-              _ -> SemanticConstantOperatorRefused
-            },
-            expression
+            SemanticConstantLiteralOutOfRange(
+              entry.constant.name.identity,
+              SemanticI64,
+              semantic_constant_range(entry, left)
+            )
           )
+        } else if not semantic_literal_fits_i64(rhs) {
+          SemanticConstantOperandFailed(
+            product,
+            SemanticConstantLiteralOutOfRange(
+              entry.constant.name.identity,
+              SemanticI64,
+              semantic_constant_range(entry, right)
+            )
+          )
+        } else {
+          match semantic_constant_apply(operator, lhs, rhs) {
+            Some(value) -> SemanticConstantOperandEvaluated(product, resolved, value)
+            None -> semantic_constant_refused(
+              product,
+              entry,
+              match operator {
+                4 -> SemanticConstantOperatorUnaudited
+                11 -> SemanticConstantOperatorUnaudited
+                _ -> SemanticConstantOperatorRefused
+              },
+              expression
+            )
+          }
         }
     }
+  }
+}
+
+-- An unsuffixed literal meeting the audited `i64` operators is an `i64`.
+fn semantic_literal_fits_i64(operand: SemanticConstantOperand) -> bool {
+  match operand {
+    SemanticIntegerLiteralOperand(_, magnitude) -> checked_integer_literal_fits(
+      SemanticI64,
+      magnitude,
+      false
+    )
+    _ -> true
   }
 }
