@@ -871,10 +871,22 @@ type CheckedBodyBuildStorage {
   patterns: owned CheckedPatternGraphBuilder,
   closures: owned CheckedClosureBuilder,
   effects: owned CheckedEffectBuilder,
-  propagation: owned CheckedPropagationBuilder
+  propagation: owned CheckedPropagationBuilder,
+  -- One frame per lambda body being checked, innermost first.
+  inference: List<CheckedEffectInferenceFrame>
 }
 
 type CheckedBodyBuild = opaque CheckedBodyBuildStorage
+
+-- A closure's effect set is what its body does. While a lambda body is
+-- checked, its frame records each effect its own row admits, rather than a
+-- handler inside the lambda. A lambda whose expected row leaves an effect
+-- tail for inference collects them; any other lambda's body records nothing
+-- on behalf of an enclosing one.
+type CheckedEffectInferenceFrame {
+  CheckedEffectsFixed,
+  CheckedEffectsInferred(List<SemanticTypeId>, List<usize>)
+}
 
 type CheckedBodyExprBuild {
   CheckedBodyExprBuilt(owned CheckedBodyBuild, CheckedExprId),
@@ -1111,7 +1123,8 @@ type CheckedBodyEffectRequirement {
 }
 
 type CheckedBodyPointerPermission {
-  CheckedPointerPermitted,
+  -- The `Unsafe` atom that permits the operation.
+  CheckedPointerPermitted(SemanticTypeId),
   CheckedPointerPermissionRejected(CheckedBodyProducerIssue)
 }
 
@@ -1502,7 +1515,8 @@ fn checked_body_build_in_segment(input: CheckedBodyBuildSource) -> owned Checked
       patterns: patterns,
       closures: closures,
       effects: effects,
-      propagation: propagation
+      propagation: propagation,
+      inference: Nil<CheckedEffectInferenceFrame>()
     }
   )
 }
@@ -1727,23 +1741,141 @@ fn lexical_allows_effect(
   environment: CheckedLexicalEnvironment,
   wanted: SemanticTypeId
 ) -> bool {
+  match lexical_effect_admission(catalog, environment, wanted) {
+    CheckedEffectRefused -> false
+    _ -> true
+  }
+}
+
+-- Which part of a lexical scope admits an effect: the innermost function or
+-- lambda's own row, or a handler installed inside it.
+type CheckedEffectAdmission {
+  CheckedEffectAdmittedByRow,
+  CheckedEffectAdmittedByHandler,
+  CheckedEffectRefused
+}
+
+fn lexical_effect_admission(
+  catalog: borrow SemanticTypeCatalog,
+  environment: CheckedLexicalEnvironment,
+  wanted: SemanticTypeId
+) -> CheckedEffectAdmission {
   match environment {
-    CheckedLexicalRoot(_, _, _, function_type, _) -> semantic_function_allows_effect(
+    CheckedLexicalRoot(_, _, _, function_type, _) -> if semantic_function_allows_effect(
       catalog,
       function_type,
       wanted
-    )
-    CheckedLexicalBinding(_, _, _, _, _, parent) -> lexical_allows_effect(
+    ) { CheckedEffectAdmittedByRow } else { CheckedEffectRefused }
+    CheckedLexicalBinding(_, _, _, _, _, parent) -> lexical_effect_admission(
       catalog,
       parent,
       wanted
     )
-    CheckedLexicalHandledEffect(atom, _, parent) -> semantic_type_catalog_equal(
+    CheckedLexicalHandledEffect(atom, _, parent) -> if semantic_type_catalog_equal(
       catalog,
       atom,
       wanted
-    ) or lexical_allows_effect(catalog, parent, wanted)
-    CheckedLexicalResume(_, _, parent) -> lexical_allows_effect(catalog, parent, wanted)
+    ) { CheckedEffectAdmittedByHandler } else {
+      lexical_effect_admission(catalog, parent, wanted)
+    }
+    CheckedLexicalResume(_, _, parent) -> lexical_effect_admission(catalog, parent, wanted)
+  }
+}
+
+fn checked_body_inferring_effects(state: borrow CheckedBodyBuild) -> bool {
+  match state.effect_frames() {
+    Cons(CheckedEffectsInferred(_, _), _) -> true
+    _ -> false
+  }
+}
+
+-- Record for the innermost lambda an effect its own row admitted here. An
+-- effect a handler inside the lambda admits is not the lambda's.
+fn checked_body_record_admitted_effect(
+  state: owned CheckedBodyBuild,
+  environment: CheckedLexicalEnvironment,
+  atom: SemanticTypeId
+) -> owned CheckedBodyBuild {
+  let catalog = state.types()
+  let admitted = checked_body_inferring_effects(state) and match lexical_effect_admission(
+    catalog,
+    environment,
+    atom
+  ) {
+    CheckedEffectAdmittedByRow -> true
+    _ -> false
+  }
+  if admitted { state.record_effect_atom(atom) } else { state }
+}
+
+fn checked_body_record_admitted_effects(
+  state: owned CheckedBodyBuild,
+  environment: CheckedLexicalEnvironment,
+  atoms: List<SemanticTypeId>
+) -> owned CheckedBodyBuild {
+  match atoms {
+    Nil -> state
+    Cons(atom, rest) -> checked_body_record_admitted_effects(
+      checked_body_record_admitted_effect(state, environment, atom),
+      environment,
+      rest
+    )
+  }
+}
+
+-- The effect atoms and open tail of a function type's row.
+fn checked_body_function_row(
+  catalog: borrow SemanticTypeCatalog,
+  function_type: SemanticTypeId
+) -> (List<SemanticTypeId>, Option<usize>) {
+  match catalog.graph_for(function_type) {
+    Some(function_graph) -> match semantic_type_graph_node(function_graph, function_type) {
+      SemanticFunctionNode(_, _, effects) -> match catalog.graph_for(effects) {
+        Some(effect_graph) -> match semantic_type_graph_node(effect_graph, effects) {
+          SemanticEffectSignatureNode(atoms, tail) -> {
+            let lists = semantic_type_graph_type_lists_local(effect_graph)
+            let mut collected = Nil<SemanticTypeId>()
+            let mut index: usize = 0
+            while index < semantic_type_list_len(lists, atoms) {
+              collected = collected.prepend(
+                semantic_type_graph_list_type_id(
+                  effect_graph,
+                  semantic_type_list_edge(lists, atoms, index)
+                )
+              )
+              index = index + 1
+            }
+            let open = match tail {
+              SemanticOpenEffects(variable) -> Some(variable)
+              SemanticClosedEffects -> None<usize>()
+            }
+            (collected.reverse(), open)
+          }
+          _ -> (Nil<SemanticTypeId>(), None<usize>())
+        }
+        None -> (Nil<SemanticTypeId>(), None<usize>())
+      }
+      _ -> (Nil<SemanticTypeId>(), None<usize>())
+    }
+    None -> (Nil<SemanticTypeId>(), None<usize>())
+  }
+}
+
+-- Record the effects a callee's row requires of the innermost lambda. An open
+-- tail is admitted only by the lambda's own row.
+fn checked_body_record_required_effects(
+  state: owned CheckedBodyBuild,
+  environment: CheckedLexicalEnvironment,
+  function_type: SemanticTypeId
+) -> owned CheckedBodyBuild {
+  if not checked_body_inferring_effects(state) { state } else {
+    let catalog = state.types()
+    let (atoms, tail) = checked_body_function_row(catalog, function_type)
+    let recorded = checked_body_record_admitted_effects(state, environment, atoms)
+    match tail {
+      None -> recorded
+      Some(variable) -> recorded.record_effect_tail(variable)
+    }
   }
 }
 
@@ -2643,7 +2775,15 @@ impl CheckedBodyBuild {
   fn segment(self: borrow Self) -> CheckedExprSegmentId {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.segment()
       }
     }
@@ -2652,7 +2792,15 @@ impl CheckedBodyBuild {
   fn types(self: borrow Self) -> SemanticTypeCatalog {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.types()
       }
     }
@@ -2664,7 +2812,7 @@ impl CheckedBodyBuild {
   ) -> owned CheckedBodyBuild {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         CheckedBodyBuild(
           CheckedBodyBuildStorage {
             signatures: signatures,
@@ -2672,17 +2820,95 @@ impl CheckedBodyBuild {
             patterns: patterns.with_types(types),
             closures: closures,
             effects: effects.with_types(types),
-            propagation: propagation.with_types(types)
+            propagation: propagation.with_types(types),
+            inference: inference
           }
         )
       }
     }
   }
 
+  -- Replace the lambda frames, keeping every builder.
+  fn with_effect_frames(
+    self: owned Self,
+    frames: List<CheckedEffectInferenceFrame>
+  ) -> owned CheckedBodyBuild {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let { signatures, expressions, patterns, closures, effects, propagation, inference: _ } = storage
+        CheckedBodyBuild(
+          CheckedBodyBuildStorage {
+            signatures: signatures,
+            expressions: expressions,
+            patterns: patterns,
+            closures: closures,
+            effects: effects,
+            propagation: propagation,
+            inference: frames
+          }
+        )
+      }
+    }
+  }
+
+  fn effect_frames(self: borrow Self) -> List<CheckedEffectInferenceFrame> {
+    match self {
+      CheckedBodyBuild(storage) -> {
+        let {
+          signatures: _,
+          expressions: _,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference
+        } = storage
+        inference
+      }
+    }
+  }
+
+  -- Enter a lambda body; `inferring` when its effect tail is inferred.
+  fn enter_effect_frame(self: owned Self, inferring: bool) -> owned CheckedBodyBuild {
+    let frames = self.effect_frames()
+    let frame = if inferring {
+      CheckedEffectsInferred(Nil<SemanticTypeId>(), Nil<usize>())
+    } else { CheckedEffectsFixed }
+    self.with_effect_frames(frames.prepend(frame))
+  }
+
+  fn leave_effect_frame(
+    self: owned Self
+  ) -> (owned CheckedBodyBuild, CheckedEffectInferenceFrame) {
+    match self.effect_frames() {
+      Nil -> panic("A lambda effect frame was left without being entered")
+      Cons(frame, rest) -> (self.with_effect_frames(rest), frame)
+    }
+  }
+
+  -- Record an effect the innermost lambda's own row admitted.
+  fn record_effect_atom(self: owned Self, atom: SemanticTypeId) -> owned CheckedBodyBuild {
+    match self.effect_frames() {
+      Cons(CheckedEffectsInferred(atoms, tails), rest) -> self.with_effect_frames(
+        rest.prepend(CheckedEffectsInferred(atoms.prepend(atom), tails))
+      )
+      _ -> self
+    }
+  }
+
+  fn record_effect_tail(self: owned Self, variable: usize) -> owned CheckedBodyBuild {
+    match self.effect_frames() {
+      Cons(CheckedEffectsInferred(atoms, tails), rest) -> self.with_effect_frames(
+        rest.prepend(CheckedEffectsInferred(atoms, tails.prepend(variable)))
+      )
+      _ -> self
+    }
+  }
+
   fn begin_inferred_loop(self: owned Self) -> (owned CheckedBodyBuild, usize) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.begin_inferred_loop() {
           (expressions, frame) -> (
             CheckedBodyBuild(
@@ -2692,7 +2918,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             frame
@@ -2709,7 +2936,7 @@ impl CheckedBodyBuild {
   ) -> owned CheckedBodyBuild {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         CheckedBodyBuild(
           CheckedBodyBuildStorage {
             signatures: signatures,
@@ -2717,7 +2944,8 @@ impl CheckedBodyBuild {
             patterns: patterns,
             closures: closures,
             effects: effects,
-            propagation: propagation
+            propagation: propagation,
+            inference: inference
           }
         )
       }
@@ -2727,7 +2955,15 @@ impl CheckedBodyBuild {
   fn inferred_breaks(self: borrow Self, frame: usize) -> List<SemanticTypeId> {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.inferred_breaks(frame)
       }
     }
@@ -2736,7 +2972,15 @@ impl CheckedBodyBuild {
   fn signature(self: borrow Self, index: usize) -> SemanticFunctionSignature {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures,
+          expressions: _,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         signatures.at(index)
       }
     }
@@ -2749,7 +2993,7 @@ impl CheckedBodyBuild {
   ) -> CheckedBodySignatureLookup {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let catalog = expressions.types()
         match semantic_signature_in_scope(signatures, catalog, scope, identity) {
           SemanticScopeSignatureFound(signatures, signature) -> {
@@ -2762,7 +3006,8 @@ impl CheckedBodyBuild {
                   patterns: patterns.with_types(next_catalog),
                   closures: closures,
                   effects: effects.with_types(next_catalog),
-                  propagation: propagation.with_types(next_catalog)
+                  propagation: propagation.with_types(next_catalog),
+                  inference: inference
                 }
               ),
               signature
@@ -2776,7 +3021,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             )
           )
@@ -2788,7 +3034,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             issue
@@ -2804,7 +3051,15 @@ impl CheckedBodyBuild {
   ) -> usize {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures,
+          expressions: _,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         signatures.type_parameter_count(signature)
       }
     }
@@ -2817,7 +3072,15 @@ impl CheckedBodyBuild {
   ) -> SemanticTypeVariable {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures,
+          expressions: _,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         signatures.type_parameter_at(signature, index)
       }
     }
@@ -2829,7 +3092,15 @@ impl CheckedBodyBuild {
   ) -> usize {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures,
+          expressions: _,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         signatures.bound_count(signature)
       }
     }
@@ -2842,7 +3113,15 @@ impl CheckedBodyBuild {
   ) -> SemanticSignatureBound {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions: _, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures,
+          expressions: _,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         signatures.bound_at(signature, index)
       }
     }
@@ -2857,7 +3136,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedBindingId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.binding(
           owner,
           value_type,
@@ -2872,7 +3151,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             binding
@@ -2888,7 +3168,7 @@ impl CheckedBodyBuild {
   ) -> owned CheckedBodyBuild {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         CheckedBodyBuild(
           CheckedBodyBuildStorage {
             signatures: signatures,
@@ -2896,7 +3176,8 @@ impl CheckedBodyBuild {
             patterns: patterns,
             closures: closures,
             effects: effects,
-            propagation: propagation
+            propagation: propagation,
+            inference: inference
           }
         )
       }
@@ -2911,7 +3192,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.local_reference(binding, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -2921,7 +3202,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -2937,7 +3219,15 @@ impl CheckedBodyBuild {
   ) -> Option<CheckedBindingId> {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.local_reference_binding(expression)
       }
     }
@@ -2952,7 +3242,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.borrow_reference(binding, exclusive, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -2962,7 +3252,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -2980,7 +3271,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.declaration_reference(declaration, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -2990,7 +3281,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3010,7 +3302,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.structural_field_access(
           base,
           stable_key,
@@ -3026,7 +3318,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3046,7 +3339,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.declared_field_access(
           base,
           declaration,
@@ -3062,7 +3355,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3082,7 +3376,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.binary(operator, left, right, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3092,7 +3386,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3109,7 +3404,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.wildcard(input_type, range) {
           (patterns, pattern) -> (
             CheckedBodyBuild(
@@ -3119,7 +3414,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             pattern
@@ -3137,7 +3433,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.binding(expressions, binding, input_type, range) {
           (patterns, pattern) -> (
             CheckedBodyBuild(
@@ -3147,7 +3443,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             pattern
@@ -3166,7 +3463,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.integer(value, origin, input_type, range) {
           (patterns, pattern) -> (
             CheckedBodyBuild(
@@ -3176,7 +3473,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             pattern
@@ -3196,7 +3494,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.typed_binding(
           expressions,
           binding,
@@ -3213,7 +3511,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             pattern
@@ -3230,7 +3529,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.nil_pattern(input_type, range) {
           (patterns, pattern) -> (
             CheckedBodyBuild(
@@ -3240,7 +3539,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             pattern
@@ -3255,7 +3555,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.pattern_list() {
           (patterns, list) -> (
             CheckedBodyBuild(
@@ -3265,7 +3565,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3282,7 +3583,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.pattern_list_push(list, child) {
           (patterns, list) -> (
             CheckedBodyBuild(
@@ -3292,7 +3593,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3308,7 +3610,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternListId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.pattern_list_finish(list) {
           (patterns, id) -> (
             CheckedBodyBuild(
@@ -3318,7 +3620,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             id
@@ -3336,7 +3639,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.tuple(items, input_type, range) {
           (patterns, id) -> (
             CheckedBodyBuild(
@@ -3346,7 +3649,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             id
@@ -3366,7 +3670,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.constructor(declaration, children, qualifier, input_type, range) {
           (patterns, id) -> (
             CheckedBodyBuild(
@@ -3376,7 +3680,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             id
@@ -3397,7 +3702,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedPatternId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let catalog = expressions.types()
         let segment = expressions.segment()
         let (patterns, list) = patterns.pattern_field_list()
@@ -3422,7 +3727,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             id
@@ -3437,7 +3743,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedMatchArmListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.match_arm_list() {
           (patterns, list) -> (
             CheckedBodyBuild(
@@ -3447,7 +3753,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3467,7 +3774,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedMatchArmListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.match_arm_list_push(
           expressions,
           list,
@@ -3484,7 +3791,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3500,7 +3808,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedMatchArmListId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match patterns.match_arm_list_finish(list) {
           (patterns, list) -> (
             CheckedBodyBuild(
@@ -3510,7 +3818,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3530,7 +3839,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.match_expr(origin, scrutinee, arms, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3540,7 +3849,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3555,7 +3865,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.expression_list() {
           (expressions, list) -> (
             CheckedBodyBuild(
@@ -3565,7 +3875,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3582,7 +3893,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.expression_list_push(list, child) {
           (expressions, list) -> (
             CheckedBodyBuild(
@@ -3592,7 +3903,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3608,7 +3920,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprListId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.finish_expression_list(list) {
           (expressions, list) -> (
             CheckedBodyBuild(
@@ -3618,7 +3930,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3637,7 +3950,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.array_literal(elements, element_type, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3647,7 +3960,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3667,7 +3981,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.indexed_length(base, element_type, length, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3677,7 +3991,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3698,7 +4013,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.indexed_get(base, index, element_type, length, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3708,7 +4023,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3730,7 +4046,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.indexed_set(base, index, value, element_type, length, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3740,7 +4056,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3761,7 +4078,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.indexed_slice(base, start, end, element_type, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3771,7 +4088,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3790,7 +4108,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.interpolation_concat(left, right, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -3800,7 +4118,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -3820,7 +4139,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match propagation.failure(
           expressions,
           CheckedFailurePropagation {
@@ -3838,7 +4157,8 @@ impl CheckedBodyBuild {
                   patterns: patterns,
                   closures: closures,
                   effects: effects,
-                  propagation: propagation
+                  propagation: propagation,
+                  inference: inference
                 }
               ),
               expression
@@ -3860,7 +4180,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let detail = CheckedOptionalProjection {
           base: base,
           projection: projection,
@@ -3885,7 +4205,8 @@ impl CheckedBodyBuild {
                     patterns: patterns,
                     closures: closures,
                     effects: effects,
-                    propagation: propagation
+                    propagation: propagation,
+                    inference: inference
                   }
                 ),
                 expression
@@ -3909,7 +4230,8 @@ impl CheckedBodyBuild {
                     patterns: patterns,
                     closures: closures,
                     effects: effects,
-                    propagation: propagation
+                    propagation: propagation,
+                    inference: inference
                   }
                 ),
                 expression
@@ -3932,7 +4254,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.perform(
           expressions,
           CheckedPerform {
@@ -3951,7 +4273,8 @@ impl CheckedBodyBuild {
                   patterns: patterns,
                   closures: closures,
                   effects: effects,
-                  propagation: propagation
+                  propagation: propagation,
+                  inference: inference
                 }
               ),
               expression
@@ -3967,7 +4290,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedHandlerParameterListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.parameter_list() {
           (effects, list) -> (
             CheckedBodyBuild(
@@ -3977,7 +4300,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -3994,7 +4318,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedHandlerParameterListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.parameter_list_push(expressions, list, binding) {
           (effects, list) -> (
             CheckedBodyBuild(
@@ -4004,7 +4328,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -4020,7 +4345,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedHandlerParameterListId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.finish_parameter_list(list) {
           (effects, list) -> (
             CheckedBodyBuild(
@@ -4030,7 +4355,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -4045,7 +4371,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedHandlerClauseListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.clause_list() {
           (effects, list) -> (
             CheckedBodyBuild(
@@ -4055,7 +4381,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -4071,7 +4398,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, usize) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.clause(expressions, clause) {
           (effects, id) -> (
             CheckedBodyBuild(
@@ -4081,7 +4408,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             checked_handler_clause_id_ordinal(id)
@@ -4098,7 +4426,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedHandlerClauseListBuilder) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let id: CheckedHandlerClauseId = checked_handler_clause_id_from_ordinal(
           expressions.segment(),
           ordinal
@@ -4112,7 +4440,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -4128,7 +4457,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedHandlerClauseListId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.finish_clause_list(list) {
           (effects, list) -> (
             CheckedBodyBuild(
@@ -4138,7 +4467,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             list
@@ -4159,7 +4489,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.handle_expr(
           expressions,
           CheckedHandle {
@@ -4178,7 +4508,8 @@ impl CheckedBodyBuild {
                   patterns: patterns,
                   closures: closures,
                   effects: effects,
-                  propagation: propagation
+                  propagation: propagation,
+                  inference: inference
                 }
               ),
               expression
@@ -4197,7 +4528,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match effects.handler_install(expressions, install) {
           (effects, detail) -> match expressions.handler_install(detail, result, range) {
             (expressions, expression) -> (
@@ -4208,7 +4539,8 @@ impl CheckedBodyBuild {
                   patterns: patterns,
                   closures: closures,
                   effects: effects,
-                  propagation: propagation
+                  propagation: propagation,
+                  inference: inference
                 }
               ),
               expression
@@ -4225,7 +4557,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedTypeListId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let (expressions, list) = expressions.type_list()
         let (expressions, list) = checked_body_type_arguments_into(expressions, list, arguments)
         match expressions.finish_type_list(list) {
@@ -4237,7 +4569,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             type_arguments
@@ -4255,7 +4588,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.resume_expr(value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4265,7 +4598,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4284,7 +4618,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.direct_call(function, arguments, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4294,7 +4628,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4313,7 +4648,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let (expressions, list) = expressions.type_list()
         let (expressions, list) = checked_body_type_arguments_into(
           expressions,
@@ -4330,7 +4665,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4351,7 +4687,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.method_call(
           declaration,
           receiver,
@@ -4368,7 +4704,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4389,7 +4726,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.associated_call(
           declaration,
           target,
@@ -4406,7 +4743,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4425,7 +4763,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.constructor_call(declaration, arguments, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4435,7 +4773,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4456,7 +4795,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.apply(
           callee,
           arguments,
@@ -4473,7 +4812,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4489,7 +4829,15 @@ impl CheckedBodyBuild {
   ) -> SemanticTypeId {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.result_type(expression)
       }
     }
@@ -4501,7 +4849,15 @@ impl CheckedBodyBuild {
   ) -> CheckedSourceRange {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.range(expression)
       }
     }
@@ -4510,7 +4866,15 @@ impl CheckedBodyBuild {
   fn expression_count(self: borrow Self) -> usize {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.len()
       }
     }
@@ -4519,7 +4883,15 @@ impl CheckedBodyBuild {
   fn binding_count(self: borrow Self) -> usize {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.binding_len()
       }
     }
@@ -4531,7 +4903,15 @@ impl CheckedBodyBuild {
   ) -> CheckedBinding {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.binding_info(binding)
       }
     }
@@ -4544,7 +4924,15 @@ impl CheckedBodyBuild {
   ) -> List<CheckedBindingId> {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns: _, closures: _, effects: _, propagation: _ } = storage
+        let {
+          signatures: _,
+          expressions,
+          patterns: _,
+          closures: _,
+          effects: _,
+          propagation: _,
+          inference: _
+        } = storage
         expressions.outer_references_since(first_expression, first_binding)
       }
     }
@@ -4561,7 +4949,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match checked_closure_bindings(closures, expressions, parameters) {
           (closures, parameters) -> match checked_closure_bindings(
             closures,
@@ -4586,7 +4974,8 @@ impl CheckedBodyBuild {
                       patterns: patterns,
                       closures: closures,
                       effects: effects,
-                      propagation: propagation
+                      propagation: propagation,
+                      inference: inference
                     }
                   ),
                   expression
@@ -4608,7 +4997,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.block(first, rest, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4618,7 +5007,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4638,7 +5028,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.if_expr(
           condition,
           then_branch,
@@ -4654,7 +5044,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4673,7 +5064,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.while_expr(condition, body, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4683,7 +5074,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4701,7 +5093,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.not_expr(operand, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4711,7 +5103,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4729,7 +5122,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.negate(operand, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4739,7 +5132,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4759,7 +5153,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.defer_expr(cleanup, body, source_site, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4769,7 +5163,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4787,7 +5182,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.return_expr(value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4797,7 +5192,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4815,7 +5211,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.loop_expr(body, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4825,7 +5221,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4843,7 +5240,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.break_expr(value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4853,7 +5250,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4870,7 +5268,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.break_no_value(result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4880,7 +5278,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4897,7 +5296,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.continue_expr(result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4907,7 +5306,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4928,7 +5328,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let built = if mutable {
           expressions.let_mut_expr(binding, value, body, result, range)
         } else { expressions.let_expr(binding, value, body, result, range) }
@@ -4941,7 +5341,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4960,7 +5361,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.assign(binding, value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4970,7 +5371,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -4988,7 +5390,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.integer(value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -4998,7 +5400,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5016,7 +5419,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.string(value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -5026,7 +5429,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5044,7 +5448,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.float(value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -5054,7 +5458,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5072,7 +5477,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.boolean(value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -5082,7 +5487,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5099,7 +5505,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.nil(result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -5109,7 +5515,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5128,7 +5535,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.address_of(mutable, target, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -5138,7 +5545,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5156,7 +5564,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.dereference(pointer, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -5166,7 +5574,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5185,7 +5594,7 @@ impl CheckedBodyBuild {
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         match expressions.pointer_assign(pointer, value, result, range) {
           (expressions, expression) -> (
             CheckedBodyBuild(
@@ -5195,7 +5604,8 @@ impl CheckedBodyBuild {
                 patterns: patterns,
                 closures: closures,
                 effects: effects,
-                propagation: propagation
+                propagation: propagation,
+                inference: inference
               }
             ),
             expression
@@ -5212,7 +5622,7 @@ impl CheckedBodyBuild {
   ) -> owned CheckedBodyBuild {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         CheckedBodyBuild(
           CheckedBodyBuildStorage {
             signatures: signatures,
@@ -5220,7 +5630,8 @@ impl CheckedBodyBuild {
             patterns: patterns,
             closures: closures,
             effects: effects,
-            propagation: propagation
+            propagation: propagation,
+            inference: inference
           }
         )
       }
@@ -5234,7 +5645,7 @@ impl CheckedBodyBuild {
   ) -> owned CheckedBodyBuild {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         CheckedBodyBuild(
           CheckedBodyBuildStorage {
             signatures: signatures,
@@ -5242,7 +5653,8 @@ impl CheckedBodyBuild {
             patterns: patterns,
             closures: closures,
             effects: effects,
-            propagation: propagation
+            propagation: propagation,
+            inference: inference
           }
         )
       }
@@ -5258,7 +5670,7 @@ impl CheckedBodyBuild {
   ) -> CheckedHandlerBodyResult {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures: _, expressions, patterns, closures, effects, propagation, inference: _ } = storage
         let expressions = expressions.freeze()
         let borrows = checked_borrow_facts_conservative(expressions, declarations)
         let ownership = checked_ownership_facts(expressions)
@@ -5286,7 +5698,7 @@ impl CheckedBodyBuild {
   ) -> CheckedBodyCheckResult {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
         let expressions = expressions.freeze()
         let borrows = checked_borrow_facts_conservative(expressions, declarations)
         let ownership = checked_ownership_facts(expressions)
@@ -5315,7 +5727,7 @@ impl Drop for CheckedBodyBuild {
   fn drop(self) -> nil {
     match self {
       CheckedBodyBuild(storage) -> {
-        let { signatures: _, expressions, patterns, closures, effects, propagation } = storage
+        let { signatures: _, expressions, patterns, closures, effects, propagation, inference: _ } = storage
         expressions.drop()
         patterns.drop()
         closures.drop()
@@ -5609,7 +6021,7 @@ fn checked_body_standalone_lambda(
         body,
         source_site,
         CheckedRequireResult(function_type),
-        true
+        CheckedLambdaInference { result: CheckedLambdaInferred, effects: CheckedLambdaInferred }
       )
     }
   }
@@ -5704,6 +6116,29 @@ fn checked_body_lambda_inferred_type(
   (semantic_type_catalog_with_graph(catalog, builder.freeze()), inferred)
 }
 
+-- What a lambda's expected type leaves for its body to determine.
+type CheckedLambdaPart {
+  CheckedLambdaExpected,
+  CheckedLambdaInferred
+}
+
+type CheckedLambdaInference {
+  result: CheckedLambdaPart,
+  effects: CheckedLambdaPart
+}
+
+fn checked_lambda_expected() -> CheckedLambdaInference {
+  CheckedLambdaInference { result: CheckedLambdaExpected, effects: CheckedLambdaExpected }
+}
+
+fn checked_body_lambda_rejected(
+  state: owned CheckedBodyBuild,
+  issue: CheckedBodyProducerIssue
+) -> CheckedBodyExprBuild {
+  let (state, _) = state.leave_effect_frame()
+  CheckedBodyExprRejected(state, issue)
+}
+
 fn checked_body_lambda(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -5714,7 +6149,7 @@ fn checked_body_lambda(
   body: Expr,
   source_site: i64,
   expectation: CheckedBodyExpectation,
-  infer_body_result: bool
+  inference: CheckedLambdaInference
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   match source_range(source, source_site, 2) {
     nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
@@ -5735,26 +6170,39 @@ fn checked_body_lambda(
         match catalog.graph_for(function_type) {
           Some(graph) -> match semantic_type_graph_node(graph, function_type) {
             SemanticFunctionNode(_, result, _) -> {
+              -- A row left for inference is checked against every effect the
+              -- enclosing scope could provide; the effects the body records
+              -- then state the lambda's row exactly.
+              let inferring = match inference.effects {
+                CheckedLambdaInferred -> true
+                CheckedLambdaExpected -> false
+              }
+              let (checking_catalog, checking_type) = if inferring {
+                checked_body_effect_inference_type(catalog, types, environment, function_type)
+              } else { (catalog, function_type) }
+              let state = state.with_types(checking_catalog).enter_effect_frame(inferring)
               let first_expression = state.expression_count()
               let first_binding = state.binding_count()
               match checked_body_lambda_parameters(
                 state,
                 source,
-                types,
+                checked_body_types_with_catalog(types, checking_catalog),
                 owner,
                 function_type,
                 parameters,
                 0,
-                lexical_lambda_environment(environment, function_type),
+                lexical_lambda_environment(environment, checking_type),
                 Nil<CheckedBindingId>()
               ) {
                 CheckedLambdaParametersRejected(state, issue) ->
-                  CheckedBodyExprRejected(state, issue)
+                  checked_body_lambda_rejected(state, issue)
                 CheckedLambdaParametersBuilt(state, lambda_environment, bindings) -> {
                   let lambda_catalog = state.types()
                   let lambda_types = checked_body_types_with_catalog(types, lambda_catalog)
-                  let body_expectation = if infer_body_result { CheckedInferResult }
-                  else { CheckedRequireResult(result) }
+                  let body_expectation = match inference.result {
+                    CheckedLambdaInferred -> CheckedInferResult
+                    CheckedLambdaExpected -> CheckedRequireResult(result)
+                  }
                   match checked_body_expr(
                     state,
                     source,
@@ -5766,8 +6214,12 @@ fn checked_body_lambda(
                     body,
                     body_expectation
                   ) {
-                    CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+                    CheckedBodyExprRejected(state, issue) -> checked_body_lambda_rejected(
+                      state,
+                      issue
+                    )
                     CheckedBodyExprBuilt(state, checked_body) -> {
+                      let (state, frame) = state.leave_effect_frame()
                       let captures = state.outer_references_since(
                         first_expression,
                         first_binding
@@ -5783,46 +6235,51 @@ fn checked_body_lambda(
                             state,
                             CheckedBodyProducerInvalidRange
                           )
-                          range: CheckedSourceRange -> if infer_body_result {
+                          range: CheckedSourceRange -> {
                             let actual_result = state.result_type(checked_body)
                             let current_catalog = state.types()
-                            if semantic_type_catalog_equal(
-                              current_catalog,
-                              actual_result,
-                              types.never_type
-                            ) {
+                            let result_undetermined = match inference.result {
+                              CheckedLambdaInferred -> semantic_type_catalog_equal(
+                                current_catalog,
+                                actual_result,
+                                types.never_type
+                              )
+                              CheckedLambdaExpected -> false
+                            }
+                            if result_undetermined {
                               CheckedBodyExprRejected(
                                 state,
                                 CheckedBodyProducerGenericInferenceIncomplete(site)
                               )
                             } else {
-                              let (next_catalog, inferred_type) = checked_body_lambda_inferred_type(
-                                current_catalog,
-                                types,
-                                function_type,
-                                actual_result
-                              )
+                              let lambda_result = match inference.result {
+                                CheckedLambdaInferred -> actual_result
+                                CheckedLambdaExpected -> result
+                              }
+                              let (next_catalog, lambda_type) = match (
+                                inference.result,
+                                inference.effects,
+                              ) {
+                                (CheckedLambdaExpected, CheckedLambdaExpected) ->
+                                  (current_catalog, function_type)
+                                _ -> checked_body_lambda_type(
+                                  current_catalog,
+                                  types,
+                                  function_type,
+                                  lambda_result,
+                                  frame
+                                )
+                              }
                               match state.with_types(next_catalog).lambda(
                                 bindings,
                                 captures,
                                 checked_body,
                                 __i64_to_usize(source_site),
-                                inferred_type,
+                                lambda_type,
                                 range
                               ) {
                                 (state, expression) -> CheckedBodyExprBuilt(state, expression)
                               }
-                            }
-                          } else {
-                            match state.lambda(
-                              bindings,
-                              captures,
-                              checked_body,
-                              __i64_to_usize(source_site),
-                              function_type,
-                              range
-                            ) {
-                              (state, expression) -> CheckedBodyExprBuilt(state, expression)
                             }
                           }
                         }
@@ -5845,6 +6302,167 @@ fn checked_body_lambda(
       }
     }
   }
+}
+
+-- Effect atoms of `extra` not already in `base`, appended in order.
+fn checked_body_effect_atoms_union(
+  catalog: borrow SemanticTypeCatalog,
+  base: List<SemanticTypeId>,
+  extra: List<SemanticTypeId>
+) -> List<SemanticTypeId> {
+  match extra {
+    Nil -> base
+    Cons(atom, rest) -> checked_body_effect_atoms_union(
+      catalog,
+      if checked_body_effect_atom_listed(catalog, base, atom) { base } else { base.append(atom) },
+      rest
+    )
+  }
+}
+
+fn checked_body_effect_atom_listed(
+  catalog: borrow SemanticTypeCatalog,
+  atoms: List<SemanticTypeId>,
+  wanted: SemanticTypeId
+) -> bool {
+  match atoms {
+    Nil -> false
+    Cons(atom, rest) -> semantic_type_catalog_equal(catalog, atom, wanted) or
+      checked_body_effect_atom_listed(catalog, rest, wanted)
+  }
+}
+
+-- The atoms of `atoms` that `excluded` does not list, in order.
+fn checked_body_effect_atoms_without(
+  catalog: borrow SemanticTypeCatalog,
+  atoms: List<SemanticTypeId>,
+  excluded: List<SemanticTypeId>
+) -> List<SemanticTypeId> {
+  match atoms {
+    Nil -> Nil<SemanticTypeId>()
+    Cons(atom, rest) -> {
+      let kept = checked_body_effect_atoms_without(catalog, rest, excluded)
+      if checked_body_effect_atom_listed(catalog, excluded, atom) { kept } else {
+        kept.prepend(atom)
+      }
+    }
+  }
+}
+
+-- Every effect atom available where a lambda is written: its enclosing
+-- function or lambda's row, handlers installed around it, and that row's tail.
+fn checked_body_available_row(
+  catalog: borrow SemanticTypeCatalog,
+  environment: CheckedLexicalEnvironment,
+  collected: List<SemanticTypeId>
+) -> (List<SemanticTypeId>, Option<usize>) {
+  match environment {
+    CheckedLexicalRoot(_, _, _, function_type, _) -> {
+      let (atoms, tail) = checked_body_function_row(catalog, function_type)
+      (checked_body_effect_atoms_union(catalog, collected, atoms), tail)
+    }
+    CheckedLexicalBinding(_, _, _, _, _, parent) -> checked_body_available_row(
+      catalog,
+      parent,
+      collected
+    )
+    CheckedLexicalHandledEffect(atom, _, parent) -> {
+      let atoms = Nil<SemanticTypeId>()
+      checked_body_available_row(
+        catalog,
+        parent,
+        checked_body_effect_atoms_union(catalog, collected, atoms.prepend(atom))
+      )
+    }
+    CheckedLexicalResume(_, _, parent) -> checked_body_available_row(
+      catalog,
+      parent,
+      collected
+    )
+  }
+}
+
+-- The type a lambda whose row is inferred is checked against: its expected
+-- parameters, result and fixed atoms, plus everything available at the site.
+fn checked_body_effect_inference_type(
+  catalog: SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  environment: CheckedLexicalEnvironment,
+  function_type: SemanticTypeId
+) -> (SemanticTypeCatalog, SemanticTypeId) {
+  let result = match catalog.graph_for(function_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, function_type) {
+      SemanticFunctionNode(_, result, _) -> result
+      _ -> panic("A lambda's inference context must be a function")
+    }
+    None -> panic("A lambda's inference context is outside its type catalog")
+  }
+  let (fixed, _) = checked_body_function_row(catalog, function_type)
+  let (available, tail) = checked_body_available_row(catalog, environment, Nil<SemanticTypeId>())
+  let atoms = checked_body_effect_atoms_union(catalog, fixed, available)
+  checked_body_build_function_type(catalog, types, function_type, result, atoms, tail)
+}
+
+-- A lambda's own type: its parameters, its result, and either the expected
+-- row or, when inferred, the fixed atoms plus exactly what the body recorded.
+fn checked_body_lambda_type(
+  catalog: SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  function_type: SemanticTypeId,
+  result: SemanticTypeId,
+  frame: CheckedEffectInferenceFrame
+) -> (SemanticTypeCatalog, SemanticTypeId) {
+  match frame {
+    CheckedEffectsFixed -> checked_body_lambda_inferred_type(
+      catalog,
+      types,
+      function_type,
+      result
+    )
+    CheckedEffectsInferred(recorded, tails) -> {
+      let (fixed, _) = checked_body_function_row(catalog, function_type)
+      let atoms = checked_body_effect_atoms_union(catalog, fixed, recorded.reverse())
+      let tail = match tails {
+        Nil -> None<usize>()
+        Cons(variable, _) -> Some(variable)
+      }
+      checked_body_build_function_type(catalog, types, function_type, result, atoms, tail)
+    }
+  }
+}
+
+-- A function type with `function_type`'s parameters and the given result and
+-- effect row.
+fn checked_body_build_function_type(
+  catalog: SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  function_type: SemanticTypeId,
+  result: SemanticTypeId,
+  atoms: List<SemanticTypeId>,
+  tail: Option<usize>
+) -> (SemanticTypeCatalog, SemanticTypeId) {
+  let parameters = semantic_function_parameters_into(
+    catalog,
+    function_type,
+    0,
+    Nil<SemanticTypeId>()
+  )
+  let module = types.module
+  let resolution = types.resolution
+  let segment = semantic_type_derived_segment_id(
+    module.identity,
+    catalog.next_derived_segment(module.identity, resolution.next_type_segment())
+  )
+  let builder = semantic_type_graph_builder(segment)
+  let (builder, parameter_list) = builder.type_list(parameters)
+  let (builder, atom_list) = builder.type_list(atoms)
+  let effect_tail = match tail {
+    Some(variable) -> SemanticOpenEffects(variable)
+    None -> SemanticClosedEffects
+  }
+  let (builder, effects) = builder.effect_signature(atom_list, effect_tail)
+  let (builder, built) = builder.function(parameter_list, result, effects)
+  (semantic_type_catalog_with_graph(catalog, builder.freeze()), built)
 }
 
 fn expectation_allows(
@@ -6499,6 +7117,7 @@ fn checked_body_zero_arg_method(
               CheckedBodyProducerEffectTailUnavailable(variable)
             )
             CheckedBodyEffectsAvailable -> {
+              let state = checked_body_record_required_effects(state, environment, signature)
               let result = semantic_function_result(next_catalog, signature)
               let (state, arguments) = state.expression_list()
               let (state, arguments) = state.finish_expression_list(arguments)
@@ -8002,7 +8621,7 @@ fn checked_body_pointer_permission(
       declaration: DeclarationIdentity -> {
         let catalog = types.catalog
         match checked_body_lexical_effect_declaration(catalog, environment, declaration) {
-          Some(atom) -> CheckedPointerPermitted
+          Some(atom) -> CheckedPointerPermitted(atom)
           None -> CheckedPointerPermissionRejected(
             CheckedBodyProducerUnsafeEffectUnavailable
           )
@@ -13562,6 +14181,11 @@ fn checked_body_associated_call(
           CheckedBodyProducerEffectTailUnavailable(variable)
         )
         CheckedBodyEffectsAvailable -> {
+          let next_state = checked_body_record_required_effects(
+            next_state,
+            environment,
+            signature
+          )
           let result = semantic_function_result(next_catalog, signature)
           if not expectation_allows(next_catalog, result, expectation) {
             CheckedBodyExprRejected(
@@ -13855,6 +14479,7 @@ fn checked_body_monomorphic_method_call(
       CheckedBodyProducerEffectTailUnavailable(variable)
     )
     CheckedBodyEffectsAvailable -> {
+      let state = checked_body_record_required_effects(state, environment, signature)
       let result = semantic_function_result(catalog, signature)
       if not expectation_allows(catalog, result, expectation) {
         CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
@@ -14132,6 +14757,7 @@ fn checked_body_instantiated_method_call(
           CheckedBodyProducerEffectTailUnavailable(variable)
         )
         CheckedBodyEffectsAvailable -> {
+          let state = checked_body_record_required_effects(state, environment, specialized)
           let result = semantic_function_result(next_catalog, specialized)
           if not expectation_allows(next_catalog, result, expectation) {
             CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
@@ -14453,6 +15079,11 @@ fn checked_body_perform_other(
                         CheckedBodyProducerMissingHandlerClause(site.operation_declaration)
                       )
                     } else {
+                      let state = checked_body_record_admitted_effect(
+                        state,
+                        environment,
+                        site.atom
+                      )
                       let result = match types.module.authority {
                         StrictSourceAuthority -> site.result
                         TrustedSourceAuthority -> match checked_body_standard_declaration(
@@ -14829,6 +15460,7 @@ fn checked_body_call_with_signature(
       CheckedBodyProducerEffectTailUnavailable(variable)
     )
     CheckedBodyEffectsAvailable -> {
+      let state = checked_body_record_required_effects(state, environment, signature)
       let result = semantic_function_result(catalog, signature)
       if not expectation_allows(catalog, result, expectation) {
         CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
@@ -14925,6 +15557,93 @@ fn checked_body_match_generic_argument(
         )
       }
     }
+  }
+}
+
+-- The open effect tail of a callee's function parameter, when the call's
+-- substitution has not bound it yet.
+fn checked_body_inferable_effect_tail(
+  catalog: borrow SemanticTypeCatalog,
+  parameter: SemanticTypeId,
+  substitution: borrow SemanticTypeSubstitution
+) -> Option<usize> {
+  let (_, tail) = checked_body_function_row(catalog, parameter)
+  match tail {
+    None -> None<usize>()
+    Some(variable) -> match semantic_type_substitution_get(
+      substitution,
+      SemanticParameterVariable(variable)
+    ) {
+      Some(_) -> None<usize>()
+      None -> Some(variable)
+    }
+  }
+}
+
+-- Bind a callee's effect tail from a lambda checked with an inferred row: the
+-- tail is what the lambda performs beyond the parameter's own atoms. The
+-- result binds by matching, and the lambda must then be a subtype of the
+-- instantiated parameter.
+fn checked_body_match_effect_inferred_lambda(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  parameter: SemanticTypeId,
+  substitution: SemanticTypeSubstitution,
+  actual: SemanticTypeId,
+  variable: usize
+) -[SemanticConformance]> CheckedInferredGenericMatch {
+  let catalog = state.types()
+  let resolution = types.resolution
+  let segment = catalog.next_derived_segment(
+    types.module.identity,
+    resolution.next_type_segment()
+  )
+  let product = semantic_type_product_continue(types.module.identity, catalog, segment)
+  let (product, instantiated) = semantic_type_product_substitute(product, substitution, parameter)
+  let catalog = semantic_type_product_catalog(product)
+  let (fixed, _) = checked_body_function_row(catalog, instantiated)
+  let (performed, performed_tail) = checked_body_function_row(catalog, actual)
+  let remainder = checked_body_effect_atoms_without(catalog, performed, fixed)
+  let remainder_segment = semantic_type_derived_segment_id(
+    types.module.identity,
+    catalog.next_derived_segment(types.module.identity, resolution.next_type_segment())
+  )
+  let builder = semantic_type_graph_builder(remainder_segment)
+  let (builder, atom_list) = builder.type_list(remainder)
+  let remainder_tail = match performed_tail {
+    Some(tail) -> SemanticOpenEffects(tail)
+    None -> SemanticClosedEffects
+  }
+  let (builder, remainder_row) = builder.effect_signature(atom_list, remainder_tail)
+  let catalog = semantic_type_catalog_with_graph(catalog, builder.freeze())
+  let bound = semantic_type_substitution_bind(
+    substitution,
+    SemanticParameterVariable(variable),
+    remainder_row
+  )
+  let empty = semantic_type_substitution_empty()
+  let result_bound = match semantic_type_pattern_match_substituted(
+    catalog,
+    semantic_function_result(catalog, parameter),
+    bound,
+    semantic_function_result(catalog, actual),
+    empty
+  ) {
+    SemanticTypePatternMatched(next) -> next
+    SemanticTypePatternRejected -> bound
+  }
+  let segment = catalog.next_derived_segment(
+    types.module.identity,
+    resolution.next_type_segment()
+  )
+  let product = semantic_type_product_continue(types.module.identity, catalog, segment)
+  let (product, expected) = semantic_type_product_substitute(product, result_bound, parameter)
+  let catalog = semantic_type_product_catalog(product)
+  let state = state.with_types(catalog)
+  if semantic_type_is_subtype(catalog, actual, expected) {
+    CheckedInferredGenericMatched(state, result_bound)
+  } else {
+    CheckedInferredGenericMatchRejected(state, CheckedBodyProducerTypeMismatch(actual, expected))
   }
 }
 
@@ -15145,35 +15864,30 @@ fn checked_body_complete_generic_arguments(
           let next_catalog = semantic_type_product_catalog(product)
           let next_types = checked_body_types_with_catalog(context.types, next_catalog)
           let next_state = state.with_types(next_catalog)
-          let checked_argument = if semantic_function_result_is_variable(
-            next_catalog,
-            specialized
-          ) {
-            checked_body_lambda(
-              next_state,
-              context.source,
-              next_types,
-              context.owner,
-              context.environment,
-              lambda_parameters,
-              lambda_body,
-              lambda_site,
-              CheckedRequireResult(specialized),
-              true
-            )
-          } else {
-            checked_body_expr(
-              next_state,
-              context.source,
-              next_types,
-              context.owner,
-              context.function_result,
-              context.loop_context,
-              context.environment,
-              argument,
-              CheckedRequireResult(specialized)
-            )
+          -- The callee's effect tail on this parameter, when no earlier argument
+          -- has bound it: the lambda's body is then the source of its binding.
+          let tail = checked_body_inferable_effect_tail(next_catalog, parameter, substitution)
+          let inference = CheckedLambdaInference {
+            result: if semantic_function_result_is_variable(next_catalog, specialized) {
+              CheckedLambdaInferred
+            } else { CheckedLambdaExpected },
+            effects: match tail {
+              Some(_) -> CheckedLambdaInferred
+              None -> CheckedLambdaExpected
+            }
           }
+          let checked_argument = checked_body_lambda(
+            next_state,
+            context.source,
+            next_types,
+            context.owner,
+            context.environment,
+            lambda_parameters,
+            lambda_body,
+            lambda_site,
+            CheckedRequireResult(specialized),
+            inference
+          )
           match checked_argument {
             CheckedBodyExprRejected(state, issue) -> CheckedInferredGenericArgumentsRejected(
               state,
@@ -15182,13 +15896,24 @@ fn checked_body_complete_generic_arguments(
             CheckedBodyExprBuilt(state, checked_argument) -> {
               let actual = state.result_type(checked_argument)
               let argument_range = state.range(checked_argument)
-              match checked_body_match_generic_argument(
-                state,
-                context.types,
-                parameter,
-                substitution,
-                actual
-              ) {
+              let matched = match tail {
+                None -> checked_body_match_generic_argument(
+                  state,
+                  context.types,
+                  parameter,
+                  substitution,
+                  actual
+                )
+                Some(variable) -> checked_body_match_effect_inferred_lambda(
+                  state,
+                  context.types,
+                  parameter,
+                  substitution,
+                  actual,
+                  variable
+                )
+              }
+              match matched {
                 CheckedInferredGenericMatchRejected(state, issue) ->
                   CheckedInferredGenericArgumentsRejected(state, issue)
                 CheckedInferredGenericMatched(state, next_substitution) -> match covering_range(
@@ -15722,6 +16447,11 @@ fn checked_body_inferred_generic_call(
                     CheckedBodyProducerEffectTailUnavailable(variable)
                   )
                   CheckedBodyEffectsAvailable -> {
+                    let state = checked_body_record_required_effects(
+                      state,
+                      environment,
+                      specialized
+                    )
                     let result = semantic_function_result(next_catalog, specialized)
                     if not expectation_allows(next_catalog, result, expectation) {
                       CheckedBodyExprRejected(
@@ -19145,7 +19875,15 @@ fn checked_body_record_literal(
             }
             match state.with_types(catalog) {
               CheckedBodyBuild(storage) -> {
-                let { signatures, expressions, patterns, closures, effects, propagation } = storage
+                let {
+                  signatures,
+                  expressions,
+                  patterns,
+                  closures,
+                  effects,
+                  propagation,
+                  inference
+                } = storage
                 let (expressions, list) = expressions.record_field_list()
                 let (expressions, checked_fields) = checked_body_publish_record_fields(
                   expressions,
@@ -19165,7 +19903,8 @@ fn checked_body_record_literal(
                         patterns: patterns,
                         closures: closures,
                         effects: effects,
-                        propagation: propagation
+                        propagation: propagation,
+                        inference: inference
                       }
                     ),
                     expression
@@ -19422,7 +20161,7 @@ fn checked_body_nominal_record_update(
           Some(issue) -> CheckedBodyExprRejected(state, issue)
           None -> match state {
             CheckedBodyBuild(storage) -> {
-              let { signatures, expressions, patterns, closures, effects, propagation } = storage
+              let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
               let (expressions, list) = expressions.record_field_list()
               let (expressions, checked_fields) = checked_body_publish_nominal_fields(
                 expressions,
@@ -19442,7 +20181,8 @@ fn checked_body_nominal_record_update(
                       patterns: patterns,
                       closures: closures,
                       effects: effects,
-                      propagation: propagation
+                      propagation: propagation,
+                      inference: inference
                     }
                   ),
                   expression
@@ -19515,7 +20255,7 @@ fn checked_body_structural_record_update(
         }
         match state.with_types(catalog) {
           CheckedBodyBuild(storage) -> {
-            let { signatures, expressions, patterns, closures, effects, propagation } = storage
+            let { signatures, expressions, patterns, closures, effects, propagation, inference } = storage
             let (expressions, list) = expressions.record_field_list()
             let (expressions, checked_fields) = checked_body_publish_structural_update_fields(
               expressions,
@@ -19535,7 +20275,8 @@ fn checked_body_structural_record_update(
                     patterns: patterns,
                     closures: closures,
                     effects: effects,
-                    propagation: propagation
+                    propagation: propagation,
+                    inference: inference
                   }
                 ),
                 expression
@@ -20020,7 +20761,15 @@ fn checked_body_nominal_record_literal(
                     Some(issue) -> CheckedBodyExprRejected(state, issue)
                     None -> match state.with_types(catalog) {
                       CheckedBodyBuild(storage) -> {
-                        let { signatures, expressions, patterns, closures, effects, propagation } = storage
+                        let {
+                          signatures,
+                          expressions,
+                          patterns,
+                          closures,
+                          effects,
+                          propagation,
+                          inference
+                        } = storage
                         let (expressions, list) = expressions.record_field_list()
                         let (expressions, checked_fields) = checked_body_publish_nominal_fields(
                           expressions,
@@ -20045,7 +20794,8 @@ fn checked_body_nominal_record_literal(
                                 patterns: patterns,
                                 closures: closures,
                                 effects: effects,
-                                propagation: propagation
+                                propagation: propagation,
+                                inference: inference
                               }
                             ),
                             expression
@@ -20400,7 +21150,17 @@ fn checked_body_try(
                 expectation_mismatch(success_type, expectation)
               )
             } else {
-              match checked_body_fail_atom(catalog, environment, fail_declaration, error_type) {
+              let fail_atom = checked_body_fail_atom(
+                catalog,
+                environment,
+                fail_declaration,
+                error_type
+              )
+              let state = match fail_atom {
+                Some(atom) -> checked_body_record_admitted_effect(state, environment, atom)
+                None -> state
+              }
+              match fail_atom {
                 None -> CheckedBodyExprRejected(
                   state,
                   CheckedBodyProducerTryEffectUnavailable(error_type)
@@ -20670,7 +21430,12 @@ fn checked_body_optional_chain(
     nil -> CheckedBodyExprRejected(state, CheckedBodyProducerMaybeEffectUnavailable)
     maybe_declaration: DeclarationIdentity -> {
       let catalog = state.types()
-      match checked_body_maybe_atom(catalog, environment, maybe_declaration) {
+      let maybe_atom = checked_body_maybe_atom(catalog, environment, maybe_declaration)
+      let state = match maybe_atom {
+        Some(atom) -> checked_body_record_admitted_effect(state, environment, atom)
+        None -> state
+      }
+      match maybe_atom {
         Some(atom) -> match checked_body_expr(
           state,
           source,
@@ -20731,9 +21496,14 @@ fn checked_body_address_of(
   target: Expr,
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
-  match checked_body_pointer_permission(types, environment) {
+  let permission = checked_body_pointer_permission(types, environment)
+  let state = match permission {
+    CheckedPointerPermitted(atom) -> checked_body_record_admitted_effect(state, environment, atom)
+    CheckedPointerPermissionRejected(_) -> state
+  }
+  match permission {
     CheckedPointerPermissionRejected(issue) -> CheckedBodyExprRejected(state, issue)
-    CheckedPointerPermitted -> match target {
+    CheckedPointerPermitted(_) -> match target {
       Ident(start, length) -> match source_range(source, start, length) {
         nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
         range: CheckedSourceRange -> match lexical_lookup(environment, source, start, length) {
@@ -20797,9 +21567,14 @@ fn checked_body_dereference(
   pointer: Expr,
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
-  match checked_body_pointer_permission(types, environment) {
+  let permission = checked_body_pointer_permission(types, environment)
+  let state = match permission {
+    CheckedPointerPermitted(atom) -> checked_body_record_admitted_effect(state, environment, atom)
+    CheckedPointerPermissionRejected(_) -> state
+  }
+  match permission {
     CheckedPointerPermissionRejected(issue) -> CheckedBodyExprRejected(state, issue)
-    CheckedPointerPermitted -> match checked_body_expr(
+    CheckedPointerPermitted(_) -> match checked_body_expr(
       state,
       source,
       types,
@@ -20855,9 +21630,14 @@ fn checked_body_pointer_assign(
   value: Expr,
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
-  match checked_body_pointer_permission(types, environment) {
+  let permission = checked_body_pointer_permission(types, environment)
+  let state = match permission {
+    CheckedPointerPermitted(atom) -> checked_body_record_admitted_effect(state, environment, atom)
+    CheckedPointerPermissionRejected(_) -> state
+  }
+  match permission {
     CheckedPointerPermissionRejected(issue) -> CheckedBodyExprRejected(state, issue)
-    CheckedPointerPermitted -> match checked_body_expr(
+    CheckedPointerPermitted(_) -> match checked_body_expr(
       state,
       source,
       types,
@@ -21355,7 +22135,7 @@ fn checked_body_expr(
       body,
       source_site,
       expectation,
-      false
+      checked_lambda_expected()
     )
     Apply(callee, arguments, _, site) -> checked_body_apply(
       state,
