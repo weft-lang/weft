@@ -1,0 +1,1759 @@
+-- Owned and unique values over immutable checked expressions.
+--
+-- A linear binding holds an `owned` or `unique` value, or an aggregate that
+-- does. Every direct reference to it moves the value, except a borrow of the
+-- binding and a projection or index through it, which only read. The flow
+-- follows evaluation order: a use after a possible move is refused, a
+-- conditional move leaves the value possibly moved, and a path that never
+-- completes contributes nothing to the join after it. A binding introduced
+-- inside a loop is fresh on every iteration, a loop body is followed until
+-- its states stop changing, and no closure may capture a linear value.
+
+use compiler/types/graph.{
+  SemanticBottomNode,
+  SemanticNamedNode,
+  SemanticNominalType,
+  SemanticOpaqueType,
+  SemanticOwnedNode,
+  SemanticRecordNode,
+  SemanticTypeId,
+  SemanticUnionNode,
+  SemanticUniqueNode,
+  semantic_type_graph_list_type_id,
+  semantic_type_graph_node,
+  semantic_type_graph_record_field_type_id,
+  semantic_type_graph_records_local,
+  semantic_type_graph_type_lists_local,
+  semantic_type_list_edge,
+  semantic_type_list_len,
+  semantic_type_record_field_count,
+  semantic_type_record_field_edge
+}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/declarations.{
+  SemanticDeclaredLayout,
+  SemanticDeclaredRecordLayout,
+  SemanticDeclaredVariantLayout,
+  SemanticRecordDeclarationLayoutMatched,
+  SemanticTypeDeclarationCatalog,
+  SemanticVariantDeclarationLayoutMatched,
+  semantic_type_declaration_catalog_resolve,
+  semantic_type_declared_record_field_count,
+  semantic_type_declared_record_field_type,
+  semantic_type_declared_variant_case_count,
+  semantic_type_declared_variant_payload_count,
+  semantic_type_declared_variant_payload_type
+}
+use compiler/types/graph/substitution.{semantic_type_substitution_empty}
+use compiler/weft/check/body/closure.{CheckedClosureGraph}
+use compiler/weft/check/body/effects.{
+  CheckedEffectGraph,
+  CheckedHandleDetail,
+  CheckedHandleReturnClause,
+  CheckedHandlerInstallDetail,
+  CheckedNoHandleReturn,
+  CheckedPerformDetail
+}
+use compiler/weft/check/body/graph.{*}
+use compiler/weft/check/body/pattern.{
+  CheckedBindingPatternNode,
+  CheckedConstructorPatternNode,
+  CheckedGuarded,
+  CheckedIntegerPatternNode,
+  CheckedNilPatternNode,
+  CheckedPatternGraph,
+  CheckedPatternId,
+  CheckedPatternListId,
+  CheckedRecordPatternNode,
+  CheckedTuplePatternNode,
+  CheckedTypedBindingPatternNode,
+  CheckedUnguarded,
+  CheckedWildcardPatternNode
+}
+use compiler/weft/check/body/propagation.{
+  CheckedFailurePropagationDetail,
+  CheckedOptionalProjectionDetail,
+  CheckedPropagationGraph
+}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{None, Option, Some}
+
+pub(package) type CheckedLinearIssue {
+  -- A use of a linear value on a path where it may already have moved.
+  CheckedLinearUsedAfterMove(CheckedBindingId, CheckedSourceRange),
+  -- A closure capturing a linear value, which it could consume repeatedly.
+  CheckedLinearCaptured(CheckedBindingId, CheckedSourceRange)
+}
+
+type CheckedLinearMove {
+  CheckedLinearMoved,
+  CheckedLinearMaybeMoved
+}
+
+-- A linear binding that has, or may have, moved. Every other linear binding
+-- in scope still holds its value.
+type CheckedLinearEntry {
+  binding: usize,
+  move: CheckedLinearMove
+}
+
+-- The states reaching the end of an expression, and the states at the
+-- `break` and `continue` points of its innermost enclosing loop. A path that
+-- never completes has no normal state.
+type CheckedLinearFlow {
+  normal: Option<List<CheckedLinearEntry>>,
+  breaks: List<List<CheckedLinearEntry>>,
+  continues: List<List<CheckedLinearEntry>>
+}
+
+type CheckedLinearVisit {
+  CheckedLinearVisited(CheckedLinearFlow),
+  CheckedLinearRefused(CheckedLinearIssue)
+}
+
+type CheckedLinearGraphs {
+  linear: List<usize>
+}
+
+fn linear_flow(state: List<CheckedLinearEntry>) -> CheckedLinearFlow {
+  CheckedLinearFlow {
+    normal: Some(state),
+    breaks: Nil<List<CheckedLinearEntry>>(),
+    continues: Nil<List<CheckedLinearEntry>>()
+  }
+}
+
+fn linear_diverged() -> CheckedLinearFlow {
+  CheckedLinearFlow {
+    normal: None<List<CheckedLinearEntry>>(),
+    breaks: Nil<List<CheckedLinearEntry>>(),
+    continues: Nil<List<CheckedLinearEntry>>()
+  }
+}
+
+fn linear_member(values: List<usize>, wanted: usize) -> bool {
+  match values {
+    Nil -> false
+    Cons(value, rest) -> value == wanted or linear_member(rest, wanted)
+  }
+}
+
+fn linear_lookup(state: List<CheckedLinearEntry>, binding: usize) -> Option<CheckedLinearMove> {
+  match state {
+    Nil -> None<CheckedLinearMove>()
+    Cons(entry, rest) -> if entry.binding == binding { Some(entry.move) } else {
+      linear_lookup(rest, binding)
+    }
+  }
+}
+
+fn linear_without(state: List<CheckedLinearEntry>, binding: usize) -> List<CheckedLinearEntry> {
+  match state {
+    Nil -> state
+    Cons(entry, rest) -> if entry.binding == binding { linear_without(rest, binding) } else {
+      linear_without(rest, binding).prepend(entry)
+    }
+  }
+}
+
+fn linear_with(
+  state: List<CheckedLinearEntry>,
+  binding: usize,
+  move: CheckedLinearMove
+) -> List<CheckedLinearEntry> {
+  linear_without(state, binding).prepend(CheckedLinearEntry { binding: binding, move: move })
+}
+
+fn linear_move_eq(left: CheckedLinearMove, right: CheckedLinearMove) -> bool {
+  match (left, right) {
+    (CheckedLinearMoved, CheckedLinearMoved) -> true
+    (CheckedLinearMaybeMoved, CheckedLinearMaybeMoved) -> true
+    _ -> false
+  }
+}
+
+-- Two paths meet: a value moved on both has moved; one moved on either may
+-- have moved.
+fn linear_join(
+  left: List<CheckedLinearEntry>,
+  right: List<CheckedLinearEntry>
+) -> List<CheckedLinearEntry> {
+  let mut joined = Nil<CheckedLinearEntry>()
+  let mut remaining = left
+  loop {
+    match remaining {
+      Nil -> break
+      Cons(entry, rest) -> {
+        let move = match (entry.move, linear_lookup(right, entry.binding)) {
+          (CheckedLinearMoved, Some(CheckedLinearMoved)) -> CheckedLinearMoved
+          _ -> CheckedLinearMaybeMoved
+        }
+        joined = joined.prepend(CheckedLinearEntry { binding: entry.binding, move: move })
+        remaining = rest
+      }
+    }
+  }
+  remaining = right
+  loop {
+    match remaining {
+      Nil -> break
+      Cons(entry, rest) -> {
+        match linear_lookup(left, entry.binding) {
+          Some(_) -> nil
+          None -> {
+            joined = joined.prepend(
+              CheckedLinearEntry { binding: entry.binding, move: CheckedLinearMaybeMoved }
+            )
+          }
+        }
+        remaining = rest
+      }
+    }
+  }
+  joined
+}
+
+fn linear_state_eq(left: List<CheckedLinearEntry>, right: List<CheckedLinearEntry>) -> bool {
+  linear_state_within(left, right) and linear_state_within(right, left)
+}
+
+fn linear_state_within(
+  left: List<CheckedLinearEntry>,
+  right: List<CheckedLinearEntry>
+) -> bool {
+  match left {
+    Nil -> true
+    Cons(entry, rest) -> match linear_lookup(right, entry.binding) {
+      Some(move) -> linear_move_eq(move, entry.move) and linear_state_within(rest, right)
+      None -> false
+    }
+  }
+}
+
+fn linear_join_all(
+  states: List<List<CheckedLinearEntry>>,
+  initial: Option<List<CheckedLinearEntry>>
+) -> Option<List<CheckedLinearEntry>> {
+  match states {
+    Nil -> initial
+    Cons(state, rest) -> linear_join_all(
+      rest,
+      match initial {
+        None -> Some(state)
+        Some(existing) -> Some(linear_join(existing, state))
+      }
+    )
+  }
+}
+
+fn linear_concat(
+  left: List<List<CheckedLinearEntry>>,
+  right: List<List<CheckedLinearEntry>>
+) -> List<List<CheckedLinearEntry>> {
+  match left {
+    Nil -> right
+    Cons(state, rest) -> linear_concat(rest, right).prepend(state)
+  }
+}
+
+-- Two alternatives from one state: normal completions join, and both
+-- alternatives' loop exits remain.
+fn linear_branch(left: CheckedLinearFlow, right: CheckedLinearFlow) -> CheckedLinearFlow {
+  CheckedLinearFlow {
+    normal: match (left.normal, right.normal) {
+      (Some(first), Some(second)) -> Some(linear_join(first, second))
+      (Some(first), None) -> Some(first)
+      (None, second) -> second
+    },
+    breaks: linear_concat(left.breaks, right.breaks),
+    continues: linear_concat(left.continues, right.continues)
+  }
+}
+
+-- Whether a type holds a linear value: an `owned` or `unique` value, an
+-- application with a linear argument, or a declared aggregate, tuple or
+-- record with a linear field or payload.
+pub(package) fn checked_linear_type(
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  value: SemanticTypeId
+) -> bool {
+  checked_linear_type_within(types, declarations, value, Nil<SemanticDeclaredLayout>(), 0)
+}
+
+fn linear_layout_eq(left: SemanticDeclaredLayout, right: SemanticDeclaredLayout) -> bool {
+  match (left, right) {
+    (SemanticDeclaredRecordLayout(first), SemanticDeclaredRecordLayout(second)) ->
+      first == second
+    (SemanticDeclaredVariantLayout(first), SemanticDeclaredVariantLayout(second)) ->
+      first == second
+    _ -> false
+  }
+}
+
+fn linear_layout_visited(
+  visited: List<SemanticDeclaredLayout>,
+  wanted: SemanticDeclaredLayout
+) -> bool {
+  match visited {
+    Nil -> false
+    Cons(layout, rest) -> linear_layout_eq(layout, wanted) or linear_layout_visited(rest, wanted)
+  }
+}
+
+fn checked_linear_type_within(
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  value: SemanticTypeId,
+  visited: List<SemanticDeclaredLayout>,
+  depth: usize
+) -> bool {
+  if depth > 32 { return false }
+  match types.graph_for(value) {
+    None -> false
+    Some(graph) -> match semantic_type_graph_node(graph, value) {
+      SemanticOwnedNode(_) -> true
+      SemanticUniqueNode(_) -> true
+      SemanticUnionNode(left, right) -> checked_linear_type_within(
+        types,
+        declarations,
+        left,
+        visited,
+        depth + 1
+      ) or checked_linear_type_within(types, declarations, right, visited, depth + 1)
+      SemanticRecordNode(fields, _, _) -> {
+        let records = semantic_type_graph_records_local(graph)
+        let count = semantic_type_record_field_count(records, fields)
+        let mut index: usize = 0
+        while index < count {
+          let field_type = semantic_type_graph_record_field_type_id(
+            graph,
+            semantic_type_record_field_edge(records, fields, index)
+          )
+          if checked_linear_type_within(types, declarations, field_type, visited, depth + 1) {
+            return true
+          }
+          index = index + 1
+        }
+        false
+      }
+      SemanticNamedNode(_, role, representation, arguments) -> {
+        let lists = semantic_type_graph_type_lists_local(graph)
+        let count = semantic_type_list_len(lists, arguments)
+        let mut index: usize = 0
+        while index < count {
+          let argument = semantic_type_graph_list_type_id(
+            graph,
+            semantic_type_list_edge(lists, arguments, index)
+          )
+          if checked_linear_type_within(types, declarations, argument, visited, depth + 1) {
+            return true
+          }
+          index = index + 1
+        }
+        match role {
+          SemanticOpaqueType -> checked_linear_type_within(
+            types,
+            declarations,
+            representation,
+            visited,
+            depth + 1
+          )
+          SemanticNominalType -> {
+            let empty = semantic_type_substitution_empty()
+            let layout = match semantic_type_declaration_catalog_resolve(
+              types,
+              declarations,
+              value,
+              empty
+            ) {
+              SemanticRecordDeclarationLayoutMatched(found, _) -> Some(
+                SemanticDeclaredRecordLayout(found)
+              )
+              SemanticVariantDeclarationLayoutMatched(found, _) -> Some(
+                SemanticDeclaredVariantLayout(found)
+              )
+              _ -> None<SemanticDeclaredLayout>()
+            }
+            match layout {
+              None -> false
+              Some(found) -> if linear_layout_visited(visited, found) { false } else {
+                linear_layout_holds(types, declarations, found, visited.prepend(found), depth)
+              }
+            }
+          }
+          _ -> false
+        }
+      }
+      _ -> false
+    }
+  }
+}
+
+fn linear_layout_holds(
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  layout: SemanticDeclaredLayout,
+  visited: List<SemanticDeclaredLayout>,
+  depth: usize
+) -> bool {
+  match layout {
+    SemanticDeclaredRecordLayout(index) -> {
+      let count = match semantic_type_declared_record_field_count(declarations, index) {
+        Some(found) -> found
+        None -> return false
+      }
+      let mut field: usize = 0
+      while field < count {
+        match semantic_type_declared_record_field_type(declarations, index, field) {
+          Some(field_type) -> if checked_linear_type_within(
+            types,
+            declarations,
+            field_type,
+            visited,
+            depth + 1
+          ) {
+            return true
+          }
+          None -> nil
+        }
+        field = field + 1
+      }
+      false
+    }
+    SemanticDeclaredVariantLayout(index) -> {
+      let cases = match semantic_type_declared_variant_case_count(declarations, index) {
+        Some(found) -> found
+        None -> return false
+      }
+      let mut case: usize = 0
+      while case < cases {
+        let payloads = match semantic_type_declared_variant_payload_count(
+          declarations,
+          index,
+          case
+        ) {
+          Some(found) -> found
+          None -> return false
+        }
+        let mut payload: usize = 0
+        while payload < payloads {
+          match semantic_type_declared_variant_payload_type(declarations, index, case, payload) {
+            Some(payload_type) -> if checked_linear_type_within(
+              types,
+              declarations,
+              payload_type,
+              visited,
+              depth + 1
+            ) {
+              return true
+            }
+            None -> nil
+          }
+          payload = payload + 1
+        }
+        case = case + 1
+      }
+      false
+    }
+  }
+}
+
+-- A reference to a binding: moving unless `reading`, and refused when the
+-- value may already have moved.
+fn linear_reference(
+  graphs: borrow CheckedLinearGraphs,
+  state: List<CheckedLinearEntry>,
+  binding: CheckedBindingId,
+  range: CheckedSourceRange,
+  reading: bool
+) -> CheckedLinearVisit {
+  let ordinal = checked_binding_id_ordinal(binding)
+  if not linear_member(graphs.linear, ordinal) {
+    CheckedLinearVisited(linear_flow(state))
+  } else {
+    match linear_lookup(state, ordinal) {
+      Some(_) -> CheckedLinearRefused(CheckedLinearUsedAfterMove(binding, range))
+      None -> CheckedLinearVisited(
+        linear_flow(if reading { state } else { linear_with(state, ordinal, CheckedLinearMoved) })
+      )
+    }
+  }
+}
+
+-- Continue `after` from the normal state of `before`, keeping both loop
+-- exits. A diverged `before` never reaches `after`.
+fn linear_then(
+  before: CheckedLinearFlow,
+  after: CheckedLinearFlow
+) -> CheckedLinearFlow {
+  CheckedLinearFlow {
+    normal: after.normal,
+    breaks: linear_concat(before.breaks, after.breaks),
+    continues: linear_concat(before.continues, after.continues)
+  }
+}
+
+fn linear_sequence(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  first: CheckedLinearVisit,
+  next: CheckedExprId,
+  reading: bool
+) -> CheckedLinearVisit {
+  match first {
+    CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+    CheckedLinearVisited(flow) -> match flow.normal {
+      None -> CheckedLinearVisited(flow)
+      Some(state) -> match linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        next,
+        reading
+      ) {
+        CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+        CheckedLinearVisited(after) -> CheckedLinearVisited(linear_then(flow, after))
+      }
+    }
+  }
+}
+
+fn linear_list(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  first: CheckedLinearVisit,
+  values: CheckedExprListId
+) -> CheckedLinearVisit {
+  let mut visit = first
+  let mut index: usize = 0
+  while index < expressions.expression_list_len(values) {
+    visit = linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      visit,
+      expressions.expression_list_at(values, index),
+      false
+    )
+    index = index + 1
+  }
+  visit
+}
+
+fn linear_fields(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  first: CheckedLinearVisit,
+  fields: CheckedRecordFieldListId
+) -> CheckedLinearVisit {
+  let mut visit = first
+  let mut index: usize = 0
+  while index < expressions.record_field_list_len(fields) {
+    visit = linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      visit,
+      expressions.record_field_list_at(fields, index).value,
+      false
+    )
+    index = index + 1
+  }
+  visit
+}
+
+-- The bindings a pattern introduces, which hold fresh values on entry.
+fn linear_pattern_fresh(
+  patterns: borrow CheckedPatternGraph,
+  state: List<CheckedLinearEntry>,
+  pattern: CheckedPatternId
+) -> List<CheckedLinearEntry> {
+  match patterns.inspect(pattern).node {
+    CheckedBindingPatternNode(binding) -> linear_without(
+      state,
+      checked_binding_id_ordinal(binding)
+    )
+    CheckedTypedBindingPatternNode(binding, _) -> linear_without(
+      state,
+      checked_binding_id_ordinal(binding)
+    )
+    CheckedConstructorPatternNode(_, children, _) -> linear_pattern_list_fresh(
+      patterns,
+      state,
+      children
+    )
+    CheckedTuplePatternNode(items) -> linear_pattern_list_fresh(patterns, state, items)
+    CheckedRecordPatternNode(fields) -> {
+      let mut next = state
+      let mut index: usize = 0
+      while index < patterns.pattern_field_list_len(fields) {
+        next = linear_pattern_fresh(
+          patterns,
+          next,
+          patterns.pattern_field_list_at(fields, index).pattern
+        )
+        index = index + 1
+      }
+      next
+    }
+    CheckedWildcardPatternNode -> state
+    CheckedIntegerPatternNode(_, _) -> state
+    CheckedNilPatternNode -> state
+  }
+}
+
+fn linear_pattern_list_fresh(
+  patterns: borrow CheckedPatternGraph,
+  state: List<CheckedLinearEntry>,
+  items: CheckedPatternListId
+) -> List<CheckedLinearEntry> {
+  let mut next = state
+  let mut index: usize = 0
+  while index < patterns.pattern_list_len(items) {
+    next = linear_pattern_fresh(patterns, next, patterns.pattern_list_at(items, index))
+    index = index + 1
+  }
+  next
+}
+
+fn linear_match(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  state: List<CheckedLinearEntry>,
+  scrutinee: CheckedExprId,
+  arms: CheckedMatchArmListId
+) -> CheckedLinearVisit {
+  let before = match linear_visit(
+    expressions,
+    patterns,
+    closures,
+    effects,
+    propagation,
+    graphs,
+    state,
+    scrutinee,
+    false
+  ) {
+    CheckedLinearRefused(issue) -> return CheckedLinearRefused(issue)
+    CheckedLinearVisited(flow) -> flow
+  }
+  let entry = match before.normal {
+    None -> return CheckedLinearVisited(before)
+    Some(found) -> found
+  }
+  let mut joined: CheckedLinearFlow? = nil
+  let mut index: usize = 0
+  while index < patterns.match_arm_list_len(arms) {
+    let arm = patterns.match_arm_list_at(arms, index)
+    let fresh = linear_pattern_fresh(patterns, entry, arm.pattern)
+    let guarded = match arm.guard {
+      CheckedUnguarded -> CheckedLinearVisited(linear_flow(fresh))
+      CheckedGuarded(guard) -> linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        fresh,
+        guard,
+        false
+      )
+    }
+    let arm_flow = match linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      guarded,
+      arm.body,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> return CheckedLinearRefused(issue)
+      CheckedLinearVisited(flow) -> flow
+    }
+    joined = match joined {
+      nil -> arm_flow
+      existing: CheckedLinearFlow -> linear_branch(existing, arm_flow)
+    }
+    index = index + 1
+  }
+  match joined {
+    nil -> CheckedLinearVisited(linear_then(before, linear_diverged()))
+    arms_flow: CheckedLinearFlow -> CheckedLinearVisited(linear_then(before, arms_flow))
+  }
+}
+
+-- A loop runs its body until the state at its back edges stops changing; it
+-- leaves through its `break`s, or through a failed `while` condition.
+fn linear_loop(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  state: List<CheckedLinearEntry>,
+  condition: Option<CheckedExprId>,
+  body: CheckedExprId
+) -> CheckedLinearVisit {
+  let mut entry = state
+  let mut rounds: usize = 0
+  loop {
+    let (checked, exits) = match condition {
+      None -> (Some(entry), None<List<CheckedLinearEntry>>())
+      Some(guard) -> match linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        entry,
+        guard,
+        false
+      ) {
+        CheckedLinearRefused(issue) -> return CheckedLinearRefused(issue)
+        CheckedLinearVisited(flow) -> (flow.normal, flow.normal)
+      }
+    }
+    let body_flow = match checked {
+      None -> linear_diverged()
+      Some(start) -> match linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        start,
+        body,
+        false
+      ) {
+        CheckedLinearRefused(issue) -> return CheckedLinearRefused(issue)
+        CheckedLinearVisited(flow) -> flow
+      }
+    }
+    let back = match body_flow.normal {
+      Some(end) -> body_flow.continues.prepend(end)
+      None -> body_flow.continues
+    }
+    let next = match linear_join_all(back, None<List<CheckedLinearEntry>>()) {
+      None -> entry
+      Some(joined) -> linear_join(entry, joined)
+    }
+    rounds = rounds + 1
+    if linear_state_eq(next, entry) or rounds > 4 {
+      let leaving = linear_join_all(body_flow.breaks, exits)
+      return CheckedLinearVisited(
+        CheckedLinearFlow {
+          normal: leaving,
+          breaks: Nil<List<CheckedLinearEntry>>(),
+          continues: Nil<List<CheckedLinearEntry>>()
+        }
+      )
+    }
+    entry = next
+  }
+  CheckedLinearVisited(linear_diverged())
+}
+
+fn linear_effect(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  state: List<CheckedLinearEntry>,
+  detail: CheckedEffectExprId
+) -> CheckedLinearVisit {
+  let start = CheckedLinearVisited(linear_flow(state))
+  match effects.inspect(detail) {
+    CheckedPerformDetail(value) -> linear_list(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      start,
+      value.arguments
+    )
+    CheckedHandlerInstallDetail(value) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_list(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        start,
+        value.arguments
+      ),
+      value.body,
+      false
+    )
+    -- The body completes through its return clause, or a clause completes
+    -- the handle without resuming; each clause starts where the handle does.
+    CheckedHandleDetail(value) -> {
+      let body = linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        value.body,
+        false
+      )
+      let completed = match value.return_clause {
+        CheckedNoHandleReturn -> body
+        CheckedHandleReturnClause(binding, clause_body) -> match body {
+          CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+          CheckedLinearVisited(flow) -> match flow.normal {
+            None -> CheckedLinearVisited(flow)
+            Some(end) -> match linear_visit(
+              expressions,
+              patterns,
+              closures,
+              effects,
+              propagation,
+              graphs,
+              linear_without(end, checked_binding_id_ordinal(binding)),
+              clause_body,
+              false
+            ) {
+              CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+              CheckedLinearVisited(after) -> CheckedLinearVisited(linear_then(flow, after))
+            }
+          }
+        }
+      }
+      let mut joined = match completed {
+        CheckedLinearRefused(issue) -> return CheckedLinearRefused(issue)
+        CheckedLinearVisited(flow) -> flow
+      }
+      let mut index: usize = 0
+      while index < effects.clause_list_len(value.clauses) {
+        let clause = effects.clause_list_at(value.clauses, index)
+        let mut fresh = state
+        let mut parameter: usize = 0
+        while parameter < effects.parameter_list_len(clause.parameters) {
+          fresh = linear_without(
+            fresh,
+            checked_binding_id_ordinal(effects.parameter_list_at(clause.parameters, parameter))
+          )
+          parameter = parameter + 1
+        }
+        match linear_visit(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          graphs,
+          fresh,
+          clause.body,
+          false
+        ) {
+          CheckedLinearRefused(issue) -> return CheckedLinearRefused(issue)
+          CheckedLinearVisited(flow) -> { joined = linear_branch(joined, flow) }
+        }
+        index = index + 1
+      }
+      CheckedLinearVisited(joined)
+    }
+  }
+}
+
+fn linear_propagation(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  state: List<CheckedLinearEntry>,
+  detail: CheckedPropagationExprId
+) -> CheckedLinearVisit {
+  match propagation.inspect(detail) {
+    CheckedFailurePropagationDetail(value) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      value.value,
+      false
+    )
+    CheckedOptionalProjectionDetail(value) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      value.base,
+      true
+    )
+  }
+}
+
+fn linear_never(expressions: borrow CheckedExprGraph, expression: CheckedExprId) -> bool {
+  let result = expressions.result_type(expression)
+  let catalog = expressions.types()
+  match catalog.graph_for(result) {
+    Some(graph) -> match semantic_type_graph_node(graph, result) {
+      SemanticBottomNode -> true
+      _ -> false
+    }
+    None -> false
+  }
+}
+
+-- An expression's flow from `state`. `reading` marks a direct operand that
+-- is only read through: the base of a projection or an index.
+fn linear_visit(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  state: List<CheckedLinearEntry>,
+  expression: CheckedExprId,
+  reading: bool
+) -> CheckedLinearVisit {
+  let value = expressions.inspect(expression)
+  let start = CheckedLinearVisited(linear_flow(state))
+  let visited = match value.node {
+    CheckedLocalReferenceNode(binding) -> linear_reference(
+      graphs,
+      state,
+      binding,
+      value.range,
+      reading
+    )
+    CheckedBorrowNode(binding, _) -> linear_reference(graphs, state, binding, value.range, true)
+    CheckedAssignNode(binding, assigned) -> match linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      assigned,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+      CheckedLinearVisited(flow) -> CheckedLinearVisited(
+        CheckedLinearFlow {
+          normal: match flow.normal {
+            Some(end) -> Some(linear_without(end, checked_binding_id_ordinal(binding)))
+            None -> None<List<CheckedLinearEntry>>()
+          },
+          breaks: flow.breaks,
+          continues: flow.continues
+        }
+      )
+    }
+    CheckedLetNode(binding, initializer, body) -> linear_bind(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      binding,
+      initializer,
+      body
+    )
+    CheckedLetMutNode(binding, initializer, body) -> linear_bind(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      binding,
+      initializer,
+      body
+    )
+    CheckedBlockNode(first, rest) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        first,
+        false
+      ),
+      rest,
+      false
+    )
+    CheckedIfNode(condition, when_true, when_false) -> match linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      condition,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+      CheckedLinearVisited(tested) -> match tested.normal {
+        None -> CheckedLinearVisited(tested)
+        Some(entry) -> match (
+          linear_visit(
+            expressions,
+            patterns,
+            closures,
+            effects,
+            propagation,
+            graphs,
+            entry,
+            when_true,
+            false
+          ),
+          linear_visit(
+            expressions,
+            patterns,
+            closures,
+            effects,
+            propagation,
+            graphs,
+            entry,
+            when_false,
+            false
+          ),
+        ) {
+          (CheckedLinearRefused(issue), _) -> CheckedLinearRefused(issue)
+          (_, CheckedLinearRefused(issue)) -> CheckedLinearRefused(issue)
+          (CheckedLinearVisited(first), CheckedLinearVisited(second)) -> CheckedLinearVisited(
+            linear_then(tested, linear_branch(first, second))
+          )
+        }
+      }
+    }
+    CheckedMatchNode(_, scrutinee, arms) -> linear_match(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      scrutinee,
+      arms
+    )
+    CheckedWhileNode(condition, body) -> linear_loop(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      Some(condition),
+      body
+    )
+    CheckedLoopNode(body) -> linear_loop(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      None<CheckedExprId>(),
+      body
+    )
+    CheckedBreakNode(child) -> match linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      child,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+      CheckedLinearVisited(flow) -> CheckedLinearVisited(
+        CheckedLinearFlow {
+          normal: None<List<CheckedLinearEntry>>(),
+          breaks: match flow.normal {
+            Some(end) -> flow.breaks.prepend(end)
+            None -> flow.breaks
+          },
+          continues: flow.continues
+        }
+      )
+    }
+    CheckedBreakNoValueNode -> CheckedLinearVisited(
+      CheckedLinearFlow {
+        normal: None<List<CheckedLinearEntry>>(),
+        breaks: Nil<List<CheckedLinearEntry>>().prepend(state),
+        continues: Nil<List<CheckedLinearEntry>>()
+      }
+    )
+    CheckedContinueNode -> CheckedLinearVisited(
+      CheckedLinearFlow {
+        normal: None<List<CheckedLinearEntry>>(),
+        breaks: Nil<List<CheckedLinearEntry>>(),
+        continues: Nil<List<CheckedLinearEntry>>().prepend(state)
+      }
+    )
+    CheckedReturnNode(child) -> match linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      child,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+      CheckedLinearVisited(flow) -> CheckedLinearVisited(linear_then(flow, linear_diverged()))
+    }
+    -- Cleanup runs after the body however it completes.
+    CheckedDeferNode(cleanup, body, _) -> match linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      body,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+      CheckedLinearVisited(flow) -> {
+        let at_cleanup = match flow.normal {
+          Some(end) -> end
+          None -> state
+        }
+        match linear_visit(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          graphs,
+          at_cleanup,
+          cleanup,
+          false
+        ) {
+          CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+          CheckedLinearVisited(after) -> CheckedLinearVisited(
+            match flow.normal {
+              Some(_) -> linear_then(flow, after)
+              None -> linear_then(flow, linear_diverged())
+            }
+          )
+        }
+      }
+    }
+    CheckedDirectCallNode(_, arguments) -> linear_list(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      start,
+      arguments
+    )
+    CheckedConstructorCallNode(_, arguments) -> linear_list(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      start,
+      arguments
+    )
+    CheckedAssociatedCallNode(_, _, arguments, _) -> linear_list(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      start,
+      arguments
+    )
+    CheckedApplyNode(callee, arguments, _, _) -> linear_list(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        callee,
+        false
+      ),
+      arguments
+    )
+    CheckedGenericCallNode(callee, _) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      callee,
+      false
+    )
+    CheckedMethodCallNode(_, receiver, arguments, _) -> linear_list(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        receiver,
+        false
+      ),
+      arguments
+    )
+    CheckedNotNode(child) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      child,
+      false
+    )
+    CheckedNegateNode(child) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      child,
+      false
+    )
+    CheckedBinaryNode(_, left, right) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        left,
+        false
+      ),
+      right,
+      false
+    )
+    CheckedInterpolationConcatNode(left, right) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        left,
+        false
+      ),
+      right,
+      false
+    )
+    CheckedAddressOfNode(_, child) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      child,
+      true
+    )
+    CheckedDerefNode(child) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      child,
+      true
+    )
+    CheckedPointerAssignNode(pointer, assigned) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        pointer,
+        true
+      ),
+      assigned,
+      false
+    )
+    CheckedDeclaredFieldAccessNode(base, _, _) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      base,
+      true
+    )
+    CheckedStructuralFieldAccessNode(base, _, _) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      base,
+      true
+    )
+    CheckedIndexedLengthNode(base, _, _) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      base,
+      true
+    )
+    CheckedIndexedGetNode(base, index, _, _) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        base,
+        true
+      ),
+      index,
+      false
+    )
+    CheckedIndexedSetNode(base, index, assigned, _, _) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_sequence(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        linear_visit(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          graphs,
+          state,
+          base,
+          true
+        ),
+        index,
+        false
+      ),
+      assigned,
+      false
+    )
+    CheckedIndexedSliceNode(base, first, last, _) -> linear_sequence(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_sequence(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        linear_visit(
+          expressions,
+          patterns,
+          closures,
+          effects,
+          propagation,
+          graphs,
+          state,
+          base,
+          true
+        ),
+        first,
+        false
+      ),
+      last,
+      false
+    )
+    CheckedRecordInitNode(_, fields) -> linear_fields(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      start,
+      fields
+    )
+    CheckedRecordUpdateNode(base, fields) -> linear_fields(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        state,
+        base,
+        false
+      ),
+      fields
+    )
+    CheckedArrayLiteralNode(elements, _) -> linear_list(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      start,
+      elements
+    )
+    -- A closure's own body is checked separately; its captures never
+    -- include a linear value.
+    CheckedLambdaNode(_) -> start
+    CheckedPerformNode(detail) -> linear_effect(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      detail
+    )
+    CheckedHandleNode(detail) -> linear_effect(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      detail
+    )
+    CheckedHandlerInstallNode(detail) -> linear_effect(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      detail
+    )
+    CheckedResumeNode(child) -> linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      child,
+      false
+    )
+    CheckedFailurePropagationNode(detail) -> linear_propagation(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      detail
+    )
+    CheckedOptionalProjectionNode(detail) -> linear_propagation(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      state,
+      detail
+    )
+    CheckedIntegerNode(_) -> start
+    CheckedBooleanNode(_) -> start
+    CheckedNilNode -> start
+    CheckedStringNode(_) -> start
+    CheckedFloatNode(_) -> start
+    CheckedDeclarationReferenceNode(_) -> start
+  }
+  -- An expression of type `never` does not complete.
+  match visited {
+    CheckedLinearVisited(flow) -> match flow.normal {
+      Some(_) -> if linear_never(expressions, expression) {
+        CheckedLinearVisited(linear_then(flow, linear_diverged()))
+      } else { CheckedLinearVisited(flow) }
+      None -> CheckedLinearVisited(flow)
+    }
+    CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+  }
+}
+
+fn linear_bind(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  graphs: borrow CheckedLinearGraphs,
+  state: List<CheckedLinearEntry>,
+  binding: CheckedBindingId,
+  initializer: CheckedExprId,
+  body: CheckedExprId
+) -> CheckedLinearVisit {
+  match linear_visit(
+    expressions,
+    patterns,
+    closures,
+    effects,
+    propagation,
+    graphs,
+    state,
+    initializer,
+    false
+  ) {
+    CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+    CheckedLinearVisited(flow) -> match flow.normal {
+      None -> CheckedLinearVisited(flow)
+      Some(end) -> match linear_visit(
+        expressions,
+        patterns,
+        closures,
+        effects,
+        propagation,
+        graphs,
+        linear_without(end, checked_binding_id_ordinal(binding)),
+        body,
+        false
+      ) {
+        CheckedLinearRefused(issue) -> CheckedLinearRefused(issue)
+        CheckedLinearVisited(after) -> CheckedLinearVisited(linear_then(flow, after))
+      }
+    }
+  }
+}
+
+-- The first linear use a checked module refuses: a capture of a linear
+-- value by any closure, then a use after a possible move in any function or
+-- closure body.
+pub(package) fn checked_linearity_issue(
+  expressions: borrow CheckedExprGraph,
+  patterns: borrow CheckedPatternGraph,
+  closures: borrow CheckedClosureGraph,
+  effects: borrow CheckedEffectGraph,
+  propagation: borrow CheckedPropagationGraph,
+  declarations: borrow SemanticTypeDeclarationCatalog
+) -> CheckedLinearIssue? {
+  let types = expressions.types()
+  let mut linear = Nil<usize>()
+  let mut binding_index: usize = 0
+  while binding_index < expressions.binding_len() {
+    let binding = checked_binding_id_from_ordinal(expressions.segment(), binding_index)
+    if checked_linear_type(types, declarations, expressions.binding(binding).value_type) {
+      linear = linear.prepend(binding_index)
+    }
+    binding_index = binding_index + 1
+  }
+  match linear {
+    Nil -> return nil
+    _ -> nil
+  }
+  let graphs = CheckedLinearGraphs { linear: linear }
+  let mut lambda_index: usize = 0
+  while lambda_index < closures.len() {
+    let lambda = checked_lambda_id(closures.segment(), lambda_index)
+    let closure = closures.inspect(lambda)
+    let mut capture: usize = 0
+    while capture < closures.binding_list_len(closure.captures) {
+      let binding = closures.binding_list_at(closure.captures, capture)
+      if linear_member(linear, checked_binding_id_ordinal(binding)) {
+        return CheckedLinearCaptured(binding, expressions.range(closure.body))
+      }
+      capture = capture + 1
+    }
+    match linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      Nil<CheckedLinearEntry>(),
+      closure.body,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> return issue
+      CheckedLinearVisited(_) -> nil
+    }
+    lambda_index = lambda_index + 1
+  }
+  let mut function_index: usize = 0
+  while function_index < expressions.function_len() {
+    match linear_visit(
+      expressions,
+      patterns,
+      closures,
+      effects,
+      propagation,
+      graphs,
+      Nil<CheckedLinearEntry>(),
+      expressions.function(function_index).root,
+      false
+    ) {
+      CheckedLinearRefused(issue) -> return issue
+      CheckedLinearVisited(_) -> nil
+    }
+    function_index = function_index + 1
+  }
+  nil
+}
