@@ -18866,6 +18866,13 @@ fn checked_body_constructor_finish(
   }
 }
 
+-- Which field a projection reads: a structural record's field by stable key
+-- and placement, or a declared record's field by declaration and ordinal.
+type CheckedFieldProjection {
+  CheckedStructuralFieldProjection(i64, CheckedStructuralFieldPosition),
+  CheckedDeclaredFieldProjection(DeclarationIdentity, usize)
+}
+
 type CheckedConstructorBounds {
   CheckedConstructorBoundsSatisfied,
   CheckedConstructorBoundsRejected(SemanticTypeCatalog, CheckedBodyProducerIssue)
@@ -21054,6 +21061,55 @@ fn checked_body_field_access_value(
   }
 }
 
+-- A field projected through a borrow is seen as a borrowed view with the
+-- borrow's access, as a pattern over a borrowed record sees it.
+fn checked_body_field_through(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  field_type: SemanticTypeId,
+  borrowed: Option<SemanticMutability>
+) -> (owned CheckedBodyBuild, CheckedBodyPrimitiveTypes, SemanticTypeId) {
+  match borrowed {
+    None -> (state, types, field_type)
+    Some(access) -> checked_body_borrowed_field_view(state, types, field_type, access)
+  }
+}
+
+fn checked_body_publish_field(
+  state: owned CheckedBodyBuild,
+  checked_base: CheckedExprId,
+  field: CheckedFieldProjection,
+  result: SemanticTypeId,
+  field_range: CheckedSourceRange,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = state.types()
+  if not expectation_allows(catalog, result, expectation) {
+    CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
+  } else {
+    match covering_range(state.range(checked_base), field_range) {
+      nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+      range: CheckedSourceRange -> match field {
+        CheckedStructuralFieldProjection(stable_key, place) ->
+          match state.structural_field_access(
+            checked_base,
+            stable_key,
+            place,
+            result,
+            range
+          ) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+        CheckedDeclaredFieldProjection(declaration, field_index) ->
+          match
+          state.declared_field_access(checked_base, declaration, field_index, result, range) {
+            (state, expression) -> CheckedBodyExprBuilt(state, expression)
+          }
+      }
+    }
+  }
+}
+
 fn checked_body_project_field(
   state: owned CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
@@ -21064,51 +21120,40 @@ fn checked_body_project_field(
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   let catalog = state.types()
-  match semantic_record_field_projection(
-    catalog,
-    base_type,
-    field_name
-  ) {
-    SemanticRecordFieldProjected(stable_key, word_offset, result) ->
-      if expectation_allows(catalog, result, expectation) {
-        match covering_range(state.range(checked_base), field_range) {
-          range: CheckedSourceRange -> match state.structural_field_access(
-            checked_base,
-            stable_key,
-            CheckedStructuralFieldWordOffset(word_offset),
-            result,
-            range
-          ) {
-            (state, expression) -> CheckedBodyExprBuilt(state, expression)
-          }
-          nil -> CheckedBodyExprRejected(
-            state,
-            CheckedBodyProducerInvalidRange
-          )
-        }
-      } else {
-        CheckedBodyExprRejected(
-          state,
-          expectation_mismatch(result, expectation)
-        )
-      }
-    SemanticRecordFieldUnplaced(stable_key, exact_name, result) ->
-      if expectation_allows(catalog, result, expectation) {
-        match covering_range(state.range(checked_base), field_range) {
-          range: CheckedSourceRange -> match state.structural_field_access(
-            checked_base,
-            stable_key,
-            CheckedStructuralFieldUnplaced(exact_name),
-            result,
-            range
-          ) {
-            (state, expression) -> CheckedBodyExprBuilt(state, expression)
-          }
-          nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
-        }
-      } else {
-        CheckedBodyExprRejected(state, expectation_mismatch(result, expectation))
-      }
+  -- A borrowed record is projected through its borrow.
+  let (record_type, borrowed) = match catalog.graph_for(base_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, base_type) {
+      SemanticBorrowNode(inner, access) -> (inner, Some(access))
+      _ -> (base_type, None<SemanticMutability>())
+    }
+    None -> (base_type, None<SemanticMutability>())
+  }
+  match semantic_record_field_projection(catalog, record_type, field_name) {
+    SemanticRecordFieldProjected(stable_key, word_offset, result) -> {
+      let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+      checked_body_publish_field(
+        state,
+        checked_base,
+        CheckedStructuralFieldProjection(
+          stable_key,
+          CheckedStructuralFieldWordOffset(word_offset)
+        ),
+        view,
+        field_range,
+        expectation
+      )
+    }
+    SemanticRecordFieldUnplaced(stable_key, exact_name, result) -> {
+      let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+      checked_body_publish_field(
+        state,
+        checked_base,
+        CheckedStructuralFieldProjection(stable_key, CheckedStructuralFieldUnplaced(exact_name)),
+        view,
+        field_range,
+        expectation
+      )
+    }
     SemanticRecordFieldMissing -> CheckedBodyExprRejected(
       state,
       CheckedBodyProducerUnknownField(field_range)
@@ -21117,34 +21162,21 @@ fn checked_body_project_field(
       let (state, types, projection) = checked_body_declared_field(
         state,
         types,
-        base_type,
+        record_type,
         field_name
       )
-      let catalog = state.types()
       match projection {
-        SemanticDeclaredFieldProjected(declaration, field_index, result) ->
-          if expectation_allows(catalog, result, expectation) {
-            match covering_range(state.range(checked_base), field_range) {
-              range: CheckedSourceRange -> match state.declared_field_access(
-                checked_base,
-                declaration,
-                field_index,
-                result,
-                range
-              ) {
-                (state, expression) -> CheckedBodyExprBuilt(state, expression)
-              }
-              nil -> CheckedBodyExprRejected(
-                state,
-                CheckedBodyProducerInvalidRange
-              )
-            }
-          } else {
-            CheckedBodyExprRejected(
-              state,
-              expectation_mismatch(result, expectation)
-            )
-          }
+        SemanticDeclaredFieldProjected(declaration, field_index, result) -> {
+          let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+          checked_body_publish_field(
+            state,
+            checked_base,
+            CheckedDeclaredFieldProjection(declaration, field_index),
+            view,
+            field_range,
+            expectation
+          )
+        }
         SemanticDeclaredFieldMissing -> CheckedBodyExprRejected(
           state,
           CheckedBodyProducerUnknownField(field_range)
