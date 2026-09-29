@@ -224,8 +224,18 @@ check_rejects "field_access_generic_impl" "test/negative/field_access_generic_im
 check_rejects "entry_unhandled_effect" "test/negative/entry_unhandled_effect.weft" 'entry point `main` requires unhandled effects' 1
 check_rejects "entry_unhandled_effect_unused" "test/negative/entry_unhandled_effect_unused.weft" 'entry point `main` requires unhandled effects' 1
 check_rejects "entry_unhandled_effect_open_tail" "test/negative/entry_unhandled_effect_open_tail.weft" 'entry point `main` requires unhandled effects' 1
-check_rejects "entry_unhandled_effect_unannotated" "test/negative/entry_unhandled_effect_unannotated.weft" 'effect `EntryRead` is not available in this context' 1
+check_rejects "entry_unhandled_effect_unannotated" "test/negative/entry_unhandled_effect_unannotated.weft" 'error[E0004]: expected '"'"'->'"'"' or '"'"'-[effects]>'"'"' and a result type' 1
 check_rejects "entry_unhandled_effect_parameterized" "test/negative/entry_unhandled_effect_parameterized.weft" 'entry point `main` requires unhandled effects' 1
+check_rejects "signature_missing_result" "test/negative/signature_missing_result.weft" 'error[E0004]: expected '"'"'->'"'"' or '"'"'-[effects]>'"'"' and a result type; a function declaration states what it returns and performs' 1
+check_rejects "signature_missing_result_effectful" "test/negative/signature_missing_result_effectful.weft" 'error[E0004]: expected '"'"'->'"'"' or '"'"'-[effects]>'"'"' and a result type; a function declaration states what it returns and performs' 1
+check_rejects "signature_trait_method_missing_result" "test/negative/signature_trait_method_missing_result.weft" 'error[E0004]: expected '"'"'->'"'"' or '"'"'-[effects]>'"'"' and a result type; a function declaration states what it returns and performs' 1
+check_rejects "signature_effect_operation_missing_result" "test/negative/signature_effect_operation_missing_result.weft" 'error[E0004]: expected '"'"'->'"'"' or '"'"'-[effects]>'"'"' and a result type; a function declaration states what it returns and performs' 1
+check_rejects "signature_missing_parameter_type" "test/negative/signature_missing_parameter_type.weft" 'error[E0004]: expected '"'"':'"'"' and a type for this parameter; a function declaration states every parameter'"'"'s type' 1
+check_rejects "signature_missing_positional_parameter_type" "test/negative/signature_missing_positional_parameter_type.weft" 'error[E0004]: expected '"'"':'"'"' and a type for this parameter; a function declaration states every parameter'"'"'s type' 1
+check_rejects "signature_free_function_self" "test/negative/signature_free_function_self.weft" 'error[E0004]: expected '"'"':'"'"' and a type for this parameter; a function declaration states every parameter'"'"'s type' 1
+check_rejects "signature_impl_method_missing_parameter_type" "test/negative/signature_impl_method_missing_parameter_type.weft" 'error[E0004]: expected '"'"':'"'"' and a type for this parameter; a function declaration states every parameter'"'"'s type' 1
+check_rejects "signature_effect_operation_missing_parameter_type" "test/negative/signature_effect_operation_missing_parameter_type.weft" 'error[E0004]: expected '"'"':'"'"' and a type for this parameter; a function declaration states every parameter'"'"'s type' 1
+check_rejects "signature_handler_constructor_missing_parameter_type" "test/negative/signature_handler_constructor_missing_parameter_type.weft" 'error[E0004]: expected '"'"':'"'"' and a type for this parameter; a function declaration states every parameter'"'"'s type' 1
 check_rejects "import_missing_path" "test/negative/import_missing_path.weft" "expected path-form module after 'use'"
 check_rejects "import_dangling_selection_dot" "test/negative/import_dangling_selection_dot.weft" "expected '{' after '.' in import selection"
 check_rejects "import_unclosed_selection" "test/negative/import_unclosed_selection.weft" "expected '}' after import selection"

@@ -136,6 +136,30 @@ if [ "$mode" = all ] || [ "$mode" = rejections ]; then
     grep -Fq 'error[E0002]' "$work_dir/diagnostic.txt"
   done
 
+  # A declaration that omits a parameter type or its result is incomplete
+  # in both grammars; the compiler names the rule with its own code.
+  for fixture in signature_missing_result signature_missing_result_effectful \
+    signature_trait_method_missing_result signature_effect_operation_missing_result \
+    signature_missing_parameter_type signature_missing_positional_parameter_type \
+    signature_free_function_self signature_impl_method_missing_parameter_type \
+    signature_effect_operation_missing_parameter_type \
+    signature_handler_constructor_missing_parameter_type; do
+    source="$repo_root/test/negative/$fixture.weft"
+    if "$tree_sitter" parse --lib-path "$parser" --lang-name weft --quiet \
+      "$source" > "$work_dir/rejection.txt" 2>&1; then
+      echo "tree-sitter-weft: accepted an incomplete signature in $fixture" >&2
+      exit 1
+    fi
+    grep -Eq 'ERROR|MISSING' "$work_dir/rejection.txt"
+    if (cd "$repo_root" && "$weft" fmt "$source") \
+      > "$work_dir/formatted.weft" 2> "$work_dir/diagnostic.txt"; then
+      echo "weft: accepted an incomplete signature in $fixture" >&2
+      exit 1
+    fi
+    test ! -s "$work_dir/formatted.weft"
+    grep -Fq 'error[E0004]' "$work_dir/diagnostic.txt"
+  done
+
   for fixture in interp_unterminated_expression interp_unmatched_close \
     interp_backslash_brace interp_backslash_close_brace \
     interp_empty_expression interp_multiple_expressions; do
