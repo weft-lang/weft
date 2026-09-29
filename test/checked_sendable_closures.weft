@@ -1,0 +1,222 @@
+-- Sendable function values on the typed path: `F & Sendable` is a function
+-- whose captured environment is Sendable. A lambda proves it from its
+-- captures, a named function captures nothing, and a value already typed
+-- `F & Sendable` carries its proof; a function type alone proves nothing.
+
+use compiler/project/identity.{ModuleIdentity, named_module_identity}
+use compiler/source/input.{source_from_text}
+use compiler/weft/check/body/installer.{CheckedModuleOrdinaryRejected}
+use compiler/weft/check/checked_module.{
+  CheckedModuleAccepted,
+  CheckedModuleBodyRejected,
+  CheckedModuleResolutionRejected,
+  check_registered_module_with_resolution
+}
+use compiler/weft/check/registration/catalog as registration
+use compiler/weft/check/registration/catalog.{RegisteredModule}
+use compiler/weft/check/registration/scope as registration_scope
+use compiler/weft/check/rejection.{checked_body_producer_issue_category}
+use compiler/weft/check/resolution.{SemanticResolutionAccepted, resolve_module_semantics}
+use compiler/weft/grammar.{ParsedWeftSource, WeftParser}
+use stdlib/diagnostic.{Diagnose}
+use stdlib/grammar.{Grammar, Parsed}
+use stdlib/list as list
+use stdlib/list.{Cons, List, Nil}
+use stdlib/option.{Option}
+use stdlib/panic.{panic}
+use stdlib/string.{str_concat}
+use stdlib/test.{Test}
+
+fn parse(text: str) -[Test]> ParsedWeftSource {
+  let result = handle WeftParser().parse(source_from_text(text).all()) {
+    Diagnose.report(diagnostic) -> { Test.assert_true(false); resume(0) }
+    Diagnose.error(message, location) -> { Test.assert_true(false); resume(0) }
+    Diagnose.warn(message, location) -> resume(0)
+    Diagnose.note(message, location) -> resume(0)
+  }
+  match result {
+    Parsed(syntax) -> syntax
+    _ -> panic("expected complete authored syntax")
+  }
+}
+
+fn registered(text: str, module: ModuleIdentity) -[Test]> RegisteredModule {
+  let parsed = parse(text)
+  registration.register(parsed.declarations, parsed.source.source(), module)
+}
+
+-- Boundaries that require Sendable callbacks, as the SDK's parallel and task
+-- APIs do, beside a pure and an effectful shape.
+fn boundaries() -> str {
+  "use stdlib/vector/handles.{Vector} "
+    |> str_concat("effect Tick { fn tick() -> i64 } ")
+    |> str_concat("fn run<T: Sendable>(f: (() -> T) & Sendable) -> T { f() } ")
+    |> str_concat("fn run_i64(f: (() -> i64) & Sendable) -> i64 { f() } ")
+    |> str_concat("fn apply(f: ((i64) -> i64) & Sendable) -> i64 { f(1) } ")
+    |> str_concat("fn ticking(f: (() -[Tick]> i64) & Sendable) -[Tick]> i64 { f() } ")
+    |> str_concat("fn measure<T>(value: T) -> i64 { 1 } ")
+}
+
+-- Check `program` beside the sealed SDK vector handle, through the production
+-- checker whose conformance oracle decides Sendable structurally.
+fn outcome(program: str, discriminator: i64) -[Test]> str {
+  let handles = registered(
+    "pub type Vector<T> { }",
+    named_module_identity("stdlib/vector/handles", discriminator)
+  )
+  let consumer = registered(
+    str_concat(boundaries(), program),
+    named_module_identity("fixture/sendable_closures", discriminator)
+  )
+  let edge = registration_scope.resolved_import(
+    consumer,
+    consumer.syntax.imports.get(0).unwrap(),
+    handles.identity,
+    false
+  )
+  let modules = [handles, consumer]
+  let imports = [edge]
+  let scope = registration_scope.registration_scope_build(
+    list.from_slice(modules[..]),
+    list.from_slice(imports[..])
+  )
+  match resolve_module_semantics(consumer, scope) {
+    SemanticResolutionAccepted(resolution) -> match check_registered_module_with_resolution(
+      consumer,
+      scope,
+      resolution,
+      discriminator
+    ) {
+      CheckedModuleAccepted(_) -> "accepted"
+      CheckedModuleBodyRejected(CheckedModuleOrdinaryRejected(_, issue, _)) ->
+        checked_body_producer_issue_category(issue)
+      CheckedModuleBodyRejected(_) -> "installer"
+      CheckedModuleResolutionRejected(_) -> "resolution"
+      _ -> "other"
+    }
+    _ -> "unresolved"
+  }
+}
+
+fn assert_outcomes(cases: List<str>, expected: str, discriminator: i64) -[Test]> nil {
+  match cases {
+    Nil -> nil
+    Cons(program, rest) -> {
+      Test.assert_str_eq(outcome(program, discriminator), expected)
+      assert_outcomes(rest, expected, discriminator + 1)
+    }
+  }
+}
+
+test "a lambda is Sendable when everything it captures is" {
+  let accepted = [
+    "fn main() -> i64 { run(() => 1) }",
+    "fn main() -> i64 { let base = 41 run_i64(() => base + 1) }",
+    "fn main() -> i64 { let pair = (20, 22) run_i64(() => pair.0 + pair.1) }",
+    "fn main() -> i64 { let name = \"weft\" run_i64(() => measure(name)) }",
+    -- A variable bounded by Sendable in the enclosing function is Sendable.
+    "fn keep<T: Sendable>(value: T) -> i64 { run_i64(() => measure(value)) }",
+    -- A lambda with its own parameters proves only its captures.
+    "fn main() -> i64 { let step = 1 apply((x: i64) => x + step) }"
+  ]
+  assert_outcomes(list.from_slice(accepted[..]), "accepted", 6101)
+  let refused = [
+    -- A mutable container reaches shared mutable state.
+    "fn size(items: Vector<i64>) -> i64 { run_i64(() => measure(items)) }",
+    -- An unbounded variable may be instantiated with anything.
+    "fn count<T>(value: T) -> i64 { run_i64(() => measure(value)) }",
+    -- A captured function value proves nothing about its own captures.
+    "fn wrap(f: () -> i64) -> i64 { run_i64(() => f()) }"
+  ]
+  assert_outcomes(list.from_slice(refused[..]), "sendable_capture_unproven", 6121)
+}
+
+test "named functions and refined values carry their proof" {
+  let accepted = [
+    "fn one() -> i64 { 1 } fn main() -> i64 { run_i64(one) }",
+    "fn next(x: i64) -> i64 { x + 1 } fn main() -> i64 { apply(next) }",
+    -- A generic function instantiates at the expected function type.
+    "fn same<T>(value: T) -> T { value } fn main() -> i64 { apply(same) }",
+    -- A value already typed `F & Sendable` passes on and may be captured.
+    "fn relay(f: (() -> i64) & Sendable) -> i64 { run_i64(f) }",
+    "fn wrap(f: (() -> i64) & Sendable) -> i64 { run_i64(() => f() + 1) }",
+    "fn relay<T: Sendable>(f: (() -> T) & Sendable) -> T { run(f) }",
+    -- The atom may be written on either side.
+    "fn relay(f: Sendable & (() -> i64)) -> i64 { run_i64(f) }",
+    "fn wrap(f: Sendable & (() -> i64)) -> i64 { run_i64(() => f() + 1) }"
+  ]
+  assert_outcomes(list.from_slice(accepted[..]), "accepted", 6141)
+  -- A function type alone is not proof: nothing says what its value captured.
+  let refused = [
+    "fn relay(f: () -> i64) -> i64 { run_i64(f) }",
+    "fn relay(f: (i64) -> i64) -> i64 { apply(f) }"
+  ]
+  assert_outcomes(list.from_slice(refused[..]), "type_mismatch", 6161)
+}
+
+test "an effectful callback is Sendable when its captures are" {
+  let accepted = [
+    "fn main() -> i64 { let base = 1 handle ticking(() => Tick.tick() + base) { Tick.tick() -> resume(41) } }",
+    "fn relay(f: (() -[Tick]> i64) & Sendable) -[Tick]> i64 { ticking(f) }"
+  ]
+  assert_outcomes(list.from_slice(accepted[..]), "accepted", 6171)
+  Test.assert_str_eq(
+    outcome(
+      "fn size(items: Vector<i64>) -[Tick]> i64 { ticking(() => Tick.tick() + measure(items)) }",
+      6181
+    ),
+    "sendable_capture_unproven"
+  )
+}
+
+-- A trait names a set of values in any type expression, so `i64 & Show` is
+-- the i64 values whose type implements Show.
+test "trait atoms name value sets in type expressions" {
+  let show = "trait Show { fn show(self) -> i64 } "
+  Test.assert_str_eq(
+    outcome(
+      str_concat(
+        show,
+        "impl Show for i64 { fn show(self) -> i64 { self } } fn f(x: i64 & Show) -> i64 { x } fn main() -> i64 { f(1) }"
+      ),
+      6191
+    ),
+    "accepted"
+  )
+  -- Nothing implements Show for i64, so 1 is not in `i64 & Show`.
+  Test.assert_str_eq(
+    outcome(str_concat(show, "fn f(x: i64 & Show) -> i64 { x } fn main() -> i64 { f(1) }"), 6192),
+    "type_mismatch"
+  )
+  -- A name no type or trait declares still resolves to nothing.
+  Test.assert_str_eq(outcome("fn f(x: i64 & Missing) -> i64 { x }", 6193), "unresolved")
+  -- Trait arguments are not yet part of a type expression's trait atom.
+  Test.assert_str_eq(
+    outcome(str_concat(show, "fn f(x: i64 & Show<i64>) -> i64 { x }"), 6194),
+    "unresolved"
+  )
+}
+
+test "a generic function instantiates at an expected function type" {
+  let apply = "fn apply_plain(f: (i64) -> i64) -> i64 { f(1) } "
+  Test.assert_str_eq(
+    outcome(
+      str_concat(
+        apply,
+        "fn same<T>(value: T) -> T { value } fn main() -> i64 { apply_plain(same) }"
+      ),
+      6195
+    ),
+    "accepted"
+  )
+  Test.assert_str_eq(
+    outcome(
+      str_concat(
+        apply,
+        "fn text<T>(value: T) -> str { \"x\" } fn main() -> i64 { apply_plain(text) }"
+      ),
+      6196
+    ),
+    "type_mismatch"
+  )
+}

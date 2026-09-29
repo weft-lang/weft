@@ -225,6 +225,7 @@ use compiler/types/graph.{
   SemanticI32,
   SemanticI64,
   SemanticI8,
+  SemanticIntersectionNode,
   SemanticIsize,
   SemanticImmutable,
   SemanticMutable,
@@ -674,6 +675,8 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerGenericInferenceIncomplete(CheckedSourceRange),
   CheckedBodyProducerLambdaContextRequired(CheckedSourceRange),
   CheckedBodyProducerLambdaCaptureUnsupported(CheckedSourceRange),
+  -- A lambda expected to be Sendable captures a value not proven Sendable.
+  CheckedBodyProducerSendableCaptureUnproven(CheckedSourceRange),
   CheckedBodyProducerGenericDeclarationRequired(CheckedSourceRange),
   CheckedBodyProducerCallableRequired(SemanticTypeId),
   CheckedBodyProducerContinuationConsumerRequired(CheckedSourceRange),
@@ -7303,6 +7306,12 @@ fn checked_body_capture_type_safe(
       SemanticVariableNode(_) -> true
       SemanticRecordNode(fields, _, SemanticClosedRecord) ->
         checked_body_capture_record_fields_safe(state, graph, fields)
+      -- A trait refinement such as `F & Sendable` is captured as its value.
+      SemanticIntersectionNode(left, right) -> if checked_body_trait_atom(catalog, right) {
+        checked_body_capture_type_safe(state, left)
+      } else if checked_body_trait_atom(catalog, left) {
+        checked_body_capture_type_safe(state, right)
+      } else { false }
       _ -> false
     }
   }
@@ -7379,6 +7388,106 @@ fn checked_body_lambda_rejected(
   CheckedBodyExprRejected(state, issue)
 }
 
+-- The function type a value implements, and the sealed Sendable atom when
+-- the expectation is `F & Sendable`.
+fn checked_body_lambda_target(
+  catalog: borrow SemanticTypeCatalog,
+  expected: SemanticTypeId
+) -> (SemanticTypeId, Option<SemanticTypeId>) {
+  match catalog.graph_for(expected) {
+    Some(graph) -> match semantic_type_graph_node(graph, expected) {
+      SemanticIntersectionNode(left, right) -> if semantic_type_is_sendable_atom(catalog, right) {
+        (left, Some(right))
+      } else if semantic_type_is_sendable_atom(catalog, left) {
+        (right, Some(left))
+      } else { (expected, None<SemanticTypeId>()) }
+      _ -> (expected, None<SemanticTypeId>())
+    }
+    None -> (expected, None<SemanticTypeId>())
+  }
+}
+
+-- Whether every capture of a lambda that must be Sendable is. A captured
+-- function value counts only when its own type already carries the proof.
+fn checked_body_lambda_captures_sendable(
+  state: borrow CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  sendable: Option<SemanticTypeId>,
+  captures: List<CheckedBindingId>
+) -[SemanticConformance]> bool {
+  match sendable {
+    None -> true
+    Some(atom) -> {
+      let catalog = state.types()
+      let mut remaining = captures
+      loop {
+        match remaining {
+          Nil -> return true
+          Cons(binding, rest) -> {
+            let detail = state.binding_info(binding)
+            if not checked_body_bound_holds(types, catalog, owner, detail.value_type, atom) {
+              return false
+            }
+            remaining = rest
+          }
+        }
+      }
+      false
+    }
+  }
+}
+
+-- A function value proven Sendable takes its function type refined by the
+-- sealed atom, so the proof travels with the value to later expectations.
+fn checked_body_refine_sendable(
+  catalog: SemanticTypeCatalog,
+  types: CheckedBodyPrimitiveTypes,
+  value_type: SemanticTypeId,
+  atom: SemanticTypeId
+) -> (SemanticTypeCatalog, SemanticTypeId) {
+  let module = types.module
+  let resolution = types.resolution
+  let segment = semantic_type_derived_segment_id(
+    module.identity,
+    catalog.next_derived_segment(module.identity, resolution.next_type_segment())
+  )
+  let builder = semantic_type_graph_builder(segment)
+  let (builder, refined) = builder.intersection(value_type, atom)
+  (semantic_type_catalog_with_graph(catalog, builder.freeze()), refined)
+}
+
+fn checked_body_trait_atom(catalog: borrow SemanticTypeCatalog, value: SemanticTypeId) -> bool {
+  match catalog.graph_for(value) {
+    Some(graph) -> match semantic_type_graph_node(graph, value) {
+      SemanticTraitNode(_, _) -> true
+      _ -> false
+    }
+    None -> false
+  }
+}
+
+-- The function a callee value applies: its own function type, or the one a
+-- trait refinement such as `F & Sendable` narrows, since a trait atom adds no
+-- way to call.
+fn checked_body_callable_signature(
+  catalog: borrow SemanticTypeCatalog,
+  callee_type: SemanticTypeId
+) -> Option<SemanticTypeId> {
+  if semantic_function_type(catalog, callee_type) { return Some(callee_type) }
+  match catalog.graph_for(callee_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, callee_type) {
+      SemanticIntersectionNode(left, right) -> if checked_body_trait_atom(catalog, right) {
+        checked_body_callable_signature(catalog, left)
+      } else if checked_body_trait_atom(catalog, left) {
+        checked_body_callable_signature(catalog, right)
+      } else { None<SemanticTypeId>() }
+      _ -> None<SemanticTypeId>()
+    }
+    None -> None<SemanticTypeId>()
+  }
+}
+
 fn checked_body_lambda(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -7405,8 +7514,11 @@ fn checked_body_lambda(
         source_site,
         site
       )
-      CheckedRequireResult(function_type) -> {
+      CheckedRequireResult(required) -> {
         let catalog = state.types()
+        -- A lambda implements the function of its expectation. A `Sendable`
+        -- expectation also asks that its captured environment be Sendable.
+        let (function_type, sendable) = checked_body_lambda_target(catalog, required)
         match catalog.graph_for(function_type) {
           Some(graph) -> match semantic_type_graph_node(graph, function_type) {
             SemanticFunctionNode(_, result, _) -> {
@@ -7464,10 +7576,22 @@ fn checked_body_lambda(
                         first_expression,
                         first_binding
                       )
+                      let outer_types = checked_body_types_with_catalog(types, state.types())
                       if not checked_body_lambda_captures_safe(state, captures) {
                         CheckedBodyExprRejected(
                           state,
                           CheckedBodyProducerLambdaCaptureUnsupported(site)
+                        )
+                      } else if not checked_body_lambda_captures_sendable(
+                        state,
+                        outer_types,
+                        owner,
+                        sendable,
+                        captures
+                      ) {
+                        CheckedBodyExprRejected(
+                          state,
+                          CheckedBodyProducerSendableCaptureUnproven(site)
                         )
                       } else {
                         match covering_range(site, state.range(checked_body)) {
@@ -7509,6 +7633,19 @@ fn checked_body_lambda(
                                   lambda_result,
                                   frame
                                 )
+                              }
+                              let (next_catalog, lambda_type) = match sendable {
+                                None -> (next_catalog, lambda_type)
+                                Some(atom) -> if semantic_type_id_eq(lambda_type, function_type) {
+                                  (next_catalog, required)
+                                } else {
+                                  checked_body_refine_sendable(
+                                    next_catalog,
+                                    types,
+                                    lambda_type,
+                                    atom
+                                  )
+                                }
                               }
                               match state.with_types(next_catalog).lambda(
                                 bindings,
@@ -17782,12 +17919,16 @@ fn checked_body_complete_generic_arguments(
         Lambda(lambda_parameters, lambda_body, lambda_site) -> {
           let catalog = state.types()
           let parameter = semantic_function_parameter(catalog, context.signature, index)
-          let (state, substitution) = match catalog.graph_for(parameter) {
-            Some(graph) -> match semantic_type_graph_node(graph, parameter) {
+          -- The lambda is checked against the whole parameter, so a Sendable
+          -- refinement reaches it; inference reads the function it implements,
+          -- which carries every type variable.
+          let (parameter_function, _) = checked_body_lambda_target(catalog, parameter)
+          let (state, substitution) = match catalog.graph_for(parameter_function) {
+            Some(graph) -> match semantic_type_graph_node(graph, parameter_function) {
               SemanticFunctionNode(_, _, _) -> checked_body_infer_lambda_annotations(
                 state,
                 context,
-                parameter,
+                parameter_function,
                 lambda_parameters,
                 0,
                 substitution
@@ -17817,9 +17958,14 @@ fn checked_body_complete_generic_arguments(
           let next_state = state.with_types(next_catalog)
           -- The callee's effect tail on this parameter, when no earlier argument
           -- has bound it: the lambda's body is then the source of its binding.
-          let tail = checked_body_inferable_effect_tail(next_catalog, parameter, substitution)
+          let tail = checked_body_inferable_effect_tail(
+            next_catalog,
+            parameter_function,
+            substitution
+          )
+          let (specialized_function, _) = checked_body_lambda_target(next_catalog, specialized)
           let inference = CheckedLambdaInference {
-            result: if semantic_function_result_is_variable(next_catalog, specialized) {
+            result: if semantic_function_result_is_variable(next_catalog, specialized_function) {
               CheckedLambdaInferred
             } else { CheckedLambdaExpected },
             effects: match tail {
@@ -17845,20 +17991,24 @@ fn checked_body_complete_generic_arguments(
               issue
             )
             CheckedBodyExprBuilt(state, checked_argument) -> {
-              let actual = state.result_type(checked_argument)
+              let argument_catalog = state.types()
+              let (actual, _) = checked_body_lambda_target(
+                argument_catalog,
+                state.result_type(checked_argument)
+              )
               let argument_range = state.range(checked_argument)
               let matched = match tail {
                 None -> checked_body_match_generic_argument(
                   state,
                   context.types,
-                  parameter,
+                  parameter_function,
                   substitution,
                   actual
                 )
                 Some(variable) -> checked_body_match_effect_row(
                   state,
                   context.types,
-                  parameter,
+                  parameter_function,
                   substitution,
                   actual,
                   variable
@@ -17960,6 +18110,7 @@ fn checked_body_inferred_function_reference(
   declaration: DeclarationIdentity,
   signature: SemanticFunctionSignature,
   expected: SemanticTypeId,
+  sendable: Option<SemanticTypeId>,
   range: CheckedSourceRange
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   let catalog = state.types()
@@ -18024,11 +18175,15 @@ fn checked_body_inferred_function_reference(
                 CheckedBodyProducerTypeMismatch(specialized, expected)
               )
             } else {
+              let (published_catalog, published) = match sendable {
+                None -> (next_catalog, specialized)
+                Some(atom) -> checked_body_refine_sendable(next_catalog, types, specialized, atom)
+              }
               match state.declaration_reference(declaration, specialized, range) {
-                (state, reference) -> match state.generic_call(
+                (state, reference) -> match state.with_types(published_catalog).generic_call(
                   reference,
                   resolved,
-                  specialized,
+                  published,
                   range
                 ) {
                   (state, generic) -> CheckedBodyExprBuilt(state, generic)
@@ -20064,33 +20219,51 @@ fn checked_body_value_declaration(
   ) {
     CheckedBodySignatureFound(state, signature) -> {
       let catalog = state.types()
-      if expectation_allows(catalog, signature.type_id, expectation) {
-        match expectation {
-          CheckedRequireResult(expected) -> if state.type_parameter_count(signature) > 0 {
-            checked_body_inferred_function_reference(
-              state,
-              checked_body_types_with_catalog(types, catalog),
-              owner,
-              declaration,
-              signature,
-              expected,
-              range
-            )
-          } else {
-            match state.declaration_reference(declaration, signature.type_id, range) {
-              (state, expression) -> CheckedBodyExprBuilt(state, expression)
-            }
-          }
-          CheckedInferResult -> match state.declaration_reference(
+      -- A named function captures nothing, so a `Sendable` expectation holds
+      -- whenever its function type does.
+      let (expectation, sendable) = match expectation {
+        CheckedRequireResult(expected) -> match checked_body_lambda_target(catalog, expected) {
+          (function_type, Some(atom)) -> (CheckedRequireResult(function_type), Some(atom))
+          _ -> (expectation, None<SemanticTypeId>())
+        }
+        CheckedInferResult -> (expectation, None<SemanticTypeId>())
+      }
+      match expectation {
+        -- A generic function instantiates at the expected function type; its
+        -- own signature, over rigid variables, is compared only afterwards.
+        CheckedRequireResult(expected) -> if state.type_parameter_count(signature) > 0 {
+          checked_body_inferred_function_reference(
+            state,
+            checked_body_types_with_catalog(types, catalog),
+            owner,
             declaration,
-            signature.type_id,
+            signature,
+            expected,
+            sendable,
+            range
+          )
+        } else if expectation_allows(catalog, signature.type_id, expectation) {
+          let (catalog, reference_type) = match sendable {
+            None -> (catalog, signature.type_id)
+            Some(atom) -> checked_body_refine_sendable(catalog, types, signature.type_id, atom)
+          }
+          match state.with_types(catalog).declaration_reference(
+            declaration,
+            reference_type,
             range
           ) {
             (state, expression) -> CheckedBodyExprBuilt(state, expression)
           }
+        } else {
+          CheckedBodyExprRejected(state, expectation_mismatch(signature.type_id, expectation))
         }
-      } else {
-        CheckedBodyExprRejected(state, expectation_mismatch(signature.type_id, expectation))
+        CheckedInferResult -> match state.declaration_reference(
+          declaration,
+          signature.type_id,
+          range
+        ) {
+          (state, expression) -> CheckedBodyExprBuilt(state, expression)
+        }
       }
     }
     CheckedBodySignatureMissing(state) -> {
@@ -20475,11 +20648,11 @@ fn checked_body_call(
       start,
       length
     ) {
-      CheckedLexicalFound(binding, callee_type, _) -> if semantic_function_type(
+      CheckedLexicalFound(binding, callee_type, _) -> match checked_body_callable_signature(
         catalog,
         callee_type
       ) {
-        match state.local_reference(binding, callee_type, name_range) {
+        Some(signature_type) -> match state.local_reference(binding, callee_type, name_range) {
           (state, callee) -> checked_body_call_with_signature(
             state,
             source,
@@ -20491,13 +20664,12 @@ fn checked_body_call(
             name_range,
             name_range.start,
             arguments,
-            callee_type,
+            signature_type,
             CheckedAppliedCallee(callee),
             expectation
           )
         }
-      } else {
-        CheckedBodyExprRejected(
+        None -> CheckedBodyExprRejected(
           state,
           CheckedBodyProducerCallableRequired(callee_type)
         )
@@ -20695,30 +20867,31 @@ fn checked_body_apply(
     CheckedBodyExprBuilt(state, checked_callee) -> {
       let callee_type = state.result_type(checked_callee)
       let catalog = state.types()
-      if not semantic_function_type(catalog, callee_type) {
-        CheckedBodyExprRejected(
+      match checked_body_callable_signature(catalog, callee_type) {
+        None -> CheckedBodyExprRejected(
           state,
           CheckedBodyProducerCallableRequired(callee_type)
         )
-      } else {
-        let callee_range = state.range(checked_callee)
-        match source_range(source, site, 0) {
-          call_range: CheckedSourceRange -> checked_body_call_with_signature(
-            state,
-            source,
-            checked_body_types_with_catalog(types, catalog),
-            owner,
-            function_result,
-            loop_context,
-            environment,
-            callee_range,
-            call_range.start,
-            arguments,
-            callee_type,
-            CheckedAppliedCallee(checked_callee),
-            expectation
-          )
-          nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+        Some(signature_type) -> {
+          let callee_range = state.range(checked_callee)
+          match source_range(source, site, 0) {
+            call_range: CheckedSourceRange -> checked_body_call_with_signature(
+              state,
+              source,
+              checked_body_types_with_catalog(types, catalog),
+              owner,
+              function_result,
+              loop_context,
+              environment,
+              callee_range,
+              call_range.start,
+              arguments,
+              signature_type,
+              CheckedAppliedCallee(checked_callee),
+              expectation
+            )
+            nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+          }
         }
       }
     }
