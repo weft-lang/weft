@@ -330,6 +330,7 @@ use compiler/types/graph/layout.{
   semantic_record_layout_fields,
   semantic_structural_record_source_fields,
   semantic_structural_record,
+  semantic_tuple_item_projection,
   semantic_tuple_pattern_arity,
   semantic_tuple_pattern_element,
   semantic_value_excludes_zero
@@ -465,7 +466,7 @@ use compiler/weft/check/body/graph.{
   CheckedRecordFieldOrdinal,
   CheckedStructuralFieldPosition,
   CheckedStructuralFieldUnplaced,
-  CheckedStructuralFieldWordOffset,
+  CheckedStructuralFieldLayoutIndex,
   CheckedStructuralRecordConstruction,
   CheckedDeclaredRecordConstruction,
   CheckedTupleRecordConstruction,
@@ -524,7 +525,7 @@ use compiler/weft/check/body/pattern.{
   CheckedPatternFieldListBuilder,
   CheckedPatternFieldListId,
   CheckedPatternFieldUnplaced,
-  CheckedPatternFieldWordOffset,
+  CheckedPatternFieldLayoutIndex,
   CheckedPatternListId,
   CheckedPatternListBuilder,
   CheckedPatternGraphBuilder,
@@ -608,7 +609,13 @@ use compiler/weft/check/signatures.{
   semantic_signature_in_scope
 }
 use compiler/weft/check/storage.{dense_index}
-use compiler/weft/syntax/numeric.{numeric_float_literal_value}
+use compiler/weft/syntax/numeric.{
+  ExactMagnitude,
+  IntegerSpelling,
+  TuplePositionNumber,
+  numeric_float_literal_value,
+  numeric_scan
+}
 use compiler/weft/check/body/resource.{
   CheckedResourceContext,
   CheckedResourceDropEffectUnavailable,
@@ -642,6 +649,12 @@ pub(package) type CheckedBodyProducerIssue {
   CheckedBodyProducerInvalidRange,
   CheckedBodyProducerUnknownIdentifier(CheckedSourceRange),
   CheckedBodyProducerUnknownField(CheckedSourceRange),
+  -- `base.N` past the last item of a tuple: the position and its span.
+  CheckedBodyProducerUnknownTuplePosition(usize, CheckedSourceRange),
+  -- `base.N` on a value that is not a tuple.
+  CheckedBodyProducerTuplePositionRequiresTuple(SemanticTypeId, CheckedSourceRange),
+  -- A named field selected on a tuple, whose items have only positions.
+  CheckedBodyProducerTupleNamedField(CheckedSourceRange),
   CheckedBodyProducerImmutableAssignment(CheckedSourceRange),
   CheckedBodyProducerPointerSealed,
   CheckedBodyProducerUnsafeEffectUnavailable,
@@ -2936,12 +2949,12 @@ fn checked_body_record_fields_into(
           input_type,
           name
         ) {
-          SemanticRecordFieldProjected(stable_key, word_offset, value_type) ->
+          SemanticRecordFieldProjected(stable_key, layout_index, value_type) ->
             patterns.structural_pattern_field(
               list,
               stable_key,
               child,
-              CheckedPatternFieldWordOffset(word_offset),
+              CheckedPatternFieldLayoutIndex(layout_index),
               value_type
             )
           SemanticRecordFieldUnplaced(stable_key, exact_name, value_type) ->
@@ -3724,7 +3737,7 @@ impl CheckedBodyBuild {
     self: owned Self,
     base: CheckedExprId,
     stable_key: i64,
-    word_offset: CheckedStructuralFieldPosition,
+    position: CheckedStructuralFieldPosition,
     result: SemanticTypeId,
     range: CheckedSourceRange
   ) -> (owned CheckedBodyBuild, CheckedExprId) {
@@ -3743,7 +3756,7 @@ impl CheckedBodyBuild {
         match expressions.structural_field_access(
           base,
           stable_key,
-          word_offset,
+          position,
           result,
           range
         ) {
@@ -21353,6 +21366,117 @@ fn checked_body_field_access(
   field_length: i64,
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
+  -- A tuple position keeps its decimal span under a negative length. It
+  -- selects an item and never names a module member.
+  if field_length < 0 {
+    checked_body_tuple_position_access(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      base,
+      field_start,
+      0 - field_length,
+      expectation
+    )
+  } else {
+    checked_body_named_field_access(
+      state,
+      source,
+      types,
+      owner,
+      function_result,
+      loop_context,
+      environment,
+      base,
+      field_start,
+      field_length,
+      expectation
+    )
+  }
+}
+
+-- `base.N` reads the tuple item at position N.
+fn checked_body_tuple_position_access(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  base: Expr,
+  position_start: i64,
+  position_length: i64,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  match checked_body_expr(
+    state,
+    source,
+    types,
+    owner,
+    function_result,
+    loop_context,
+    environment,
+    base,
+    CheckedInferResult
+  ) {
+    CheckedBodyExprBuilt(state, checked_base) -> match source_range(
+      source,
+      position_start,
+      position_length
+    ) {
+      nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+      position_range: CheckedSourceRange -> match checked_body_tuple_position(
+        source,
+        position_range
+      ) {
+        None -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+        Some(position) -> {
+          let base_type = state.result_type(checked_base)
+          checked_body_project_tuple_item(
+            state,
+            types,
+            checked_base,
+            base_type,
+            position,
+            position_range,
+            expectation
+          )
+        }
+      }
+    }
+    CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
+  }
+}
+
+-- The position a tuple projection spells, read by the shared numeric
+-- contract for positions: plain decimal digits.
+fn checked_body_tuple_position(source: Source, range: CheckedSourceRange) -> Option<usize> {
+  match numeric_scan(source.all(), range.start, TuplePositionNumber) {
+    IntegerSpelling(end, ExactMagnitude(value)) -> if end == range.end {
+      Some(__u64_to_usize(value))
+    } else { None<usize>() }
+    _ -> None<usize>()
+  }
+}
+
+fn checked_body_named_field_access(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  base: Expr,
+  field_start: i64,
+  field_length: i64,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
   match source_range(source, field_start, field_length) {
     nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
     field_range: CheckedSourceRange -> match source.span(field_range.start, field_range.end) {
@@ -21532,6 +21656,66 @@ fn checked_body_publish_field(
   }
 }
 
+-- The value a projection reads and the view it reads through. A borrowed
+-- aggregate is projected through its borrow. An owned or unique aggregate
+-- keeps its value: a projection reads through it as a shared view, so a
+-- resource field is seen, never moved out of its owner.
+fn checked_body_projection_base(
+  catalog: borrow SemanticTypeCatalog,
+  base_type: SemanticTypeId
+) -> (SemanticTypeId, Option<SemanticMutability>) {
+  match catalog.graph_for(base_type) {
+    Some(graph) -> match semantic_type_graph_node(graph, base_type) {
+      SemanticBorrowNode(inner, access) -> (inner, Some(access))
+      SemanticOwnedNode(inner) -> (inner, Some(SemanticImmutable))
+      SemanticUniqueNode(inner) -> (inner, Some(SemanticImmutable))
+      _ -> (base_type, None<SemanticMutability>())
+    }
+    None -> (base_type, None<SemanticMutability>())
+  }
+}
+
+fn checked_body_project_tuple_item(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  checked_base: CheckedExprId,
+  base_type: SemanticTypeId,
+  position: usize,
+  position_range: CheckedSourceRange,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyExprBuild {
+  let catalog = state.types()
+  let (tuple_type, borrowed) = checked_body_projection_base(catalog, base_type)
+  match semantic_tuple_item_projection(catalog, tuple_type, position) {
+    SemanticRecordFieldProjected(stable_key, layout_index, result) -> {
+      let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+      checked_body_publish_field(
+        state,
+        checked_base,
+        CheckedStructuralFieldProjection(
+          stable_key,
+          CheckedStructuralFieldLayoutIndex(layout_index)
+        ),
+        view,
+        position_range,
+        expectation
+      )
+    }
+    SemanticRecordFieldMissing -> CheckedBodyExprRejected(
+      state,
+      CheckedBodyProducerUnknownTuplePosition(position, position_range)
+    )
+    _ -> if semantic_tuple_pattern_arity(catalog, tuple_type).is_some() {
+      CheckedBodyExprRejected(state, CheckedBodyProducerFieldProjectionUnavailable(base_type))
+    } else {
+      CheckedBodyExprRejected(
+        state,
+        CheckedBodyProducerTuplePositionRequiresTuple(base_type, position_range)
+      )
+    }
+  }
+}
+
 fn checked_body_project_field(
   state: owned CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
@@ -21542,71 +21726,68 @@ fn checked_body_project_field(
   expectation: CheckedBodyExpectation
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   let catalog = state.types()
-  -- A borrowed record is projected through its borrow.
-  let (record_type, borrowed) = match catalog.graph_for(base_type) {
-    Some(graph) -> match semantic_type_graph_node(graph, base_type) {
-      SemanticBorrowNode(inner, access) -> (inner, Some(access))
-      _ -> (base_type, None<SemanticMutability>())
-    }
-    None -> (base_type, None<SemanticMutability>())
-  }
-  match semantic_record_field_projection(catalog, record_type, field_name) {
-    SemanticRecordFieldProjected(stable_key, word_offset, result) -> {
-      let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
-      checked_body_publish_field(
+  let (record_type, borrowed) = checked_body_projection_base(catalog, base_type)
+  if semantic_tuple_pattern_arity(catalog, record_type).is_some() {
+    CheckedBodyExprRejected(state, CheckedBodyProducerTupleNamedField(field_range))
+  } else {
+    match semantic_record_field_projection(catalog, record_type, field_name) {
+      SemanticRecordFieldProjected(stable_key, layout_index, result) -> {
+        let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+        checked_body_publish_field(
+          state,
+          checked_base,
+          CheckedStructuralFieldProjection(
+            stable_key,
+            CheckedStructuralFieldLayoutIndex(layout_index)
+          ),
+          view,
+          field_range,
+          expectation
+        )
+      }
+      SemanticRecordFieldUnplaced(stable_key, exact_name, result) -> {
+        let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+        checked_body_publish_field(
+          state,
+          checked_base,
+          CheckedStructuralFieldProjection(stable_key, CheckedStructuralFieldUnplaced(exact_name)),
+          view,
+          field_range,
+          expectation
+        )
+      }
+      SemanticRecordFieldMissing -> CheckedBodyExprRejected(
         state,
-        checked_base,
-        CheckedStructuralFieldProjection(
-          stable_key,
-          CheckedStructuralFieldWordOffset(word_offset)
-        ),
-        view,
-        field_range,
-        expectation
+        CheckedBodyProducerUnknownField(field_range)
       )
-    }
-    SemanticRecordFieldUnplaced(stable_key, exact_name, result) -> {
-      let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
-      checked_body_publish_field(
-        state,
-        checked_base,
-        CheckedStructuralFieldProjection(stable_key, CheckedStructuralFieldUnplaced(exact_name)),
-        view,
-        field_range,
-        expectation
-      )
-    }
-    SemanticRecordFieldMissing -> CheckedBodyExprRejected(
-      state,
-      CheckedBodyProducerUnknownField(field_range)
-    )
-    SemanticRecordFieldProjectionUnavailable -> {
-      let (state, types, projection) = checked_body_declared_field(
-        state,
-        types,
-        record_type,
-        field_name
-      )
-      match projection {
-        SemanticDeclaredFieldProjected(declaration, field_index, result) -> {
-          let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
-          checked_body_publish_field(
+      SemanticRecordFieldProjectionUnavailable -> {
+        let (state, types, projection) = checked_body_declared_field(
+          state,
+          types,
+          record_type,
+          field_name
+        )
+        match projection {
+          SemanticDeclaredFieldProjected(declaration, field_index, result) -> {
+            let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+            checked_body_publish_field(
+              state,
+              checked_base,
+              CheckedDeclaredFieldProjection(declaration, field_index),
+              view,
+              field_range,
+              expectation
+            )
+          }
+          SemanticDeclaredFieldMissing -> CheckedBodyExprRejected(
             state,
-            checked_base,
-            CheckedDeclaredFieldProjection(declaration, field_index),
-            view,
-            field_range,
-            expectation
+            CheckedBodyProducerUnknownField(field_range)
+          )
+          SemanticDeclaredFieldProjectionUnavailable -> CheckedBodyExprRejected(
+            state,
+            CheckedBodyProducerFieldProjectionUnavailable(base_type)
           )
         }
-        SemanticDeclaredFieldMissing -> CheckedBodyExprRejected(
-          state,
-          CheckedBodyProducerUnknownField(field_range)
-        )
-        SemanticDeclaredFieldProjectionUnavailable -> CheckedBodyExprRejected(
-          state,
-          CheckedBodyProducerFieldProjectionUnavailable(base_type)
-        )
       }
     }
   }
@@ -23799,16 +23980,17 @@ fn checked_body_optional_field(
 ) -[SemanticConformance]> CheckedBodyExprBuild {
   let catalog = state.types()
   match semantic_record_field_projection(catalog, payload_type, field_name) {
-    SemanticRecordFieldProjected(key, offset, result) -> checked_body_optional_structural_field(
-      state,
-      base,
-      key,
-      CheckedStructuralFieldWordOffset(offset),
-      result,
-      field_range,
-      atom,
-      expectation
-    )
+    SemanticRecordFieldProjected(key, layout_index, result) ->
+      checked_body_optional_structural_field(
+        state,
+        base,
+        key,
+        CheckedStructuralFieldLayoutIndex(layout_index),
+        result,
+        field_range,
+        atom,
+        expectation
+      )
     SemanticRecordFieldUnplaced(key, exact_name, result) ->
       checked_body_optional_structural_field(
         state,
