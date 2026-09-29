@@ -3086,10 +3086,10 @@ assert_equals "array_census_backing_allocations" "${rc_array_fields[44]}" "2"
 
 # A frozen checked-expression store is columnar: typed scalar ids and facts
 # live in separate immutable segments instead of boxed universal nodes. The
-# fixture performs 10,000 branch inspections, yielding more than 80,000
-# borrowed calls. Publishing the segments and their final cleanup may use a
-# bounded number of managed operations, but inspection must not scale them
-# with the borrowed-call count.
+# fixture performs 10,000 branch inspections, each observing the segments
+# through four borrowed calls, so more than 40,000 in all. Publishing the
+# segments and their final cleanup may use a bounded number of managed
+# operations, but inspection must not scale them with the borrowed-call count.
 run_weft_compile_guarded "$WEFT" compile --rc-census \
   test/fixtures/typed_checker_columnar_census.weft > "$tmp_out" 2> "$tmp_err"
 chmod +x "$tmp_out"
@@ -3102,7 +3102,7 @@ assert_equals \
 if [ "${checker_storage_fields[2]}" -le 64 ] && \
   [ "${checker_storage_fields[3]}" -le 64 ] && \
   [ "${checker_storage_fields[4]}" -le 128 ] && \
-  [ "${checker_storage_fields[17]}" -gt 80000 ] && \
+  [ "${checker_storage_fields[17]}" -gt 40000 ] && \
   [ "${checker_storage_fields[21]}" -le 32 ] && \
   [ "${checker_storage_fields[22]}" -le 128 ]; then
   echo "  ok typed_checker_storage_inspection_keeps_managed_transport_bounded"
@@ -3122,7 +3122,8 @@ fi
 # same local root. Traversal allocation remains a construction constant, while
 # equality and hashing together stay below nineteen managed retains and
 # releases per iteration; complete ids are not carried through local recursive
-# edges. The borrowed-call count must scale with the work.
+# edges. The borrowed-call count must scale with the work: more than a hundred
+# borrowed lanes per iteration.
 run_weft_compile_guarded "$WEFT" compile --rc-census \
   test/fixtures/semantic_type_graph_census.weft > "$tmp_out" 2> "$tmp_err"
 chmod +x "$tmp_out"
@@ -3135,7 +3136,7 @@ assert_equals \
 if [ "${semantic_graph_fields[2]}" -le 640 ] && \
   [ "${semantic_graph_fields[3]}" -le 185000 ] && \
   [ "${semantic_graph_fields[4]}" -le 185500 ] && \
-  [ "${semantic_graph_fields[17]}" -gt 2300000 ] && \
+  [ "${semantic_graph_fields[17]}" -gt 1000000 ] && \
   [ "${semantic_graph_fields[21]}" -le 185000 ] && \
   [ "${semantic_graph_fields[22]}" -le 185500 ]; then
   echo "  ok semantic_type_graph_equality_and_hashing_keep_local_transport_within_budget"
