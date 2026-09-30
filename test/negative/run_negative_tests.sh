@@ -246,6 +246,8 @@ check_rejects "source_subspan_signed_bounds" "test/negative/source_subspan_signe
 check_rejects "source_span_signed_index" "test/negative/source_span_signed_index.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "string_slice_signed_bounds" "test/negative/string_slice_signed_bounds.weft" 'argument type mismatch: expected `usize`, found `i64`'
 check_rejects "string_byte_signed_index" "test/negative/string_byte_signed_index.weft" 'argument type mismatch: expected `usize`, found `i64`'
+check_rejects "generic_argument_mismatch_names_instantiated_parameters" "test/negative/generic_argument_mismatch_names_instantiated_parameters.weft" 'argument type mismatch: expected `Box<A>`, found `borrow Box<A>`'
+check_rejects "generic_argument_mismatch_imported_parameter_names" "test/negative/generic_argument_mismatch_imported_parameter_names.weft" 'argument type mismatch: expected `Holder<Item>`, found `borrow Holder<Item>`'
 
 check_rejects "par_map_effectful" "test/negative/par_map_effectful.weft" 'error[E1002]: argument type mismatch: expected `(i64) -> i64`, found `(i64) -[Log]> i64`'
 check_rejects "constructor_callback_argument" "test/negative/constructor_callback_argument.weft" 'error[E1002]: argument type mismatch' 1
