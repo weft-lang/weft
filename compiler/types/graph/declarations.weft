@@ -9,8 +9,10 @@
 -- Every stored column is a flat persistent vector. Each layout records where
 -- its fields, cases and bounds start, and each case where its payloads
 -- start, so every accessor is an indexed lookup rather than a walk over the
--- catalog. A match returns only a scalar layout index and its generic
--- substitution; typed accessors expose one field or payload at a time.
+-- catalog. Layouts are also indexed by their target's declaration key, so a
+-- lookup visits only the layouts that could apply the wanted declaration. A
+-- match returns only a scalar layout index and its generic substitution;
+-- typed accessors expose one field or payload at a time.
 
 use compiler/project/identity.{
   DeclarationIdentity,
@@ -40,6 +42,8 @@ use compiler/types/graph/substitution.{
   semantic_type_substitution_get
 }
 use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
 use stdlib/option.{None, Option, Some}
 use stdlib/persistent_vector as persistent_vector
 use stdlib/persistent_vector.{PersistentVector}
@@ -78,13 +82,19 @@ type SemanticDeclaredBoundColumns {
   types: PersistentVector<SemanticTypeId>
 }
 
--- Record layouts: one target, key, field start and field count per layout,
--- beside the flat field columns.
+-- Layout indices by their target's declaration key, newest first, beside
+-- the newest-first layouts whose target has no key. A key narrows a lookup
+-- and never decides it: distinct declarations may share a key.
+type SemanticLayoutKeyIndex {
+  keyed: Map<i64, List<usize>>,
+  unkeyed: List<usize>
+}
+
+-- Record layouts: one target, field start and field count per layout,
+-- beside the key index and the flat field columns.
 type SemanticRecordLayoutColumns {
   targets: PersistentVector<SemanticTypeId>,
-  -- Each target's declaration key, beside it: a lookup pattern-matches only
-  -- the targets that apply the concrete type's own declaration.
-  keys: PersistentVector<Option<i64>>,
+  index: SemanticLayoutKeyIndex,
   field_starts: PersistentVector<usize>,
   field_counts: PersistentVector<usize>,
   declarations: PersistentVector<DeclarationIdentity>,
@@ -92,12 +102,12 @@ type SemanticRecordLayoutColumns {
   bounds: SemanticDeclaredBoundColumns
 }
 
--- Variant layouts: one target, key, case start and case count per layout;
--- one declaration, payload start and payload count per case; and the flat
--- payload types.
+-- Variant layouts: one target, case start and case count per layout, beside
+-- the key index; one declaration, payload start and payload count per case;
+-- and the flat payload types.
 type SemanticVariantLayoutColumns {
   targets: PersistentVector<SemanticTypeId>,
-  keys: PersistentVector<Option<i64>>,
+  index: SemanticLayoutKeyIndex,
   case_starts: PersistentVector<usize>,
   case_counts: PersistentVector<usize>,
   declarations: PersistentVector<DeclarationIdentity>,
@@ -168,6 +178,56 @@ fn semantic_layout_ordinal(
   }
 }
 
+fn semantic_layout_key_index_empty() -> SemanticLayoutKeyIndex {
+  SemanticLayoutKeyIndex { keyed: map.new<i64, List<usize>>(), unkeyed: Nil<usize>() }
+}
+
+fn semantic_layout_key_index_add(
+  index: SemanticLayoutKeyIndex,
+  key: Option<i64>,
+  layout: usize
+) -> SemanticLayoutKeyIndex {
+  let { keyed, unkeyed } = index
+  match key {
+    None -> SemanticLayoutKeyIndex { keyed: keyed, unkeyed: unkeyed.prepend(layout) }
+    Some(value) -> {
+      let layouts = match keyed.get(value) {
+        Some(existing) -> existing.prepend(layout)
+        None -> Nil<usize>().prepend(layout)
+      }
+      SemanticLayoutKeyIndex { keyed: keyed.insert(value, layouts), unkeyed: unkeyed }
+    }
+  }
+}
+
+-- Two newest-first layout lists as one.
+fn semantic_layouts_newest_first(left: List<usize>, right: List<usize>) -> List<usize> {
+  match (left, right) {
+    (Nil, rest) -> rest
+    (rest, Nil) -> rest
+    (Cons(first, left_rest), Cons(second, right_rest)) -> if first > second {
+      semantic_layouts_newest_first(left_rest, right).prepend(first)
+    } else { semantic_layouts_newest_first(left, right_rest).prepend(second) }
+  }
+}
+
+-- The layouts, newest first, whose target could apply a type with `key`:
+-- those sharing the key and every unkeyed one. A keyed target applies a
+-- declaration, and matches only a type applying that same declaration, so
+-- an unkeyed type admits only the unkeyed layouts.
+fn semantic_layout_key_candidates(
+  index: borrow SemanticLayoutKeyIndex,
+  key: Option<i64>
+) -> List<usize> {
+  match key {
+    None -> index.unkeyed
+    Some(value) -> match index.keyed.get(value) {
+      None -> index.unkeyed
+      Some(keyed) -> semantic_layouts_newest_first(keyed, index.unkeyed)
+    }
+  }
+}
+
 fn semantic_declared_bounds_empty() -> SemanticDeclaredBoundColumns {
   SemanticDeclaredBoundColumns {
     starts: persistent_vector.new<usize>(),
@@ -196,7 +256,7 @@ pub(package) fn semantic_type_declaration_catalog_empty(
     SemanticTypeDeclarationCatalogStorage {
       records: SemanticRecordLayoutColumns {
         targets: persistent_vector.new<SemanticTypeId>(),
-        keys: persistent_vector.new<Option<i64>>(),
+        index: semantic_layout_key_index_empty(),
         field_starts: persistent_vector.new<usize>(),
         field_counts: persistent_vector.new<usize>(),
         declarations: persistent_vector.new<DeclarationIdentity>(),
@@ -205,7 +265,7 @@ pub(package) fn semantic_type_declaration_catalog_empty(
       },
       variants: SemanticVariantLayoutColumns {
         targets: persistent_vector.new<SemanticTypeId>(),
-        keys: persistent_vector.new<Option<i64>>(),
+        index: semantic_layout_key_index_empty(),
         case_starts: persistent_vector.new<usize>(),
         case_counts: persistent_vector.new<usize>(),
         declarations: persistent_vector.new<DeclarationIdentity>(),
@@ -314,7 +374,11 @@ pub(package) fn semantic_type_declaration_catalog_add(
             SemanticTypeDeclarationCatalogStorage {
               records: SemanticRecordLayoutColumns {
                 targets: records.targets.push(target),
-                keys: records.keys.push(semantic_type_named_key(type_catalog, target)),
+                index: semantic_layout_key_index_add(
+                  records.index,
+                  semantic_type_named_key(type_catalog, target),
+                  records.targets.len()
+                ),
                 field_starts: records.field_starts.push(records.declarations.len()),
                 field_counts: records.field_counts.push(declarations.len()),
                 declarations: semantic_push_all<DeclarationIdentity>(
@@ -339,7 +403,11 @@ pub(package) fn semantic_type_declaration_catalog_add(
             records: records,
             variants: SemanticVariantLayoutColumns {
               targets: variants.targets.push(target),
-              keys: variants.keys.push(semantic_type_named_key(type_catalog, target)),
+              index: semantic_layout_key_index_add(
+                variants.index,
+                semantic_type_named_key(type_catalog, target),
+                variants.targets.len()
+              ),
               case_starts: variants.case_starts.push(variants.declarations.len()),
               case_counts: variants.case_counts.push(declarations.len()),
               declarations: semantic_push_all<DeclarationIdentity>(
@@ -369,15 +437,14 @@ fn semantic_record_declaration_template_from(
   types: borrow SemanticTypeCatalog,
   records: borrow SemanticRecordLayoutColumns,
   declaration: DeclarationIdentity,
-  key: Option<i64>,
-  index: usize,
+  candidates: List<usize>,
   found: SemanticRecordDeclarationTemplateSelection
 ) -> SemanticRecordDeclarationTemplateSelection {
-  match (records.targets.get(index), records.keys.get(index), records.field_counts.get(index)) {
-    (Some(target), Some(target_key), Some(count)) -> {
-      let next = if not semantic_type_keys_may_match(target_key, key) { found }
-      else {
-        match types.graph_for(target) {
+  match candidates {
+    Nil -> found
+    Cons(index, rest) -> {
+      let next = match (records.targets.get(index), records.field_counts.get(index)) {
+        (Some(target), Some(count)) -> match types.graph_for(target) {
           None -> found
           Some(graph) -> match semantic_type_graph_node(graph, target) {
             SemanticNamedNode(candidate, _, _, _) -> if declaration_identity_eq(
@@ -393,17 +460,10 @@ fn semantic_record_declaration_template_from(
             _ -> found
           }
         }
+        _ -> found
       }
-      semantic_record_declaration_template_from(
-        types,
-        records,
-        declaration,
-        key,
-        index + 1,
-        next
-      )
+      semantic_record_declaration_template_from(types, records, declaration, rest, next)
     }
-    _ -> found
   }
 }
 
@@ -415,12 +475,16 @@ pub(package) fn semantic_type_declared_record_template(
   match catalog {
     SemanticTypeDeclarationCatalog(storage) -> {
       let records = storage.records
+      let index = records.index
+      let candidates = semantic_layout_key_candidates(
+        index,
+        Some(retained_declaration_identity_hash(declaration))
+      )
       semantic_record_declaration_template_from(
         types,
         records,
         declaration,
-        Some(retained_declaration_identity_hash(declaration)),
-        0,
+        candidates,
         SemanticRecordDeclarationTemplateMissing
       )
     }
@@ -463,52 +527,38 @@ fn semantic_type_concrete_key(
   }
 }
 
--- Whether a target could apply the concrete type's declaration: only a
--- differing pair of known keys rules it out.
-fn semantic_type_keys_may_match(target: Option<i64>, concrete: Option<i64>) -> bool {
-  match (target, concrete) {
-    (Some(left), Some(right)) -> left == right
-    _ -> true
-  }
-}
-
--- The most recently added target that the concrete type instantiates,
--- searching down from `count`.
+-- The first candidate target, newest first, that the concrete type
+-- instantiates.
 fn semantic_type_declaration_resolve_from(
   types: borrow SemanticTypeCatalog,
   targets: PersistentVector<SemanticTypeId>,
-  keys: PersistentVector<Option<i64>>,
+  candidates: List<usize>,
   concrete: SemanticTypeId,
-  concrete_key: Option<i64>,
-  concrete_substitution: borrow SemanticTypeSubstitution,
-  count: usize
+  concrete_substitution: borrow SemanticTypeSubstitution
 ) -> Option<(usize, SemanticTypeSubstitution)> {
-  if count == 0 { None<(usize, SemanticTypeSubstitution)>() }
-  else {
-    let index = count - 1
-    let matched = match (targets.get(index), keys.get(index)) {
-      (Some(target), Some(key)) -> if semantic_type_keys_may_match(key, concrete_key) {
-        semantic_type_pattern_match_substituted(
+  match candidates {
+    Nil -> None<(usize, SemanticTypeSubstitution)>()
+    Cons(index, rest) -> {
+      let matched = match targets.get(index) {
+        Some(target) -> semantic_type_pattern_match_substituted(
           types,
           target,
           semantic_type_substitution_empty(),
           concrete,
           concrete_substitution
         )
-      } else { SemanticTypePatternRejected }
-      _ -> SemanticTypePatternRejected
-    }
-    match matched {
-      SemanticTypePatternMatched(substitution) -> Some((index, substitution))
-      SemanticTypePatternRejected -> semantic_type_declaration_resolve_from(
-        types,
-        targets,
-        keys,
-        concrete,
-        concrete_key,
-        concrete_substitution,
-        index
-      )
+        None -> SemanticTypePatternRejected
+      }
+      match matched {
+        SemanticTypePatternMatched(substitution) -> Some((index, substitution))
+        SemanticTypePatternRejected -> semantic_type_declaration_resolve_from(
+          types,
+          targets,
+          rest,
+          concrete,
+          concrete_substitution
+        )
+      }
     }
   }
 }
@@ -524,14 +574,14 @@ pub(package) fn semantic_type_declaration_catalog_resolve(
       let concrete_key = semantic_type_concrete_key(types, concrete, concrete_substitution)
       let records = storage.records
       let variants = storage.variants
+      let record_index = records.index
+      let variant_index = variants.index
       match semantic_type_declaration_resolve_from(
         types,
         records.targets,
-        records.keys,
+        semantic_layout_key_candidates(record_index, concrete_key),
         concrete,
-        concrete_key,
-        concrete_substitution,
-        records.targets.len()
+        concrete_substitution
       ) {
         Some((layout, substitution)) -> SemanticRecordDeclarationLayoutMatched(
           layout,
@@ -540,11 +590,9 @@ pub(package) fn semantic_type_declaration_catalog_resolve(
         None -> match semantic_type_declaration_resolve_from(
           types,
           variants.targets,
-          variants.keys,
+          semantic_layout_key_candidates(variant_index, concrete_key),
           concrete,
-          concrete_key,
-          concrete_substitution,
-          variants.targets.len()
+          concrete_substitution
         ) {
           Some((layout, substitution)) ->
             SemanticVariantDeclarationLayoutMatched(layout, substitution)
@@ -840,22 +888,19 @@ fn semantic_declared_variant_constructor_from(
   catalog: borrow SemanticTypeDeclarationCatalog,
   variants: borrow SemanticVariantLayoutColumns,
   declaration: DeclarationIdentity,
-  owner_key: Option<i64>,
-  layout_index: usize,
+  candidates: List<usize>,
   found: SemanticDeclaredVariantConstructor
 ) -> SemanticDeclaredVariantConstructor {
-  match (
-    variants.targets.get(layout_index),
-    variants.keys.get(layout_index),
-    variants.case_counts.get(layout_index),
-  ) {
-    (Some(target), Some(key), Some(case_count)) -> {
-      let case = if semantic_type_keys_may_match(key, owner_key) {
-        semantic_variant_constructor_case(catalog, declaration, layout_index, 0, case_count)
-      } else { None<(usize, usize)>() }
-      let next = match case {
-        None -> found
-        Some((case_index, payload_count)) -> match found {
+  match candidates {
+    Nil -> found
+    Cons(layout_index, rest) -> {
+      let case = match variants.case_counts.get(layout_index) {
+        Some(case_count) ->
+          semantic_variant_constructor_case(catalog, declaration, layout_index, 0, case_count)
+        None -> None<(usize, usize)>()
+      }
+      let next = match (case, variants.targets.get(layout_index)) {
+        (Some((case_index, payload_count)), Some(target)) -> match found {
           SemanticDeclaredVariantConstructorMissing -> SemanticDeclaredVariantConstructorSelected(
             target,
             layout_index,
@@ -864,18 +909,17 @@ fn semantic_declared_variant_constructor_from(
           )
           _ -> SemanticDeclaredVariantConstructorAmbiguous
         }
+        _ -> found
       }
-      semantic_declared_variant_constructor_from(
-        catalog,
-        variants,
-        declaration,
-        owner_key,
-        layout_index + 1,
-        next
-      )
+      semantic_declared_variant_constructor_from(catalog, variants, declaration, rest, next)
     }
-    _ -> found
   }
+}
+
+-- Every layout below `count`, newest first.
+fn semantic_layouts_below(count: usize, layouts: List<usize>) -> List<usize> {
+  if count == 0 { layouts }
+  else { semantic_layouts_below(count - 1, layouts.prepend(count - 1)) }
 }
 
 -- The declared layout of a constructor, generic or not.
@@ -886,15 +930,20 @@ pub(package) fn semantic_type_declared_variant_constructor(
   match catalog {
     SemanticTypeDeclarationCatalog(storage) -> {
       let variants = storage.variants
+      let index = variants.index
+      -- A case whose owner is unknown could belong to any layout.
+      let candidates = match declaration_identity_owner(declaration) {
+        nil -> semantic_layouts_below(variants.targets.len(), Nil<usize>())
+        owner: DeclarationIdentity -> semantic_layout_key_candidates(
+          index,
+          Some(retained_declaration_identity_hash(owner))
+        )
+      }
       semantic_declared_variant_constructor_from(
         catalog,
         variants,
         declaration,
-        match declaration_identity_owner(declaration) {
-          nil -> None<i64>()
-          owner: DeclarationIdentity -> Some(retained_declaration_identity_hash(owner))
-        },
-        0,
+        candidates,
         SemanticDeclaredVariantConstructorMissing
       )
     }
