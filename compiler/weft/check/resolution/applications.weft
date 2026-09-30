@@ -5,6 +5,11 @@
 -- concrete substitution once, and recursively follows the resulting member
 -- types. A body-local type expression continues the immutable catalog from
 -- its checked semantic identity, without a second raw syntax recognizer.
+--
+-- Each catalog keeps flat persistent columns: an application records where
+-- its members start, so a member is an indexed lookup. Applied targets are
+-- found through their semantic hash, with catalog equality deciding within a
+-- bucket, so neither a lookup nor a later materialization walks the catalog.
 
 use compiler/project/identity.{
   DeclarationIdentity,
@@ -60,38 +65,59 @@ use compiler/types/graph/hash.{semantic_type_catalog_hash}
 use stdlib/list.{Cons, List, Nil}
 use stdlib/map as map
 use stdlib/map.{Map}
-use stdlib/num/scalar.{num_scalar_usize_checked_add}
 use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
+use stdlib/persistent_vector as persistent_vector
+use stdlib/persistent_vector.{PersistentVector}
+
+-- Semantic types found by their semantic hash, each at its insertion
+-- ordinal. A hash narrows a lookup and never decides it: membership is
+-- catalog equality within the bucket. A type the catalog cannot hash is
+-- kept apart, and every lookup compares against those too.
+type SemanticApplicationIndex {
+  types: PersistentVector<SemanticTypeId>,
+  buckets: Map<i64, List<usize>>,
+  unhashed: List<usize>
+}
 
 type SemanticRecordApplicationCatalogStorage {
-  targets: List<SemanticTypeId>,
-  field_counts: List<usize>,
-  declarations: List<DeclarationIdentity>,
-  types: List<SemanticTypeId>
+  targets: SemanticApplicationIndex,
+  field_starts: PersistentVector<usize>,
+  field_counts: PersistentVector<usize>,
+  declarations: PersistentVector<DeclarationIdentity>,
+  types: PersistentVector<SemanticTypeId>
 }
 
 pub(package) type SemanticRecordApplicationCatalog = opaque SemanticRecordApplicationCatalogStorage
 
+-- One start and count per application for its cases, and per case for its
+-- payloads.
 type SemanticVariantApplicationCatalogStorage {
-  targets: List<SemanticTypeId>,
-  case_counts: List<usize>,
-  declarations: List<DeclarationIdentity>,
-  payload_counts: List<usize>,
-  payload_types: List<SemanticTypeId>
+  targets: SemanticApplicationIndex,
+  case_starts: PersistentVector<usize>,
+  case_counts: PersistentVector<usize>,
+  declarations: PersistentVector<DeclarationIdentity>,
+  payload_starts: PersistentVector<usize>,
+  payload_counts: PersistentVector<usize>,
+  payload_types: PersistentVector<SemanticTypeId>
 }
 
 pub(package) type SemanticVariantApplicationCatalog = opaque SemanticVariantApplicationCatalogStorage
 
+-- One declaration, operation start and operation count per application;
+-- one declaration, deferral, result, parameter start and parameter count
+-- per operation.
 type SemanticEffectApplicationCatalogStorage {
-  targets: List<SemanticTypeId>,
-  declarations: List<DeclarationIdentity>,
-  operation_counts: List<usize>,
-  operation_declarations: List<DeclarationIdentity>,
-  operation_deferred: List<bool>,
-  operation_parameter_counts: List<usize>,
-  operation_parameter_types: List<SemanticTypeId>,
-  operation_results: List<SemanticTypeId>
+  targets: SemanticApplicationIndex,
+  declarations: PersistentVector<DeclarationIdentity>,
+  operation_starts: PersistentVector<usize>,
+  operation_counts: PersistentVector<usize>,
+  operation_declarations: PersistentVector<DeclarationIdentity>,
+  operation_deferred: PersistentVector<bool>,
+  operation_parameter_starts: PersistentVector<usize>,
+  operation_parameter_counts: PersistentVector<usize>,
+  operation_parameter_types: PersistentVector<SemanticTypeId>,
+  operation_results: PersistentVector<SemanticTypeId>
 }
 
 pub(package) type SemanticEffectApplicationCatalog = opaque SemanticEffectApplicationCatalogStorage
@@ -127,81 +153,127 @@ pub(package) type SemanticEffectApplicationSelection {
   SemanticEffectApplicationSelectionAmbiguous
 }
 
+-- The catalogs under construction, and the types this build has visited. A
+-- target is known once its catalog holds it, so a later materialization
+-- starts from the catalogs with nothing visited.
 type SemanticApplicationBuild {
   product: SemanticTypeProductBuilder,
   records: SemanticRecordApplicationCatalog,
   variants: SemanticVariantApplicationCatalog,
   effects: SemanticEffectApplicationCatalog,
-  visited: SemanticApplicationVisited
+  visited: SemanticApplicationIndex
 }
 
--- The types an application build has visited, bucketed by semantic hash so a
--- visit compares only against types that could be equal. A hash narrows the
--- search and never decides it: membership is catalog equality within the
--- bucket. A type the catalog cannot hash is kept in a plain list.
-type SemanticApplicationVisited {
-  buckets: Map<i64, List<SemanticTypeId>>,
-  unhashed: List<SemanticTypeId>
-}
-
-fn semantic_application_visited_empty() -> SemanticApplicationVisited {
-  SemanticApplicationVisited {
-    buckets: map.new<i64, List<SemanticTypeId>>(),
-    unhashed: Nil<SemanticTypeId>()
+fn semantic_application_index_empty() -> SemanticApplicationIndex {
+  SemanticApplicationIndex {
+    types: persistent_vector.new<SemanticTypeId>(),
+    buckets: map.new<i64, List<usize>>(),
+    unhashed: Nil<usize>()
   }
 }
 
-fn semantic_application_visited_add(
-  visited: SemanticApplicationVisited,
+fn semantic_application_index_add(
+  index: SemanticApplicationIndex,
   catalog: borrow SemanticTypeCatalog,
   value: SemanticTypeId
-) -> SemanticApplicationVisited {
+) -> SemanticApplicationIndex {
+  let { types, buckets, unhashed } = index
+  let ordinal = types.len()
   match semantic_type_catalog_hash(catalog, value) {
-    None -> SemanticApplicationVisited {
-      buckets: visited.buckets,
-      unhashed: visited.unhashed.prepend(value)
+    None -> SemanticApplicationIndex {
+      types: types.push(value),
+      buckets: buckets,
+      unhashed: unhashed.prepend(ordinal)
     }
     Some(hash) -> {
-      let bucket = match visited.buckets.get(hash) {
-        Some(values) -> values
-        None -> Nil<SemanticTypeId>()
+      let bucket = match buckets.get(hash) {
+        Some(ordinals) -> ordinals
+        None -> Nil<usize>()
       }
-      SemanticApplicationVisited {
-        buckets: visited.buckets.insert(hash, bucket.prepend(value)),
-        unhashed: visited.unhashed
+      SemanticApplicationIndex {
+        types: types.push(value),
+        buckets: buckets.insert(hash, bucket.prepend(ordinal)),
+        unhashed: unhashed
       }
     }
   }
 }
 
-fn semantic_application_visited_add_all(
-  visited: SemanticApplicationVisited,
+-- The first of `ordinals` whose type equals `wanted`.
+fn semantic_application_index_match(
+  types: PersistentVector<SemanticTypeId>,
+  ordinals: List<usize>,
   catalog: borrow SemanticTypeCatalog,
-  values: List<SemanticTypeId>
-) -> SemanticApplicationVisited {
-  match values {
-    Nil -> visited
-    Cons(value, rest) -> semantic_application_visited_add_all(
-      semantic_application_visited_add(visited, catalog, value),
-      catalog,
-      rest
-    )
+  wanted: SemanticTypeId
+) -> Option<usize> {
+  match ordinals {
+    Nil -> None<usize>()
+    Cons(ordinal, rest) -> match types.get(ordinal) {
+      Some(value) -> if semantic_type_catalog_equal(catalog, value, wanted) {
+        Some<usize>(ordinal)
+      } else { semantic_application_index_match(types, rest, catalog, wanted) }
+      None -> panic("Semantic application index diverged from its types")
+    }
   }
 }
 
-fn semantic_application_visited_contains(
-  visited: SemanticApplicationVisited,
+-- The ordinal of the type equal to `wanted`, given its semantic hash in
+-- `catalog`. A build adds each type at most once.
+fn semantic_application_index_find(
+  index: borrow SemanticApplicationIndex,
+  catalog: borrow SemanticTypeCatalog,
+  wanted: SemanticTypeId,
+  hash: Option<i64>
+) -> Option<usize> {
+  let types = index.types
+  let hashed = match hash {
+    None -> None<usize>()
+    Some(value) -> match index.buckets.get(value) {
+      Some(ordinals) -> semantic_application_index_match(types, ordinals, catalog, wanted)
+      None -> None<usize>()
+    }
+  }
+  match hashed {
+    Some(ordinal) -> Some<usize>(ordinal)
+    None -> semantic_application_index_match(types, index.unhashed, catalog, wanted)
+  }
+}
+
+fn semantic_application_target(
+  index: borrow SemanticApplicationIndex,
+  catalog: borrow SemanticTypeCatalog,
+  wanted: SemanticTypeId
+) -> Option<usize> {
+  semantic_application_index_find(
+    index,
+    catalog,
+    wanted,
+    semantic_type_catalog_hash(catalog, wanted)
+  )
+}
+
+-- Whether the build has visited `value`, either as an applied target or as
+-- any other type.
+fn semantic_application_known(
+  build: borrow SemanticApplicationBuild,
   catalog: borrow SemanticTypeCatalog,
   value: SemanticTypeId
 ) -> bool {
-  let hashed = match semantic_type_catalog_hash(catalog, value) {
-    None -> false
-    Some(hash) -> match visited.buckets.get(hash) {
-      Some(values) -> semantic_application_seen(values, value, catalog)
-      None -> false
-    }
+  let hash = semantic_type_catalog_hash(catalog, value)
+  let visited = build.visited
+  let records = match build.records {
+    SemanticRecordApplicationCatalog(storage) -> storage.targets
   }
-  hashed or semantic_application_seen(visited.unhashed, value, catalog)
+  let variants = match build.variants {
+    SemanticVariantApplicationCatalog(storage) -> storage.targets
+  }
+  let effects = match build.effects {
+    SemanticEffectApplicationCatalog(storage) -> storage.targets
+  }
+  semantic_application_index_find(visited, catalog, value, hash).is_some() or
+    semantic_application_index_find(records, catalog, value, hash).is_some() or
+    semantic_application_index_find(variants, catalog, value, hash).is_some() or
+    semantic_application_index_find(effects, catalog, value, hash).is_some()
 }
 
 type SemanticApplicationFields {
@@ -229,10 +301,11 @@ type SemanticApplicationOperationFields {
 fn semantic_record_applications_empty() -> SemanticRecordApplicationCatalog {
   SemanticRecordApplicationCatalog(
     SemanticRecordApplicationCatalogStorage {
-      targets: Nil<SemanticTypeId>(),
-      field_counts: Nil<usize>(),
-      declarations: Nil<DeclarationIdentity>(),
-      types: Nil<SemanticTypeId>()
+      targets: semantic_application_index_empty(),
+      field_starts: persistent_vector.new<usize>(),
+      field_counts: persistent_vector.new<usize>(),
+      declarations: persistent_vector.new<DeclarationIdentity>(),
+      types: persistent_vector.new<SemanticTypeId>()
     }
   )
 }
@@ -240,11 +313,13 @@ fn semantic_record_applications_empty() -> SemanticRecordApplicationCatalog {
 fn semantic_variant_applications_empty() -> SemanticVariantApplicationCatalog {
   SemanticVariantApplicationCatalog(
     SemanticVariantApplicationCatalogStorage {
-      targets: Nil<SemanticTypeId>(),
-      case_counts: Nil<usize>(),
-      declarations: Nil<DeclarationIdentity>(),
-      payload_counts: Nil<usize>(),
-      payload_types: Nil<SemanticTypeId>()
+      targets: semantic_application_index_empty(),
+      case_starts: persistent_vector.new<usize>(),
+      case_counts: persistent_vector.new<usize>(),
+      declarations: persistent_vector.new<DeclarationIdentity>(),
+      payload_starts: persistent_vector.new<usize>(),
+      payload_counts: persistent_vector.new<usize>(),
+      payload_types: persistent_vector.new<SemanticTypeId>()
     }
   )
 }
@@ -252,72 +327,59 @@ fn semantic_variant_applications_empty() -> SemanticVariantApplicationCatalog {
 fn semantic_effect_applications_empty() -> SemanticEffectApplicationCatalog {
   SemanticEffectApplicationCatalog(
     SemanticEffectApplicationCatalogStorage {
-      targets: Nil<SemanticTypeId>(),
-      declarations: Nil<DeclarationIdentity>(),
-      operation_counts: Nil<usize>(),
-      operation_declarations: Nil<DeclarationIdentity>(),
-      operation_deferred: Nil<bool>(),
-      operation_parameter_counts: Nil<usize>(),
-      operation_parameter_types: Nil<SemanticTypeId>(),
-      operation_results: Nil<SemanticTypeId>()
+      targets: semantic_application_index_empty(),
+      declarations: persistent_vector.new<DeclarationIdentity>(),
+      operation_starts: persistent_vector.new<usize>(),
+      operation_counts: persistent_vector.new<usize>(),
+      operation_declarations: persistent_vector.new<DeclarationIdentity>(),
+      operation_deferred: persistent_vector.new<bool>(),
+      operation_parameter_starts: persistent_vector.new<usize>(),
+      operation_parameter_counts: persistent_vector.new<usize>(),
+      operation_parameter_types: persistent_vector.new<SemanticTypeId>(),
+      operation_results: persistent_vector.new<SemanticTypeId>()
     }
   )
 }
 
-fn semantic_application_declarations_prepend(
-  values: List<DeclarationIdentity>,
-  suffix: List<DeclarationIdentity>
-) -> List<DeclarationIdentity> {
-  match values {
-    Nil -> suffix
-    Cons(value, remaining) -> Cons<DeclarationIdentity>(
-      value,
-      semantic_application_declarations_prepend(remaining, suffix)
-    )
+fn semantic_application_push_all<T>(
+  values: PersistentVector<T>,
+  items: List<T>
+) -> PersistentVector<T> {
+  match items {
+    Nil -> values
+    Cons(item, rest) -> semantic_application_push_all<T>(values.push(item), rest)
   }
 }
 
-fn semantic_application_types_prepend(
-  values: List<SemanticTypeId>,
-  suffix: List<SemanticTypeId>
-) -> List<SemanticTypeId> {
-  match values {
-    Nil -> suffix
-    Cons(value, remaining) -> Cons<SemanticTypeId>(
-      value,
-      semantic_application_types_prepend(remaining, suffix)
-    )
+-- Each member's start, from the next free position of its own members.
+fn semantic_application_starts(
+  starts: PersistentVector<usize>,
+  next: usize,
+  counts: List<usize>
+) -> PersistentVector<usize> {
+  match counts {
+    Nil -> starts
+    Cons(count, rest) -> semantic_application_starts(starts.push(next), next + count, rest)
   }
 }
 
-fn semantic_application_bools_prepend(
-  values: List<bool>,
-  suffix: List<bool>
-) -> List<bool> {
-  match values {
-    Nil -> suffix
-    Cons(value, remaining) -> Cons<bool>(
-      value,
-      semantic_application_bools_prepend(remaining, suffix)
-    )
-  }
-}
-
-fn semantic_application_usizes_prepend(
-  values: List<usize>,
-  suffix: List<usize>
-) -> List<usize> {
-  match values {
-    Nil -> suffix
-    Cons(value, remaining) -> Cons<usize>(
-      value,
-      semantic_application_usizes_prepend(remaining, suffix)
-    )
+-- The flat position of an entry's `index`th member, when it has that many.
+fn semantic_application_ordinal(
+  starts: PersistentVector<usize>,
+  counts: PersistentVector<usize>,
+  entry: usize,
+  index: usize
+) -> Option<usize> {
+  match (starts.get(entry), counts.get(entry)) {
+    (Some(start), Some(count)) -> if index < count { Some<usize>(start + index) }
+    else { None<usize>() }
+    _ -> None<usize>()
   }
 }
 
 fn semantic_record_applications_add(
   applications: SemanticRecordApplicationCatalog,
+  catalog: borrow SemanticTypeCatalog,
   target: SemanticTypeId,
   declarations: List<DeclarationIdentity>,
   types: List<SemanticTypeId>
@@ -326,13 +388,14 @@ fn semantic_record_applications_add(
     SemanticRecordApplicationCatalog(storage) ->
       SemanticRecordApplicationCatalog(
         SemanticRecordApplicationCatalogStorage {
-          targets: storage.targets.prepend(target),
-          field_counts: storage.field_counts.prepend(declarations.len()),
-          declarations: semantic_application_declarations_prepend(
-            declarations,
-            storage.declarations
+          targets: semantic_application_index_add(storage.targets, catalog, target),
+          field_starts: storage.field_starts.push(storage.declarations.len()),
+          field_counts: storage.field_counts.push(declarations.len()),
+          declarations: semantic_application_push_all<DeclarationIdentity>(
+            storage.declarations,
+            declarations
           ),
-          types: semantic_application_types_prepend(types, storage.types)
+          types: semantic_application_push_all<SemanticTypeId>(storage.types, types)
         }
       )
   }
@@ -340,6 +403,7 @@ fn semantic_record_applications_add(
 
 fn semantic_variant_applications_add(
   applications: SemanticVariantApplicationCatalog,
+  catalog: borrow SemanticTypeCatalog,
   target: SemanticTypeId,
   declarations: List<DeclarationIdentity>,
   payload_counts: List<usize>,
@@ -348,19 +412,25 @@ fn semantic_variant_applications_add(
   match applications {
     SemanticVariantApplicationCatalog(storage) -> SemanticVariantApplicationCatalog(
       SemanticVariantApplicationCatalogStorage {
-        targets: storage.targets.prepend(target),
-        case_counts: storage.case_counts.prepend(declarations.len()),
-        declarations: semantic_application_declarations_prepend(
-          declarations,
-          storage.declarations
+        targets: semantic_application_index_add(storage.targets, catalog, target),
+        case_starts: storage.case_starts.push(storage.declarations.len()),
+        case_counts: storage.case_counts.push(declarations.len()),
+        declarations: semantic_application_push_all<DeclarationIdentity>(
+          storage.declarations,
+          declarations
         ),
-        payload_counts: semantic_application_usizes_prepend(
-          payload_counts,
-          storage.payload_counts
+        payload_starts: semantic_application_starts(
+          storage.payload_starts,
+          storage.payload_types.len(),
+          payload_counts
         ),
-        payload_types: semantic_application_types_prepend(
-          payload_types,
-          storage.payload_types
+        payload_counts: semantic_application_push_all<usize>(
+          storage.payload_counts,
+          payload_counts
+        ),
+        payload_types: semantic_application_push_all<SemanticTypeId>(
+          storage.payload_types,
+          payload_types
         )
       }
     )
@@ -369,6 +439,7 @@ fn semantic_variant_applications_add(
 
 fn semantic_effect_applications_add(
   applications: SemanticEffectApplicationCatalog,
+  catalog: borrow SemanticTypeCatalog,
   target: SemanticTypeId,
   declaration: DeclarationIdentity,
   operation_declarations: List<DeclarationIdentity>,
@@ -380,45 +451,37 @@ fn semantic_effect_applications_add(
   match applications {
     SemanticEffectApplicationCatalog(storage) -> SemanticEffectApplicationCatalog(
       SemanticEffectApplicationCatalogStorage {
-        targets: storage.targets.prepend(target),
-        declarations: storage.declarations.prepend(declaration),
-        operation_counts: storage.operation_counts.prepend(
-          operation_declarations.len()
+        targets: semantic_application_index_add(storage.targets, catalog, target),
+        declarations: storage.declarations.push(declaration),
+        operation_starts: storage.operation_starts.push(storage.operation_declarations.len()),
+        operation_counts: storage.operation_counts.push(operation_declarations.len()),
+        operation_declarations: semantic_application_push_all<DeclarationIdentity>(
+          storage.operation_declarations,
+          operation_declarations
         ),
-        operation_declarations: semantic_application_declarations_prepend(
-          operation_declarations,
-          storage.operation_declarations
+        operation_deferred: semantic_application_push_all<bool>(
+          storage.operation_deferred,
+          operation_deferred
         ),
-        operation_deferred: semantic_application_bools_prepend(
-          operation_deferred,
-          storage.operation_deferred
+        operation_parameter_starts: semantic_application_starts(
+          storage.operation_parameter_starts,
+          storage.operation_parameter_types.len(),
+          operation_parameter_counts
         ),
-        operation_parameter_counts: semantic_application_usizes_prepend(
-          operation_parameter_counts,
-          storage.operation_parameter_counts
+        operation_parameter_counts: semantic_application_push_all<usize>(
+          storage.operation_parameter_counts,
+          operation_parameter_counts
         ),
-        operation_parameter_types: semantic_application_types_prepend(
-          operation_parameter_types,
-          storage.operation_parameter_types
+        operation_parameter_types: semantic_application_push_all<SemanticTypeId>(
+          storage.operation_parameter_types,
+          operation_parameter_types
         ),
-        operation_results: semantic_application_types_prepend(
-          operation_results,
-          storage.operation_results
+        operation_results: semantic_application_push_all<SemanticTypeId>(
+          storage.operation_results,
+          operation_results
         )
       }
     )
-  }
-}
-
-fn semantic_application_seen(
-  visited: List<SemanticTypeId>,
-  wanted: SemanticTypeId,
-  catalog: borrow SemanticTypeCatalog
-) -> bool {
-  match visited {
-    Nil -> false
-    Cons(value, remaining) -> semantic_type_catalog_equal(catalog, value, wanted) or
-      semantic_application_seen(remaining, wanted, catalog)
   }
 }
 
@@ -433,7 +496,7 @@ fn semantic_application_with_visit(
     records: build.records,
     variants: build.variants,
     effects: build.effects,
-    visited: semantic_application_visited_add(build.visited, catalog, value)
+    visited: semantic_application_index_add(build.visited, catalog, value)
   }
 }
 
@@ -885,15 +948,15 @@ fn semantic_application_effect(
           Nil<SemanticTypeId>(),
           Nil<SemanticTypeId>()
         )
-        let resolved_types = semantic_application_types_prepend(
-          operations.parameter_types,
-          operations.results
-        )
+        let resolved_types = operations.parameter_types.concat(operations.results)
+        let resolved_product = operations.build.product
+        let resolved_catalog = semantic_type_product_catalog(resolved_product)
         semantic_application_type_values(
           semantic_application_with_effect_catalog(
             operations.build,
             semantic_effect_applications_add(
               operations.build.effects,
+              resolved_catalog,
               value,
               declaration,
               operations.declarations,
@@ -954,10 +1017,13 @@ fn semantic_application_named(
             Nil<DeclarationIdentity>(),
             Nil<SemanticTypeId>()
           )
+          let resolved_product = fields.build.product
+          let resolved_catalog = semantic_type_product_catalog(resolved_product)
           semantic_application_with_record_catalog(
             fields.build,
             semantic_record_applications_add(
               fields.build.records,
+              resolved_catalog,
               value,
               fields.declarations,
               fields.types
@@ -981,10 +1047,13 @@ fn semantic_application_named(
             Nil<usize>(),
             Nil<SemanticTypeId>()
           )
+          let resolved_product = cases.build.product
+          let resolved_catalog = semantic_type_product_catalog(resolved_product)
           semantic_application_with_variant_catalog(
             cases.build,
             semantic_variant_applications_add(
               cases.build.variants,
+              resolved_catalog,
               value,
               cases.declarations,
               cases.payload_counts,
@@ -1019,7 +1088,7 @@ fn semantic_application_type(
 ) -> SemanticApplicationBuild {
   let product = build.product
   let catalog = semantic_type_product_catalog(product)
-  if semantic_application_visited_contains(build.visited, catalog, value) { build }
+  if semantic_application_known(build, catalog, value) { build }
   else {
     let next = semantic_application_with_visit(build, value)
     match catalog.graph_for(value) {
@@ -1288,7 +1357,7 @@ pub(package) fn resolve_semantic_applications(
           records: semantic_record_applications_empty(),
           variants: semantic_variant_applications_empty(),
           effects: semantic_effect_applications_empty(),
-          visited: semantic_application_visited_empty()
+          visited: semantic_application_index_empty()
         },
         signatures,
         declarations,
@@ -1325,27 +1394,13 @@ pub(package) fn semantic_applications_materialize_type(
   SemanticVariantApplicationCatalog,
   SemanticEffectApplicationCatalog
 ) {
-  let known_records = match records {
-    SemanticRecordApplicationCatalog(storage) -> storage.targets
-  }
-  let known_variants = match variants {
-    SemanticVariantApplicationCatalog(storage) -> storage.targets
-  }
-  let known_effects = match effects {
-    SemanticEffectApplicationCatalog(storage) -> storage.targets
-  }
-  let known_catalog = semantic_type_product_catalog(product)
   let build = semantic_application_type(
     SemanticApplicationBuild {
       product: product,
       records: records,
       variants: variants,
       effects: effects,
-      visited: semantic_application_visited_add_all(
-        semantic_application_visited_empty(),
-        known_catalog,
-        known_records.concat(known_variants).concat(known_effects)
-      )
+      visited: semantic_application_index_empty()
     },
     declarations,
     effect_declarations,
@@ -1354,74 +1409,25 @@ pub(package) fn semantic_applications_materialize_type(
   (build.product, build.records, build.variants, build.effects)
 }
 
-fn semantic_application_usize_prefix(
-  values: List<usize>,
-  count: usize,
-  total: usize
-) -> Option<usize> {
-  if count == 0 { Some<usize>(total) }
-  else {
-    match values {
-      Nil -> None<usize>()
-      Cons(value, remaining) -> match num_scalar_usize_checked_add(total, value) {
-        Some(next) -> semantic_application_usize_prefix(remaining, count - 1, next)
-        None -> None<usize>()
-      }
-    }
-  }
-}
-
-fn semantic_application_at<T>(values: List<T>, index: usize) -> Option<T> {
-  match values {
-    Nil -> None<T>()
-    Cons(value, remaining) -> if index == 0 { Some<T>(value) }
-    else { semantic_application_at(remaining, index - 1) }
-  }
-}
-
-fn semantic_application_target_index(
-  targets: List<SemanticTypeId>,
-  wanted: SemanticTypeId,
-  catalog: borrow SemanticTypeCatalog,
-  index: usize
-) -> Option<usize> {
-  match targets {
-    Nil -> None<usize>()
-    Cons(target, remaining) -> if semantic_type_catalog_equal(catalog, target, wanted) {
-      Some<usize>(index)
-    } else {
-      semantic_application_target_index(remaining, wanted, catalog, index + 1)
-    }
-  }
-}
-
 fn semantic_application_field_projection(
-  storage: SemanticRecordApplicationCatalogStorage,
+  storage: borrow SemanticRecordApplicationCatalogStorage,
+  application: usize,
   wanted: str,
-  field: usize,
-  field_count: usize,
-  start: usize
+  field: usize
 ) -> SemanticDeclaredFieldProjection {
-  if field >= field_count { SemanticDeclaredFieldMissing }
-  else {
-    let ordinal = start + field
-    match (
-      semantic_application_at(storage.declarations, ordinal),
-      semantic_application_at(storage.types, ordinal),
-    ) {
+  match semantic_application_ordinal(
+    storage.field_starts,
+    storage.field_counts,
+    application,
+    field
+  ) {
+    None -> SemanticDeclaredFieldMissing
+    Some(ordinal) -> match (storage.declarations.get(ordinal), storage.types.get(ordinal)) {
       (Some(declaration), Some(field_type)) -> {
         let name = declaration_identity_name(declaration)
         if match name.text() { Some(value) -> value == wanted, None -> false } {
           SemanticDeclaredFieldProjected(declaration, field, field_type)
-        } else {
-          semantic_application_field_projection(
-            storage,
-            wanted,
-            field + 1,
-            field_count,
-            start
-          )
-        }
+        } else { semantic_application_field_projection(storage, application, wanted, field + 1) }
       }
       _ -> panic("Semantic record application columns diverged")
     }
@@ -1435,56 +1441,44 @@ pub(package) fn semantic_declared_field_projection(
   wanted: str
 ) -> SemanticDeclaredFieldProjection {
   match applications {
-    SemanticRecordApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      base,
-      types,
-      0
-    ) {
-      None -> SemanticDeclaredFieldProjectionUnavailable
-      Some(application) -> match (
-        semantic_application_at(storage.field_counts, application),
-        semantic_application_usize_prefix(storage.field_counts, application, 0),
-      ) {
-        (Some(field_count), Some(start)) -> semantic_application_field_projection(
+    SemanticRecordApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, base) {
+        None -> SemanticDeclaredFieldProjectionUnavailable
+        Some(application) -> semantic_application_field_projection(
           storage,
+          application,
           wanted,
-          0,
-          field_count,
-          start
+          0
         )
-        _ -> panic("Semantic record application bounds diverged")
       }
     }
   }
 }
 
 fn semantic_application_case_projection(
-  storage: SemanticVariantApplicationCatalogStorage,
+  storage: borrow SemanticVariantApplicationCatalogStorage,
+  application: usize,
   wanted: str,
-  case_index: usize,
-  case_count: usize,
-  start: usize
+  case_index: usize
 ) -> SemanticVariantCaseProjection {
-  if case_index >= case_count { SemanticVariantCaseMissing }
-  else {
-    let ordinal = start + case_index
-    match (
-      semantic_application_at(storage.declarations, ordinal),
-      semantic_application_at(storage.payload_counts, ordinal),
+  match semantic_application_ordinal(
+    storage.case_starts,
+    storage.case_counts,
+    application,
+    case_index
+  ) {
+    None -> SemanticVariantCaseMissing
+    Some(ordinal) -> match (
+      storage.declarations.get(ordinal),
+      storage.payload_counts.get(ordinal)
     ) {
       (Some(declaration), Some(payload_count)) -> {
         let name = declaration_identity_name(declaration)
         if match name.text() { Some(value) -> value == wanted, None -> false } {
           SemanticVariantCaseProjected(declaration, case_index, payload_count)
         } else {
-          semantic_application_case_projection(
-            storage,
-            wanted,
-            case_index + 1,
-            case_count,
-            start
-          )
+          semantic_application_case_projection(storage, application, wanted, case_index + 1)
         }
       }
       _ -> panic("Semantic variant application columns diverged")
@@ -1499,25 +1493,11 @@ pub(package) fn semantic_variant_case_projection(
   wanted: str
 ) -> SemanticVariantCaseProjection {
   match applications {
-    SemanticVariantApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      base,
-      types,
-      0
-    ) {
-      None -> SemanticVariantApplicationUnavailable
-      Some(application) -> match (
-        semantic_application_at(storage.case_counts, application),
-        semantic_application_usize_prefix(storage.case_counts, application, 0),
-      ) {
-        (Some(case_count), Some(start)) -> semantic_application_case_projection(
-          storage,
-          wanted,
-          0,
-          case_count,
-          start
-        )
-        _ -> panic("Semantic variant application bounds diverged")
+    SemanticVariantApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, base) {
+        None -> SemanticVariantApplicationUnavailable
+        Some(application) -> semantic_application_case_projection(storage, application, wanted, 0)
       }
     }
   }
@@ -1529,14 +1509,12 @@ pub(package) fn semantic_variant_case_count(
   base: SemanticTypeId
 ) -> Option<usize> {
   match applications {
-    SemanticVariantApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      base,
-      types,
-      0
-    ) {
-      None -> None<usize>()
-      Some(application) -> semantic_application_at(storage.case_counts, application)
+    SemanticVariantApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, base) {
+        None -> None<usize>()
+        Some(application) -> storage.case_counts.get(application)
+      }
     }
   }
 }
@@ -1549,117 +1527,113 @@ pub(package) fn semantic_variant_payload_type(
   payload_index: usize
 ) -> Option<SemanticTypeId> {
   match applications {
-    SemanticVariantApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      base,
-      types,
-      0
-    ) {
-      None -> None<SemanticTypeId>()
-      Some(application) -> match (
-        semantic_application_at(storage.case_counts, application),
-        semantic_application_usize_prefix(storage.case_counts, application, 0),
-      ) {
-        (Some(case_count), Some(case_start)) -> if case_index >= case_count {
-          None<SemanticTypeId>()
-        } else {
-          let ordinal = case_start + case_index
-          match (
-            semantic_application_at(storage.payload_counts, ordinal),
-            semantic_application_usize_prefix(storage.payload_counts, ordinal, 0),
+    SemanticVariantApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, base) {
+        None -> None<SemanticTypeId>()
+        Some(application) -> match semantic_application_ordinal(
+          storage.case_starts,
+          storage.case_counts,
+          application,
+          case_index
+        ) {
+          None -> None<SemanticTypeId>()
+          Some(case_ordinal) -> match semantic_application_ordinal(
+            storage.payload_starts,
+            storage.payload_counts,
+            case_ordinal,
+            payload_index
           ) {
-            (Some(payload_count), Some(payload_start)) -> if payload_index >= payload_count {
-              None<SemanticTypeId>()
-            } else {
-              semantic_application_at(storage.payload_types, payload_start + payload_index)
-            }
-            _ -> panic("Semantic variant payload bounds diverged")
+            None -> None<SemanticTypeId>()
+            Some(ordinal) -> storage.payload_types.get(ordinal)
           }
         }
-        _ -> panic("Semantic variant application bounds diverged")
       }
     }
+  }
+}
+
+-- The flat position of the first operation of an application that `found`
+-- selects.
+fn semantic_effect_application_operation_where(
+  storage: borrow SemanticEffectApplicationCatalogStorage,
+  application: usize,
+  found: (DeclarationIdentity) -> bool
+) -> Option<usize> {
+  let mut offset: usize = 0
+  loop {
+    match semantic_application_ordinal(
+      storage.operation_starts,
+      storage.operation_counts,
+      application,
+      offset
+    ) {
+      None -> return None<usize>()
+      Some(ordinal) -> match storage.operation_declarations.get(ordinal) {
+        Some(operation) -> if found(operation) { return Some<usize>(ordinal) }
+        None -> panic("Semantic effect application columns diverged")
+      }
+    }
+    offset = offset + 1
   }
 }
 
 fn semantic_effect_application_operation_index(
-  storage: SemanticEffectApplicationCatalogStorage,
+  storage: borrow SemanticEffectApplicationCatalogStorage,
   application: usize,
   wanted: str
 ) -> Option<usize> {
-  match (
-    semantic_application_at(storage.operation_counts, application),
-    semantic_application_usize_prefix(storage.operation_counts, application, 0),
-  ) {
-    (Some(count), Some(start)) -> {
-      let mut offset: usize = 0
-      while offset < count {
-        let ordinal = start + offset
-        match semantic_application_at(storage.operation_declarations, ordinal) {
-          Some(operation) -> {
-            let name = declaration_identity_name(operation)
-            if match name.text() { Some(value) -> value == wanted, None -> false } {
-              return Some<usize>(ordinal)
-            }
-          }
-          None -> panic("Semantic effect application columns diverged")
-        }
-        offset = offset + 1
-      }
-      None<usize>()
+  semantic_effect_application_operation_where(
+    storage,
+    application,
+    (operation) => match declaration_identity_name(operation).text() {
+      Some(value) -> value == wanted
+      None -> false
     }
-    _ -> panic("Semantic effect application bounds diverged")
-  }
+  )
 }
 
 fn semantic_effect_application_operation_identity_index(
-  storage: SemanticEffectApplicationCatalogStorage,
+  storage: borrow SemanticEffectApplicationCatalogStorage,
   application: usize,
   wanted: DeclarationIdentity
 ) -> Option<usize> {
-  match (
-    semantic_application_at(storage.operation_counts, application),
-    semantic_application_usize_prefix(storage.operation_counts, application, 0),
-  ) {
-    (Some(count), Some(start)) -> {
-      let mut offset: usize = 0
-      while offset < count {
-        let ordinal = start + offset
-        match semantic_application_at(storage.operation_declarations, ordinal) {
-          Some(operation) -> if declaration_identity_eq(operation, wanted) {
-            return Some<usize>(ordinal)
-          }
-          None -> panic("Semantic effect application columns diverged")
-        }
-        offset = offset + 1
-      }
-      None<usize>()
-    }
-    _ -> panic("Semantic effect application bounds diverged")
-  }
+  semantic_effect_application_operation_where(
+    storage,
+    application,
+    (operation) => declaration_identity_eq(operation, wanted)
+  )
 }
 
 fn semantic_effect_operation_projection_at(
-  storage: SemanticEffectApplicationCatalogStorage,
+  storage: borrow SemanticEffectApplicationCatalogStorage,
   application: usize,
   operation_index: usize
 ) -> SemanticEffectOperationProjection {
+  let targets = storage.targets
   match (
-    semantic_application_at(storage.declarations, application),
-    semantic_application_at(storage.operation_declarations, operation_index),
-    semantic_application_at(storage.operation_deferred, operation_index),
-    semantic_application_at(storage.operation_parameter_counts, operation_index),
-    semantic_application_at(storage.operation_results, operation_index),
+    targets.types.get(application),
+    storage.declarations.get(application),
+    storage.operation_declarations.get(operation_index),
+    storage.operation_deferred.get(operation_index),
+    storage.operation_parameter_counts.get(operation_index),
+    storage.operation_results.get(operation_index),
   ) {
-    (Some(declaration), Some(operation), Some(deferred), Some(parameter_count), Some(result)) ->
-      SemanticEffectOperationProjected(
-        semantic_application_at(storage.targets, application).unwrap(),
-        declaration,
-        operation,
-        deferred,
-        parameter_count,
-        result
-      )
+    (
+      Some(target),
+      Some(declaration),
+      Some(operation),
+      Some(deferred),
+      Some(parameter_count),
+      Some(result),
+    ) -> SemanticEffectOperationProjected(
+      target,
+      declaration,
+      operation,
+      deferred,
+      parameter_count,
+      result
+    )
     _ -> panic("Semantic effect application columns diverged")
   }
 }
@@ -1671,24 +1645,22 @@ pub(package) fn semantic_effect_operation_projection(
   wanted: str
 ) -> SemanticEffectOperationProjection {
   match applications {
-    SemanticEffectApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      atom,
-      types,
-      0
-    ) {
-      None -> SemanticEffectApplicationUnavailable
-      Some(application) -> match semantic_effect_application_operation_index(
-        storage,
-        application,
-        wanted
-      ) {
-        None -> SemanticEffectOperationMissing
-        Some(operation_index) -> semantic_effect_operation_projection_at(
+    SemanticEffectApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, atom) {
+        None -> SemanticEffectApplicationUnavailable
+        Some(application) -> match semantic_effect_application_operation_index(
           storage,
           application,
-          operation_index
-        )
+          wanted
+        ) {
+          None -> SemanticEffectOperationMissing
+          Some(operation_index) -> semantic_effect_operation_projection_at(
+            storage,
+            application,
+            operation_index
+          )
+        }
       }
     }
   }
@@ -1703,50 +1675,40 @@ pub(package) fn semantic_effect_operation_projection_by_identity(
   wanted: DeclarationIdentity
 ) -> SemanticEffectOperationProjection {
   match applications {
-    SemanticEffectApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      atom,
-      types,
-      0
-    ) {
-      None -> SemanticEffectApplicationUnavailable
-      Some(application) -> match semantic_effect_application_operation_identity_index(
-        storage,
-        application,
-        wanted
-      ) {
-        None -> SemanticEffectOperationMissing
-        Some(operation_index) -> semantic_effect_operation_projection_at(
+    SemanticEffectApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, atom) {
+        None -> SemanticEffectApplicationUnavailable
+        Some(application) -> match semantic_effect_application_operation_identity_index(
           storage,
           application,
-          operation_index
-        )
+          wanted
+        ) {
+          None -> SemanticEffectOperationMissing
+          Some(operation_index) -> semantic_effect_operation_projection_at(
+            storage,
+            application,
+            operation_index
+          )
+        }
       }
     }
   }
 }
 
 fn semantic_effect_application_parameter_at(
-  storage: SemanticEffectApplicationCatalogStorage,
+  storage: borrow SemanticEffectApplicationCatalogStorage,
   operation_index: usize,
   parameter: usize
 ) -> Option<SemanticTypeId> {
-  match semantic_application_at(storage.operation_parameter_counts, operation_index) {
-    Some(count) -> if parameter >= count { None<SemanticTypeId>() }
-    else {
-      match semantic_application_usize_prefix(
-        storage.operation_parameter_counts,
-        operation_index,
-        0
-      ) {
-        None -> None<SemanticTypeId>()
-        Some(start) -> match num_scalar_usize_checked_add(start, parameter) {
-          None -> None<SemanticTypeId>()
-          Some(index) -> semantic_application_at(storage.operation_parameter_types, index)
-        }
-      }
-    }
+  match semantic_application_ordinal(
+    storage.operation_parameter_starts,
+    storage.operation_parameter_counts,
+    operation_index,
+    parameter
+  ) {
     None -> None<SemanticTypeId>()
+    Some(ordinal) -> storage.operation_parameter_types.get(ordinal)
   }
 }
 
@@ -1758,24 +1720,22 @@ pub(package) fn semantic_effect_application_parameter_type(
   parameter: usize
 ) -> Option<SemanticTypeId> {
   match applications {
-    SemanticEffectApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      atom,
-      types,
-      0
-    ) {
-      None -> None<SemanticTypeId>()
-      Some(application) -> match semantic_effect_application_operation_index(
-        storage,
-        application,
-        wanted
-      ) {
+    SemanticEffectApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, atom) {
         None -> None<SemanticTypeId>()
-        Some(operation_index) -> semantic_effect_application_parameter_at(
+        Some(application) -> match semantic_effect_application_operation_index(
           storage,
-          operation_index,
-          parameter
-        )
+          application,
+          wanted
+        ) {
+          None -> None<SemanticTypeId>()
+          Some(operation_index) -> semantic_effect_application_parameter_at(
+            storage,
+            operation_index,
+            parameter
+          )
+        }
       }
     }
   }
@@ -1789,60 +1749,24 @@ pub(package) fn semantic_effect_application_parameter_type_by_identity(
   parameter: usize
 ) -> Option<SemanticTypeId> {
   match applications {
-    SemanticEffectApplicationCatalog(storage) -> match semantic_application_target_index(
-      storage.targets,
-      atom,
-      types,
-      0
-    ) {
-      None -> None<SemanticTypeId>()
-      Some(application) -> match semantic_effect_application_operation_identity_index(
-        storage,
-        application,
-        wanted
-      ) {
+    SemanticEffectApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      match semantic_application_target(targets, types, atom) {
         None -> None<SemanticTypeId>()
-        Some(operation_index) -> semantic_effect_application_parameter_at(
+        Some(application) -> match semantic_effect_application_operation_identity_index(
           storage,
-          operation_index,
-          parameter
-        )
-      }
-    }
-  }
-}
-
-fn semantic_effect_application_select_declaration(
-  targets: List<SemanticTypeId>,
-  declarations: List<DeclarationIdentity>,
-  wanted: DeclarationIdentity,
-  selected: Option<SemanticTypeId>
-) -> SemanticEffectApplicationSelection {
-  match (targets, declarations) {
-    (Nil, Nil) -> match selected {
-      Some(atom) -> SemanticEffectApplicationSelected(atom)
-      None -> SemanticEffectApplicationSelectionMissing
-    }
-    (Cons(atom, remaining_targets), Cons(declaration, remaining_declarations)) ->
-      if declaration_identity_eq(declaration, wanted) {
-        match selected {
-          Some(_) -> SemanticEffectApplicationSelectionAmbiguous
-          None -> semantic_effect_application_select_declaration(
-            remaining_targets,
-            remaining_declarations,
-            wanted,
-            Some<SemanticTypeId>(atom)
+          application,
+          wanted
+        ) {
+          None -> None<SemanticTypeId>()
+          Some(operation_index) -> semantic_effect_application_parameter_at(
+            storage,
+            operation_index,
+            parameter
           )
         }
-      } else {
-        semantic_effect_application_select_declaration(
-          remaining_targets,
-          remaining_declarations,
-          wanted,
-          selected
-        )
       }
-    _ -> panic("Semantic effect application declaration columns diverged")
+    }
   }
 }
 
@@ -1851,12 +1775,26 @@ pub(package) fn semantic_effect_application_for_declaration(
   declaration: DeclarationIdentity
 ) -> SemanticEffectApplicationSelection {
   match applications {
-    SemanticEffectApplicationCatalog(storage) ->
-      semantic_effect_application_select_declaration(
-        storage.targets,
-        storage.declarations,
-        declaration,
-        None<SemanticTypeId>()
-      )
+    SemanticEffectApplicationCatalog(storage) -> {
+      let targets = storage.targets
+      let mut selected = None<SemanticTypeId>()
+      let mut application: usize = 0
+      while application < storage.declarations.len() {
+        match (storage.declarations.get(application), targets.types.get(application)) {
+          (Some(candidate), Some(atom)) -> if declaration_identity_eq(candidate, declaration) {
+            match selected {
+              Some(_) -> return SemanticEffectApplicationSelectionAmbiguous
+              None -> { selected = Some<SemanticTypeId>(atom) }
+            }
+          }
+          _ -> panic("Semantic effect application declaration columns diverged")
+        }
+        application = application + 1
+      }
+      match selected {
+        Some(atom) -> SemanticEffectApplicationSelected(atom)
+        None -> SemanticEffectApplicationSelectionMissing
+      }
+    }
   }
 }
