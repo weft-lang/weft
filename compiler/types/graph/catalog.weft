@@ -3,10 +3,13 @@
 -- The catalog owns no global compiler state. Checked-program composition
 -- supplies exactly the frozen segments in its closure. A scalar open-addressed
 -- index selects a one-word segment handle; exact retained identity decides a
--- hash collision.
+-- hash collision. Beside it, each owner's next free derived ordinal is kept
+-- as segments arrive, so allocating a derived segment never walks the others.
 
 use compiler/types/graph.{*}
 use compiler/project/identity.{ModuleIdentity}
+use compiler/project/identity/equality.{module_identity_eq}
+use compiler/project/identity/hash.{retained_module_identity_hash}
 use compiler/weft/check/storage.{
   DenseBuilder,
   DenseSegment,
@@ -15,6 +18,9 @@ use compiler/weft/check/storage.{
   dense_index_value
 }
 use stdlib/drop.{Drop}
+use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
 use stdlib/num/scalar.{num_scalar_usize_checked_add, num_scalar_usize_checked_mul}
 use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
@@ -37,10 +43,21 @@ pub(package) type SemanticTypeCatalogSegment {
   SemanticTypeCatalogSegmentValue(SemanticTypeCatalogContext)
 }
 
+-- One owner's next free derived ordinal.
+type SemanticDerivedOrdinal {
+  owner: ModuleIdentity,
+  next: usize
+}
+
+-- Next free derived ordinals by the owner's retained hash; exact identity
+-- decides a collision within a bucket.
+type SemanticDerivedOrdinals = Map<i64, List<SemanticDerivedOrdinal>>
+
 type SemanticTypeCatalogStorage {
   segments: DenseSegment<SemanticTypeCatalogSegment>,
   slots: DenseSegment<usize>,
-  mask: usize
+  mask: usize,
+  derived: SemanticDerivedOrdinals
 }
 
 pub(package) type SemanticTypeCatalog = opaque SemanticTypeCatalogStorage
@@ -48,7 +65,8 @@ pub(package) type SemanticTypeCatalog = opaque SemanticTypeCatalogStorage
 type SemanticTypeCatalogBuilderStorage {
   segments: owned DenseBuilder<SemanticTypeCatalogSegment>,
   slots: owned DenseBuilder<usize>,
-  mask: usize
+  mask: usize,
+  derived: SemanticDerivedOrdinals
 }
 
 pub(package) type SemanticTypeCatalogBuilder = opaque SemanticTypeCatalogBuilderStorage
@@ -87,6 +105,60 @@ fn semantic_type_catalog_hash(segment: SemanticTypeSegmentId) -> i64 {
 
 fn semantic_type_catalog_index(hash: i64, mask: usize) -> usize {
   __i64_to_usize(hash band __u64_to_i64(__usize_to_u64(mask)))
+}
+
+fn semantic_derived_ordinal_raise(
+  bucket: List<SemanticDerivedOrdinal>,
+  owner: ModuleIdentity,
+  next: usize
+) -> List<SemanticDerivedOrdinal> {
+  match bucket {
+    Nil -> Nil<SemanticDerivedOrdinal>().prepend(
+      SemanticDerivedOrdinal { owner: owner, next: next }
+    )
+    Cons(entry, rest) -> if module_identity_eq(entry.owner, owner) {
+      if entry.next >= next { bucket }
+      else { rest.prepend(SemanticDerivedOrdinal { owner: owner, next: next }) }
+    } else { semantic_derived_ordinal_raise(rest, owner, next).prepend(entry) }
+  }
+}
+
+-- The ordinals after a segment arrives: a derived segment raises its owner's
+-- next free ordinal past its own.
+fn semantic_derived_ordinals_with(
+  derived: SemanticDerivedOrdinals,
+  segment: SemanticTypeSegmentId
+) -> SemanticDerivedOrdinals {
+  let owner = semantic_type_segment_module(segment)
+  match semantic_type_segment_derived_ordinal(segment, owner) {
+    None -> derived
+    Some(ordinal) -> {
+      let next = match num_scalar_usize_checked_add(ordinal, 1) {
+        Some(value) -> value
+        None -> panic("Semantic type segment ordinal is exhausted")
+      }
+      let key = retained_module_identity_hash(owner)
+      let bucket = match derived.get(key) {
+        Some(found) -> found
+        None -> Nil<SemanticDerivedOrdinal>()
+      }
+      derived.insert(key, semantic_derived_ordinal_raise(bucket, owner, next))
+    }
+  }
+}
+
+-- The owner's next free derived ordinal, and never below `floor`.
+fn semantic_derived_ordinal_next(
+  bucket: List<SemanticDerivedOrdinal>,
+  owner: ModuleIdentity,
+  floor: usize
+) -> usize {
+  match bucket {
+    Nil -> floor
+    Cons(entry, rest) -> if module_identity_eq(entry.owner, owner) {
+      if entry.next > floor { entry.next } else { floor }
+    } else { semantic_derived_ordinal_next(rest, owner, floor) }
+  }
 }
 
 fn semantic_type_catalog_segment(
@@ -134,7 +206,8 @@ pub(package) fn semantic_type_catalog_builder(
     SemanticTypeCatalogBuilderStorage {
       segments: dense_builder_with_capacity<SemanticTypeCatalogSegment>(expected),
       slots: slots,
-      mask: capacity - 1
+      mask: capacity - 1,
+      derived: map.new<i64, List<SemanticDerivedOrdinal>>()
     }
   )
 }
@@ -151,7 +224,7 @@ impl SemanticTypeCatalogBuilder {
     let wanted = semantic_type_graph_segment(graph)
     match self {
       SemanticTypeCatalogBuilder(storage) -> {
-        let { segments, slots, mask } = storage
+        let { segments, slots, mask, derived } = storage
         let mut slot = semantic_type_catalog_index(
           semantic_type_catalog_hash(wanted),
           mask
@@ -185,7 +258,8 @@ impl SemanticTypeCatalogBuilder {
                 SemanticTypeCatalogBuilderStorage {
                   segments: segments,
                   slots: slots,
-                  mask: mask
+                  mask: mask,
+                  derived: derived
                 }
               ),
               wanted
@@ -200,7 +274,8 @@ impl SemanticTypeCatalogBuilder {
                 SemanticTypeCatalogBuilderStorage {
                   segments: next_segments,
                   slots: next_slots,
-                  mask: mask
+                  mask: mask,
+                  derived: semantic_derived_ordinals_with(derived, wanted)
                 }
               )
             )
@@ -213,12 +288,13 @@ impl SemanticTypeCatalogBuilder {
   pub(package) fn freeze(self: owned Self) -> SemanticTypeCatalog {
     match self {
       SemanticTypeCatalogBuilder(storage) -> {
-        let { segments, slots, mask } = storage
+        let { segments, slots, mask, derived } = storage
         SemanticTypeCatalog(
           SemanticTypeCatalogStorage {
             segments: segments.freeze(),
             slots: slots.freeze(),
-            mask: mask
+            mask: mask,
+            derived: derived
           }
         )
       }
@@ -230,7 +306,7 @@ impl Drop for SemanticTypeCatalogBuilder {
   fn drop(self) -> nil {
     match self {
       SemanticTypeCatalogBuilder(storage) -> {
-        let { segments, slots, mask: _ } = storage
+        let { segments, slots, mask: _, derived: _ } = storage
         segments.drop()
         slots.drop()
       }
@@ -298,24 +374,11 @@ impl SemanticTypeCatalog {
   ) -> usize {
     match self {
       SemanticTypeCatalog(storage) -> {
-        let { segments } = storage
-        let mut next = floor
-        let mut index: usize = 0
-        while index < segments.len() {
-          let candidate = segments.at(dense_index(index))
-          let segment = semantic_type_catalog_segment_id(candidate)
-          match semantic_type_segment_derived_ordinal(segment, owner) {
-            Some(ordinal) -> if ordinal >= next {
-              next = match num_scalar_usize_checked_add(ordinal, 1) {
-                Some(value) -> value
-                None -> panic("Semantic type segment ordinal is exhausted")
-              }
-            } else { nil }
-            None -> nil
-          }
-          index = index + 1
+        let { derived } = storage
+        match derived.get(retained_module_identity_hash(owner)) {
+          Some(bucket) -> semantic_derived_ordinal_next(bucket, owner, floor)
+          None -> floor
         }
-        next
       }
     }
   }
@@ -441,7 +504,7 @@ pub(package) fn semantic_type_catalog_extend(
 ) -> SemanticTypeCatalogExtend {
   match catalog {
     SemanticTypeCatalog(storage) -> {
-      let { segments, slots, mask } = storage
+      let { segments, slots, mask, derived } = storage
       let required = segments.len() + 1
       let capacity = mask + 1
       let wanted_capacity = semantic_type_catalog_capacity(required)
@@ -466,7 +529,8 @@ pub(package) fn semantic_type_catalog_extend(
                 SemanticTypeCatalogStorage {
                   segments: next_segments,
                   slots: next_slots,
-                  mask: mask
+                  mask: mask,
+                  derived: semantic_derived_ordinals_with(derived, wanted)
                 }
               )
             )
@@ -481,7 +545,8 @@ pub(package) fn semantic_type_catalog_extend(
                   SemanticTypeCatalogStorage {
                     segments: segments,
                     slots: slots,
-                    mask: mask
+                    mask: mask,
+                    derived: derived
                   }
                 ),
                 wanted
