@@ -44,6 +44,7 @@ use compiler/project/identity.{
   function_identity_module
 }
 use compiler/project/identity/equality.{function_identity_eq, module_identity_eq}
+use compiler/project/identity/hash.{retained_function_identity_hash}
 use compiler/types/graph.{*}
 use compiler/types/graph/catalog.{*}
 use compiler/weft/check/registration/catalog.{
@@ -75,6 +76,8 @@ use compiler/weft/check/storage.{
   dense_index
 }
 use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
 use stdlib/option.{None, Option, Some}
 use stdlib/panic.{panic}
 
@@ -92,14 +95,77 @@ pub(package) type SemanticSignatureBound {
   trait_atom: SemanticTypeId
 }
 
+-- A module's own function signatures and the external ones it has
+-- resolved, each found through the positions of its function identity's
+-- retained hash; exact identity decides within a bucket.
 type SemanticSignatureProductStorage {
   module: ModuleIdentity,
   catalog: SemanticTypeCatalog,
   next_type_segment: usize,
   functions: DenseSegment<SemanticFunctionSignature>,
+  function_index: Map<i64, List<usize>>,
   external_functions: DenseSegment<SemanticFunctionSignature>,
+  external_index: Map<i64, List<usize>>,
   type_parameters: DenseSegment<SemanticTypeVariable>,
   bounds: DenseSegment<SemanticSignatureBound>
+}
+
+fn semantic_signature_index_add(
+  index: Map<i64, List<usize>>,
+  identity: FunctionIdentity,
+  position: usize
+) -> Map<i64, List<usize>> {
+  let key = retained_function_identity_hash(identity)
+  let bucket = match index.get(key) {
+    Some(positions) -> positions
+    None -> Nil<usize>()
+  }
+  index.insert(key, bucket.prepend(position))
+}
+
+fn semantic_signature_index(
+  signatures: borrow DenseSegment<SemanticFunctionSignature>
+) -> Map<i64, List<usize>> {
+  let mut index = map.new<i64, List<usize>>()
+  let mut position: usize = 0
+  while position < signatures.len() {
+    let signature = signatures.at(dense_index(position))
+    index = semantic_signature_index_add(index, signature.identity, position)
+    position = position + 1
+  }
+  index
+}
+
+-- The first signature, by position, whose identity is `wanted`.
+fn semantic_signature_indexed(
+  signatures: borrow DenseSegment<SemanticFunctionSignature>,
+  index: borrow Map<i64, List<usize>>,
+  wanted: FunctionIdentity
+) -> Option<SemanticFunctionSignature> {
+  let mut positions = match index.get(retained_function_identity_hash(wanted)) {
+    Some(found) -> found
+    None -> return None<SemanticFunctionSignature>()
+  }
+  let mut selected = None<SemanticFunctionSignature>()
+  let mut selected_position: usize = 0
+  loop {
+    match positions {
+      Nil -> break
+      Cons(position, rest) -> {
+        let signature = signatures.at(dense_index(position))
+        let earlier = match selected {
+          Some(_) -> position < selected_position
+          None -> true
+        }
+        if earlier and function_identity_eq(signature.identity, wanted) {
+          selected = Some<SemanticFunctionSignature>(signature)
+          selected_position = position
+        }
+        positions = rest
+      }
+    }
+  }
+  selected
 }
 
 pub(package) type SemanticSignatureProduct = opaque SemanticSignatureProductStorage
@@ -351,14 +417,18 @@ pub(package) fn resolve_module_signatures(
     SemanticSignatureBuildResolved(product, signatures, type_parameters, bounds) -> {
       let catalog = semantic_type_product_catalog(product)
       let next_type_segment = semantic_type_product_next_segment(product)
+      let functions = signatures.freeze()
+      let function_index = semantic_signature_index(functions)
       SemanticSignaturesResolved(
         SemanticSignatureProduct(
           SemanticSignatureProductStorage {
             module: module.identity,
             catalog: catalog,
             next_type_segment: next_type_segment,
-            functions: signatures.freeze(),
+            functions: functions,
+            function_index: function_index,
             external_functions: dense_builder_with_capacity<SemanticFunctionSignature>(0).freeze(),
+            external_index: map.new<i64, List<usize>>(),
             type_parameters: type_parameters.freeze(),
             bounds: bounds.freeze()
           }
@@ -478,6 +548,10 @@ pub(package) fn semantic_signature_in_scope(
                       merged_bounds = merged_bounds.push(bounds.at(dense_index(index)))
                       index = index + 1
                     }
+                    let external_position = {
+                      let externals = storage.external_functions
+                      externals.len()
+                    }
                     SemanticScopeSignatureFound(
                       SemanticSignatureProduct(
                         SemanticSignatureProductStorage {
@@ -485,7 +559,13 @@ pub(package) fn semantic_signature_in_scope(
                           catalog: semantic_type_product_catalog(product),
                           next_type_segment: semantic_type_product_next_segment(product),
                           functions: storage.functions,
+                          function_index: storage.function_index,
                           external_functions: storage.external_functions.push(signature),
+                          external_index: semantic_signature_index_add(
+                            storage.external_index,
+                            signature.identity,
+                            external_position
+                          ),
                           type_parameters: merged_variables,
                           bounds: merged_bounds
                         }
@@ -514,7 +594,9 @@ impl SemanticSignatureProduct {
         catalog: catalog,
         next_type_segment: storage.next_type_segment,
         functions: storage.functions,
+        function_index: storage.function_index,
         external_functions: storage.external_functions,
+        external_index: storage.external_index,
         type_parameters: storage.type_parameters,
         bounds: storage.bounds
       }
@@ -687,22 +769,15 @@ impl SemanticSignatureProduct {
           catalog: _,
           next_type_segment: _,
           functions,
+          function_index,
           external_functions,
+          external_index,
           type_parameters: _,
           bounds: _
         } = storage
-        let selected = if module_identity_eq(module, function_identity_module(wanted)) {
-          functions
-        } else { external_functions }
-        let mut index: usize = 0
-        while index < selected.len() {
-          let signature = selected.at(dense_index(index))
-          if function_identity_eq(signature.identity, wanted) {
-            return Some<SemanticFunctionSignature>(signature)
-          } else { nil }
-          index = index + 1
-        }
-        None<SemanticFunctionSignature>()
+        if module_identity_eq(module, function_identity_module(wanted)) {
+          semantic_signature_indexed(functions, function_index, wanted)
+        } else { semantic_signature_indexed(external_functions, external_index, wanted) }
       }
     }
   }
@@ -769,6 +844,10 @@ fn semantic_native_signature_in_scope(
           bounds_start: bounds.len(),
           bounds_count: 0
         }
+        let external_position = {
+          let externals = storage.external_functions
+          externals.len()
+        }
         SemanticScopeSignatureFound(
           SemanticSignatureProduct(
             SemanticSignatureProductStorage {
@@ -776,7 +855,13 @@ fn semantic_native_signature_in_scope(
               catalog: next_catalog,
               next_type_segment: storage.next_type_segment,
               functions: storage.functions,
+              function_index: storage.function_index,
               external_functions: storage.external_functions.push(signature),
+              external_index: semantic_signature_index_add(
+                storage.external_index,
+                signature.identity,
+                external_position
+              ),
               type_parameters: type_parameters,
               bounds: bounds
             }
