@@ -76,7 +76,13 @@ use compiler/weft/check/body/propagation.{
   CheckedPropagationGraph
 }
 use stdlib/list.{Cons, List, Nil}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/num/scalar.{num_scalar_usize_to_i64}
 use stdlib/option.{None, Option, Some}
+use stdlib/panic.{panic}
+use stdlib/set as set
+use stdlib/set.{Set}
 
 pub(package) type CheckedLinearIssue {
   -- A use of a linear value on a path where it may already have moved.
@@ -270,6 +276,24 @@ fn linear_branch(left: CheckedLinearFlow, right: CheckedLinearFlow) -> CheckedLi
   }
 }
 
+-- Declared layouts already decided. Whether a layout's fields and payloads
+-- hold a linear value does not depend on its type arguments, which every
+-- query checks itself, so one decision serves every application.
+pub(package) type CheckedLinearLayouts = opaque Map<i64, bool>
+
+pub(package) fn checked_linear_layouts() -> CheckedLinearLayouts {
+  CheckedLinearLayouts(map.new<i64, bool>())
+}
+
+-- One query's search: the decided layouts, and the layouts it has entered.
+-- An entered layout reached again contributes nothing, so a layout decided
+-- beneath it is final only once it holds a linear value. A query that finds
+-- nothing linear has entered only layouts that reach nothing linear.
+type CheckedLinearSearch {
+  decided: Map<i64, bool>,
+  entered: Set<i64>
+}
+
 -- Whether a type holds a linear value: an `owned` or `unique` value, an
 -- application with a linear argument, or a declared aggregate, tuple or
 -- record with a linear field or payload.
@@ -278,153 +302,166 @@ pub(package) fn checked_linear_type(
   declarations: borrow SemanticTypeDeclarationCatalog,
   value: SemanticTypeId
 ) -> bool {
-  checked_linear_type_within(types, declarations, value, Nil<SemanticDeclaredLayout>(), 0)
+  let (_, linear) = checked_linear_type_with(
+    checked_linear_layouts(),
+    types,
+    declarations,
+    value
+  )
+  linear
 }
 
-fn linear_layout_eq(left: SemanticDeclaredLayout, right: SemanticDeclaredLayout) -> bool {
-  match (left, right) {
-    (SemanticDeclaredRecordLayout(first), SemanticDeclaredRecordLayout(second)) ->
-      first == second
-    (SemanticDeclaredVariantLayout(first), SemanticDeclaredVariantLayout(second)) ->
-      first == second
-    _ -> false
-  }
-}
-
-fn linear_layout_visited(
-  visited: List<SemanticDeclaredLayout>,
-  wanted: SemanticDeclaredLayout
-) -> bool {
-  match visited {
-    Nil -> false
-    Cons(layout, rest) -> linear_layout_eq(layout, wanted) or linear_layout_visited(rest, wanted)
-  }
-}
-
-fn checked_linear_type_within(
+-- Whether a type holds a linear value, reusing and extending the layouts
+-- `layouts` already decided for the same catalogs.
+pub(package) fn checked_linear_type_with(
+  layouts: CheckedLinearLayouts,
   types: borrow SemanticTypeCatalog,
   declarations: borrow SemanticTypeDeclarationCatalog,
-  value: SemanticTypeId,
-  visited: List<SemanticDeclaredLayout>,
-  depth: usize
-) -> bool {
-  if depth > 32 { return false }
-  match types.graph_for(value) {
-    None -> false
-    Some(graph) -> match semantic_type_graph_node(graph, value) {
-      SemanticOwnedNode(_) -> true
-      SemanticUniqueNode(_) -> true
-      SemanticUnionNode(left, right) -> checked_linear_type_within(
-        types,
-        declarations,
-        left,
-        visited,
-        depth + 1
-      ) or checked_linear_type_within(types, declarations, right, visited, depth + 1)
-      SemanticRecordNode(fields, _, _) -> {
-        let records = semantic_type_graph_records_local(graph)
-        let count = semantic_type_record_field_count(records, fields)
-        let mut index: usize = 0
-        while index < count {
-          let field_type = semantic_type_graph_record_field_type_id(
-            graph,
-            semantic_type_record_field_edge(records, fields, index)
-          )
-          if checked_linear_type_within(types, declarations, field_type, visited, depth + 1) {
-            return true
-          }
-          index = index + 1
-        }
-        false
-      }
-      SemanticNamedNode(_, role, representation, arguments) -> {
-        let lists = semantic_type_graph_type_lists_local(graph)
-        let count = semantic_type_list_len(lists, arguments)
-        let mut index: usize = 0
-        while index < count {
-          let argument = semantic_type_graph_list_type_id(
-            graph,
-            semantic_type_list_edge(lists, arguments, index)
-          )
-          if checked_linear_type_within(types, declarations, argument, visited, depth + 1) {
-            return true
-          }
-          index = index + 1
-        }
-        match role {
-          SemanticOpaqueType -> checked_linear_type_within(
-            types,
-            declarations,
-            representation,
-            visited,
-            depth + 1
-          )
-          SemanticNominalType -> {
-            let empty = semantic_type_substitution_empty()
-            let layout = match semantic_type_declaration_catalog_resolve(
-              types,
-              declarations,
-              value,
-              empty
-            ) {
-              SemanticRecordDeclarationLayoutMatched(found, _) -> Some(
-                SemanticDeclaredRecordLayout(found)
-              )
-              SemanticVariantDeclarationLayoutMatched(found, _) -> Some(
-                SemanticDeclaredVariantLayout(found)
-              )
-              _ -> None<SemanticDeclaredLayout>()
-            }
-            match layout {
-              None -> false
-              Some(found) -> if linear_layout_visited(visited, found) { false } else {
-                linear_layout_holds(types, declarations, found, visited.prepend(found), depth)
-              }
-            }
-          }
-          _ -> false
-        }
-      }
-      _ -> false
+  value: SemanticTypeId
+) -> (CheckedLinearLayouts, bool) {
+  let known = match layouts { CheckedLinearLayouts(decided) -> decided }
+  let search = CheckedLinearSearch { decided: known, entered: set.new<i64>() }
+  let (after, linear) = linear_type_search(search, types, declarations, value)
+  let { decided, entered } = after
+  if linear { (CheckedLinearLayouts(decided), true) }
+  else {
+    let mut settled = decided
+    for key in entered { settled = settled.insert(key, false) }
+    (CheckedLinearLayouts(settled), false)
+  }
+}
+
+fn linear_layout_key(layout: SemanticDeclaredLayout) -> i64 {
+  let (index, kind) = match layout {
+    SemanticDeclaredRecordLayout(found) -> (found, 0)
+    SemanticDeclaredVariantLayout(found) -> (found, 1)
+  }
+  match num_scalar_usize_to_i64(index) {
+    Some(value) -> value * 2 + kind
+    None -> panic("Declaration layout index is not representable")
+  }
+}
+
+fn linear_type_search(
+  search: CheckedLinearSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  value: SemanticTypeId
+) -> (CheckedLinearSearch, bool) {
+  let graph = match types.graph_for(value) {
+    Some(found) -> found
+    None -> return (search, false)
+  }
+  match semantic_type_graph_node(graph, value) {
+    SemanticOwnedNode(_) -> (search, true)
+    SemanticUniqueNode(_) -> (search, true)
+    SemanticUnionNode(left, right) -> {
+      let (state, linear) = linear_type_search(search, types, declarations, left)
+      if linear { (state, true) } else { linear_type_search(state, types, declarations, right) }
     }
+    SemanticRecordNode(fields, _, _) -> {
+      let records = semantic_type_graph_records_local(graph)
+      let count = semantic_type_record_field_count(records, fields)
+      let mut state = search
+      let mut index: usize = 0
+      while index < count {
+        let field_type = semantic_type_graph_record_field_type_id(
+          graph,
+          semantic_type_record_field_edge(records, fields, index)
+        )
+        let (next, linear) = linear_type_search(state, types, declarations, field_type)
+        if linear { return (next, true) }
+        state = next
+        index = index + 1
+      }
+      (state, false)
+    }
+    SemanticNamedNode(_, role, representation, arguments) -> {
+      let lists = semantic_type_graph_type_lists_local(graph)
+      let count = semantic_type_list_len(lists, arguments)
+      let mut state = search
+      let mut index: usize = 0
+      while index < count {
+        let argument = semantic_type_graph_list_type_id(
+          graph,
+          semantic_type_list_edge(lists, arguments, index)
+        )
+        let (next, linear) = linear_type_search(state, types, declarations, argument)
+        if linear { return (next, true) }
+        state = next
+        index = index + 1
+      }
+      match role {
+        SemanticOpaqueType -> linear_type_search(state, types, declarations, representation)
+        SemanticNominalType -> linear_named_search(state, types, declarations, value)
+        _ -> (state, false)
+      }
+    }
+    _ -> (search, false)
   }
 }
 
-fn linear_layout_holds(
+-- A nominal application's own layout, decided once.
+fn linear_named_search(
+  search: CheckedLinearSearch,
   types: borrow SemanticTypeCatalog,
   declarations: borrow SemanticTypeDeclarationCatalog,
-  layout: SemanticDeclaredLayout,
-  visited: List<SemanticDeclaredLayout>,
-  depth: usize
-) -> bool {
+  value: SemanticTypeId
+) -> (CheckedLinearSearch, bool) {
+  let empty = semantic_type_substitution_empty()
+  let layout = match semantic_type_declaration_catalog_resolve(types, declarations, value, empty) {
+    SemanticRecordDeclarationLayoutMatched(found, _) -> SemanticDeclaredRecordLayout(found)
+    SemanticVariantDeclarationLayoutMatched(found, _) -> SemanticDeclaredVariantLayout(found)
+    _ -> return (search, false)
+  }
+  let key = linear_layout_key(layout)
+  match search.decided.get(key) {
+    Some(linear) -> return (search, linear)
+    None -> nil
+  }
+  if search.entered.contains(key) { return (search, false) }
+  let { decided, entered } = search
+  let marked = CheckedLinearSearch { decided: decided, entered: entered.insert(key) }
+  match linear_layout_search(marked, types, declarations, layout) {
+    (state, true) -> {
+      let { decided, entered } = state
+      (CheckedLinearSearch { decided: decided.insert(key, true), entered: entered }, true)
+    }
+    (state, false) -> (state, false)
+  }
+}
+
+-- Whether any field or payload of a declared layout holds a linear value.
+fn linear_layout_search(
+  search: CheckedLinearSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  layout: SemanticDeclaredLayout
+) -> (CheckedLinearSearch, bool) {
+  let mut state = search
   match layout {
     SemanticDeclaredRecordLayout(index) -> {
       let count = match semantic_type_declared_record_field_count(declarations, index) {
         Some(found) -> found
-        None -> return false
+        None -> return (state, false)
       }
       let mut field: usize = 0
       while field < count {
         match semantic_type_declared_record_field_type(declarations, index, field) {
-          Some(field_type) -> if checked_linear_type_within(
-            types,
-            declarations,
-            field_type,
-            visited,
-            depth + 1
-          ) {
-            return true
+          Some(field_type) -> {
+            let (next, linear) = linear_type_search(state, types, declarations, field_type)
+            if linear { return (next, true) }
+            state = next
           }
           None -> nil
         }
         field = field + 1
       }
-      false
     }
     SemanticDeclaredVariantLayout(index) -> {
       let cases = match semantic_type_declared_variant_case_count(declarations, index) {
         Some(found) -> found
-        None -> return false
+        None -> return (state, false)
       }
       let mut case: usize = 0
       while case < cases {
@@ -434,19 +471,15 @@ fn linear_layout_holds(
           case
         ) {
           Some(found) -> found
-          None -> return false
+          None -> return (state, false)
         }
         let mut payload: usize = 0
         while payload < payloads {
           match semantic_type_declared_variant_payload_type(declarations, index, case, payload) {
-            Some(payload_type) -> if checked_linear_type_within(
-              types,
-              declarations,
-              payload_type,
-              visited,
-              depth + 1
-            ) {
-              return true
+            Some(payload_type) -> {
+              let (next, linear) = linear_type_search(state, types, declarations, payload_type)
+              if linear { return (next, true) }
+              state = next
             }
             None -> nil
           }
@@ -454,9 +487,9 @@ fn linear_layout_holds(
         }
         case = case + 1
       }
-      false
     }
   }
+  (state, false)
 }
 
 -- A reference to a binding: moving unless `reading`, and refused when the
@@ -1696,12 +1729,19 @@ pub(package) fn checked_linearity_issue(
 ) -> CheckedLinearIssue? {
   let types = expressions.types()
   let mut linear = Nil<usize>()
+  -- One set of layout decisions serves every binding.
+  let mut layouts = checked_linear_layouts()
   let mut binding_index: usize = 0
   while binding_index < expressions.binding_len() {
     let binding = checked_binding_id_from_ordinal(expressions.segment(), binding_index)
-    if checked_linear_type(types, declarations, expressions.binding(binding).value_type) {
-      linear = linear.prepend(binding_index)
-    }
+    let (next, holds) = checked_linear_type_with(
+      layouts,
+      types,
+      declarations,
+      expressions.binding(binding).value_type
+    )
+    layouts = next
+    if holds { linear = linear.prepend(binding_index) }
     binding_index = binding_index + 1
   }
   match linear {
