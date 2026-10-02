@@ -15,6 +15,11 @@ and classifies each root:
   excluded_parse       legacy rejects during parsing; not a checker comparison
   harness_failure      the worker produced no record (timeout, crash, RSS)
 
+With --survey the census is replaced by a survey of the typed checker alone:
+every function it refuses in every module of every runtime root, where the
+comparison stops at the first. A function shared by many roots is counted
+once.
+
 Roots are checked as untrusted strict user code, as `weft check` treats any
 root outside the trusted compiler/runtime tree; trusted roots are out of scope.
 This is test scaffolding for the no-bridge cutover. It never makes the typed
@@ -104,6 +109,56 @@ def run_root(tool, root, timeout):
     return None, f"no record (exit {completed.returncode})"
 
 
+SURVEY = re.compile(
+    r"^typed-survey stage=(?P<stage>\S+) module=(?P<module>\S+) "
+    r"function=(?P<function>\S+) category=(?P<category>\S+) typed_at=(?P<typed_at>\S+)"
+)
+
+
+def survey_root(tool, root, timeout):
+    try:
+        completed = subprocess.run(
+            [tool, "--survey", root], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            timeout=timeout, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "worker timed out"
+    text = completed.stderr.decode("utf-8", "replace")
+    if "typed-survey-total " not in text:
+        found = FAILURE.search(text)
+        return None, found.group(0) if found else f"no survey (exit {completed.returncode})"
+    return [m.groupdict() for m in map(SURVEY.match, text.splitlines()) if m], None
+
+
+def survey(tool, jobs, roots, timeout, out, detail):
+    rejections, failures = {}, {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+        futures = {pool.submit(survey_root, tool, root, timeout): root for root in roots}
+        for future in concurrent.futures.as_completed(futures):
+            found, failure = future.result()
+            if found is None:
+                failures[futures[future]] = failure
+                continue
+            for row in found:
+                key = (row["stage"], row["module"], row["function"], row["category"],
+                       row["typed_at"])
+                rejections.setdefault(key, set()).add(futures[future])
+    if out:
+        with open(out, "w", encoding="utf-8") as handle:
+            handle.write("stage\tmodule\tfunction\tcategory\ttyped_at\troots\n")
+            for key, found in sorted(rejections.items()):
+                handle.write("\t".join(key) + f"\t{len(found)}\n")
+    print(f"== survey: {len(roots)} roots, {len(rejections)} refused functions, "
+          f"{len(failures)} roots without a survey")
+    for title, index in (("category", 3), ("module", 1)):
+        print(f"  by {title}:")
+        counts = collections.Counter(key[index] for key in rejections)
+        for name, count in counts.most_common(detail):
+            print(f"    {count:5}  {name}")
+    for root, failure in sorted(failures.items()):
+        print(f"  no survey: {root}: {failure}")
+
+
 def run(tool, jobs, roots, timeout):
     records, failures = {}, {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -164,11 +219,17 @@ def main():
     parser.add_argument("--set", action="append", choices=sorted(ROOT_SETS), dest="sets")
     parser.add_argument("--out", help="write per-root TSV records to this file")
     parser.add_argument("--detail", type=int, default=25, help="rows per breakdown table")
+    parser.add_argument("--survey", action="store_true",
+                        help="list every function the typed checker refuses in runtime roots")
     options = parser.parse_args()
     sets = options.sets or ["negatives", "runtime", "examples"]
 
     tool = f"/tmp/weft-typed-differential-{os.getpid()}"
     build_tool(options.builder, tool)
+    if options.survey:
+        survey(tool, options.jobs, runtime_roots(), options.timeout, options.out,
+               options.detail)
+        return
     rows = []
     for name in sets:
         roots = ROOT_SETS[name]()
