@@ -3086,14 +3086,21 @@ assert_equals "array_census_backing_allocations" "${rc_array_fields[44]}" "2"
 
 # A frozen checked-expression store is columnar: typed scalar ids and facts
 # live in separate immutable segments instead of boxed universal nodes. The
-# fixture performs 10,000 branch inspections, each observing the segments
-# through four borrowed calls, so more than 40,000 in all. Publishing the
-# segments and their final cleanup may use a bounded number of managed
-# operations, but inspection must not scale them with the borrowed-call count.
+# fixture performs 10,000 branch inspections, each reading four segments, and
+# exits zero only when every inspection summed the expected indices. That
+# result, not the census's borrowed-lane count, evidences the work: the lane
+# count covers managed values passed under an inferred borrow, and the segment
+# readers hand their columns to explicitly borrowing leaves, which carry none.
+# Publishing the segments and their final cleanup may use a bounded number of
+# managed operations, but inspection must not scale them with its reads.
 run_weft_compile_guarded "$WEFT" compile --rc-census \
   test/fixtures/typed_checker_columnar_census.weft > "$tmp_out" 2> "$tmp_err"
 chmod +x "$tmp_out"
+set +e
 run_binary_guarded "$tmp_out" > /dev/null 2> "$tmp_err"
+checker_storage_exit=$?
+set -e
+assert_equals "typed_checker_storage_inspection_completes" "$checker_storage_exit" "0"
 read -r -a checker_storage_fields <<< "$(grep '^WEFT_RC_CENSUS ' "$tmp_err")"
 assert_equals \
   "typed_checker_storage_census_schema_version" \
@@ -3102,7 +3109,6 @@ assert_equals \
 if [ "${checker_storage_fields[2]}" -le 64 ] && \
   [ "${checker_storage_fields[3]}" -le 64 ] && \
   [ "${checker_storage_fields[4]}" -le 128 ] && \
-  [ "${checker_storage_fields[17]}" -gt 40000 ] && \
   [ "${checker_storage_fields[21]}" -le 32 ] && \
   [ "${checker_storage_fields[22]}" -le 128 ]; then
   echo "  ok typed_checker_storage_inspection_keeps_managed_transport_bounded"
@@ -3122,12 +3128,18 @@ fi
 # same local root. Traversal allocation remains a construction constant, while
 # equality and hashing together stay below nineteen managed retains and
 # releases per iteration; complete ids are not carried through local recursive
-# edges. The borrowed-call count must scale with the work: more than a hundred
-# borrowed lanes per iteration.
+# edges. The fixture exits zero only when every iteration's inspections,
+# comparisons and hashes produced the expected total, which evidences the
+# work; as above, the borrowed-lane count does not, since explicitly borrowed
+# graph reads carry no managed lane.
 run_weft_compile_guarded "$WEFT" compile --rc-census \
   test/fixtures/semantic_type_graph_census.weft > "$tmp_out" 2> "$tmp_err"
 chmod +x "$tmp_out"
+set +e
 run_binary_guarded "$tmp_out" > /dev/null 2> "$tmp_err"
+semantic_graph_exit=$?
+set -e
+assert_equals "semantic_type_graph_census_completes" "$semantic_graph_exit" "0"
 read -r -a semantic_graph_fields <<< "$(grep '^WEFT_RC_CENSUS ' "$tmp_err")"
 assert_equals \
   "semantic_type_graph_census_schema_version" \
@@ -3136,7 +3148,6 @@ assert_equals \
 if [ "${semantic_graph_fields[2]}" -le 640 ] && \
   [ "${semantic_graph_fields[3]}" -le 185000 ] && \
   [ "${semantic_graph_fields[4]}" -le 185500 ] && \
-  [ "${semantic_graph_fields[17]}" -gt 1000000 ] && \
   [ "${semantic_graph_fields[21]}" -le 185000 ] && \
   [ "${semantic_graph_fields[22]}" -le 185500 ]; then
   echo "  ok semantic_type_graph_equality_and_hashing_keep_local_transport_within_budget"
