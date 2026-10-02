@@ -408,6 +408,7 @@ use compiler/types/graph/subtyping.{semantic_type_is_subtype}
 use compiler/types/graph/effects.{semantic_function_is_pure}
 use compiler/types/graph/substitution.{
   SemanticTypeSubstitution,
+  semantic_type_awaits_associated,
   semantic_type_substitution_bind,
   semantic_type_substitution_bind_resolved_associated,
   semantic_type_substitution_empty,
@@ -1334,6 +1335,9 @@ type CheckedInferredGenericContext {
   loop_context: CheckedLoopContext,
   environment: CheckedLexicalEnvironment,
   signature: SemanticTypeId,
+  -- The declaration whose bounds choose the associated types of the type
+  -- arguments being inferred; a constructor has none.
+  bounded: Option<SemanticFunctionSignature>,
   -- The parameter the first authored argument fills: 1 for a method, whose
   -- receiver is checked before inference.
   first: usize,
@@ -1348,6 +1352,16 @@ type CheckedInferredGenericMatch {
 type CheckedInferredGenericValidation {
   CheckedInferredGenericValid,
   CheckedInferredGenericInvalid(CheckedBodyProducerIssue)
+}
+
+type CheckedGenericBoundBuild {
+  CheckedGenericBoundHeld(SemanticTypeProductBuilder, SemanticTypeSubstitution),
+  CheckedGenericBoundFailed(
+    SemanticTypeProductBuilder,
+    SemanticTypeSubstitution,
+    SemanticTypeId,
+    SemanticTypeId
+  )
 }
 
 type CheckedGenericBoundsBuild {
@@ -16966,6 +16980,7 @@ fn checked_body_generic_method_call(
           loop_context: loop_context,
           environment: environment,
           signature: target.signature,
+          bounded: Some(own.declared),
           first: 1,
           total: __i64_to_usize(expr_list_len(arguments))
         },
@@ -17939,6 +17954,11 @@ fn checked_body_match_instantiated_argument(
   let state = state.with_types(specialized_catalog)
   if semantic_type_is_subtype(specialized_catalog, actual, expected) {
     CheckedInferredGenericMatched(state, substitution)
+  } else if semantic_type_awaits_associated(specialized_catalog, expected) {
+    -- Only a bound's conformance chooses an associated type, and bounds are
+    -- decided once every argument has been read. The call then validates
+    -- each argument against the signature those bounds instantiate.
+    CheckedInferredGenericMatched(state, substitution)
   } else {
     CheckedInferredGenericMatchRejected(state, CheckedBodyProducerTypeMismatch(actual, expected))
   }
@@ -18123,6 +18143,12 @@ fn checked_body_seed_generic_arguments(
             let actual = state.result_type(checked_argument)
             let argument_range = state.range(checked_argument)
             let parameter = semantic_function_parameter(catalog, context.signature, index)
+            let (state, substitution) = checked_body_settle_associated(
+              state,
+              context,
+              parameter,
+              substitution
+            )
             match checked_body_match_generic_argument(
               state,
               context.types,
@@ -18251,6 +18277,13 @@ fn checked_body_complete_generic_arguments(
         Lambda(lambda_parameters, lambda_body, lambda_site) -> {
           let catalog = state.types()
           let parameter = semantic_function_parameter(catalog, context.signature, index)
+          let (state, substitution) = checked_body_settle_associated(
+            state,
+            context,
+            parameter,
+            substitution
+          )
+          let catalog = state.types()
           -- The lambda is checked against the whole parameter, so a Sendable
           -- refinement reaches it; inference reads the function it implements,
           -- which carries every type variable.
@@ -18678,6 +18711,70 @@ fn checked_body_local_bound_from(
   }
 }
 
+-- One bound of a call whose type argument is `concrete`: whether it holds,
+-- and the associated types the conformance behind it chooses.
+fn checked_body_generic_bound(
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  bound: SemanticSignatureBound,
+  concrete: SemanticTypeId,
+  substitution: SemanticTypeSubstitution,
+  product: SemanticTypeProductBuilder
+) -[SemanticConformance]> CheckedGenericBoundBuild {
+  let (product, trait_atom) = semantic_type_product_substitute(
+    product,
+    substitution,
+    bound.trait_atom
+  )
+  let catalog = semantic_type_product_catalog(product)
+  let resolution = types.resolution
+  let conformances = resolution.conformances()
+  let local_bound = match catalog.graph_for(concrete) {
+    Some(graph) -> match semantic_type_graph_node(graph, concrete) {
+      SemanticVariableNode(variable) -> checked_body_local_bound_from(
+        types,
+        catalog,
+        owner,
+        variable,
+        trait_atom,
+        0
+      )
+      _ -> None<SemanticTypeId>()
+    }
+    None -> None<SemanticTypeId>()
+  }
+  match local_bound {
+    Some(offered) -> {
+      let witness_substitution = semantic_type_substitution_empty()
+      let (product, substitution) = checked_body_bind_associated_witness(
+        product,
+        substitution,
+        bound.variable,
+        offered,
+        witness_substitution,
+        0
+      )
+      CheckedGenericBoundHeld(product, substitution)
+    }
+    None -> if checked_body_bound_holds(types, catalog, owner, concrete, trait_atom) {
+      match semantic_conformance_catalog_witness(catalog, conformances, concrete, trait_atom) {
+        SemanticConformanceWitnessMissing -> CheckedGenericBoundHeld(product, substitution)
+        SemanticConformanceWitnessSelected(offered, witness_substitution) -> {
+          let (product, substitution) = checked_body_bind_associated_witness(
+            product,
+            substitution,
+            bound.variable,
+            offered,
+            witness_substitution,
+            0
+          )
+          CheckedGenericBoundHeld(product, substitution)
+        }
+      }
+    } else { CheckedGenericBoundFailed(product, substitution, concrete, trait_atom) }
+  }
+}
+
 fn checked_body_generic_bounds(
   state: borrow CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
@@ -18692,92 +18789,103 @@ fn checked_body_generic_bounds(
   } else {
     let bound = state.bound_at(signature, index)
     match semantic_type_substitution_get(substitution, bound.variable) {
-      Some(concrete) -> {
-        let (product, trait_atom) = semantic_type_product_substitute(
-          product,
+      Some(concrete) -> match checked_body_generic_bound(
+        types,
+        owner,
+        bound,
+        concrete,
+        substitution,
+        product
+      ) {
+        CheckedGenericBoundHeld(product, substitution) -> checked_body_generic_bounds(
+          state,
+          types,
+          owner,
+          signature,
           substitution,
-          bound.trait_atom
+          index + 1,
+          product
         )
-        let catalog = semantic_type_product_catalog(product)
-        let resolution = types.resolution
-        let conformances = resolution.conformances()
-        let local_bound = match catalog.graph_for(concrete) {
-          Some(graph) -> match semantic_type_graph_node(graph, concrete) {
-            SemanticVariableNode(variable) -> checked_body_local_bound_from(
-              types,
-              catalog,
-              owner,
-              variable,
-              trait_atom,
-              0
-            )
-            _ -> None<SemanticTypeId>()
-          }
-          None -> None<SemanticTypeId>()
-        }
-        match local_bound {
-          Some(offered) -> {
-            let witness_substitution = semantic_type_substitution_empty()
-            let (product, substitution) = checked_body_bind_associated_witness(
-              product,
-              substitution,
-              bound.variable,
-              offered,
-              witness_substitution,
-              0
-            )
-            checked_body_generic_bounds(
-              state,
-              types,
-              owner,
-              signature,
-              substitution,
-              index + 1,
-              product
-            )
-          }
-          None -> if checked_body_bound_holds(types, catalog, owner, concrete, trait_atom) {
-            match semantic_conformance_catalog_witness(
-              catalog,
-              conformances,
-              concrete,
-              trait_atom
-            ) {
-              SemanticConformanceWitnessMissing -> checked_body_generic_bounds(
-                state,
-                types,
-                owner,
-                signature,
-                substitution,
-                index + 1,
-                product
-              )
-              SemanticConformanceWitnessSelected(offered, witness_substitution) -> {
-                let (product, substitution) = checked_body_bind_associated_witness(
-                  product,
-                  substitution,
-                  bound.variable,
-                  offered,
-                  witness_substitution,
-                  0
-                )
-                checked_body_generic_bounds(
-                  state,
-                  types,
-                  owner,
-                  signature,
-                  substitution,
-                  index + 1,
-                  product
-                )
-              }
-            }
-          } else {
-            CheckedGenericBoundsRejected(product, concrete, trait_atom)
-          }
-        }
+        CheckedGenericBoundFailed(product, _, concrete, trait_atom) ->
+          CheckedGenericBoundsRejected(product, concrete, trait_atom)
       }
       None -> panic("Generic bound has no resolved type argument")
+    }
+  }
+}
+
+-- The bounds whose type argument inference has decided so far, so that a
+-- parameter read next sees the associated types they choose. A bound that
+-- does not hold chooses nothing here; the call rejects it once every argument
+-- has been read. Deciding a bound again repeats the same choice.
+fn checked_body_decided_bounds(
+  state: borrow CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  signature: SemanticFunctionSignature,
+  substitution: SemanticTypeSubstitution,
+  index: usize,
+  product: SemanticTypeProductBuilder
+) -[SemanticConformance]> (SemanticTypeProductBuilder, SemanticTypeSubstitution) {
+  if index >= state.bound_count(signature) { (product, substitution) }
+  else {
+    let bound = state.bound_at(signature, index)
+    let (product, substitution) = match semantic_type_substitution_get(
+      substitution,
+      bound.variable
+    ) {
+      None -> (product, substitution)
+      Some(concrete) -> match checked_body_generic_bound(
+        types,
+        owner,
+        bound,
+        concrete,
+        substitution,
+        product
+      ) {
+        CheckedGenericBoundHeld(product, substitution) -> (product, substitution)
+        CheckedGenericBoundFailed(product, substitution, _, _) -> (product, substitution)
+      }
+    }
+    checked_body_decided_bounds(state, types, owner, signature, substitution, index + 1, product)
+  }
+}
+
+-- A parameter that names an associated type is read with the types the
+-- callee's bounds have chosen for the type arguments decided before it.
+fn checked_body_settle_associated(
+  state: owned CheckedBodyBuild,
+  context: CheckedInferredGenericContext,
+  parameter: SemanticTypeId,
+  substitution: SemanticTypeSubstitution
+) -[SemanticConformance]> (owned CheckedBodyBuild, SemanticTypeSubstitution) {
+  match context.bounded {
+    None -> (state, substitution)
+    Some(callee) -> {
+      let catalog = state.types()
+      if state.bound_count(callee) == 0 or
+        not semantic_type_awaits_associated(catalog, parameter) { (state, substitution) }
+      else {
+        let resolution = context.types.resolution
+        let product = semantic_type_product_continue(
+          context.types.module.identity,
+          catalog,
+          catalog.next_derived_segment(
+            context.types.module.identity,
+            resolution.next_type_segment()
+          )
+        )
+        let (product, substitution) = checked_body_decided_bounds(
+          state,
+          checked_body_types_with_catalog(context.types, catalog),
+          context.owner,
+          callee,
+          substitution,
+          0,
+          product
+        )
+        (state.with_types(semantic_type_product_catalog(product)), substitution)
+      }
     }
   }
 }
@@ -18807,6 +18915,7 @@ fn checked_body_inferred_generic_call(
       loop_context: loop_context,
       environment: environment,
       signature: signature.type_id,
+      bounded: Some(signature),
       first: 0,
       total: total
     },
@@ -20082,6 +20191,7 @@ fn checked_body_constructor_solved_call(
             loop_context: loop_context,
             environment: environment,
             signature: signature,
+            bounded: None<SemanticFunctionSignature>(),
             first: 0,
             total: provided
           },
