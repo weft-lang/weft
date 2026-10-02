@@ -1,0 +1,334 @@
+-- Shareable types: what a part read through a borrow may become.
+--
+-- A part of a borrowed value may be used as the value exactly when its type
+-- is shareable: ordinary immutable managed data all the way down. Sharing it
+-- takes one more managed stake and changes nothing its owner can observe. A
+-- type is not shareable when a value of it could hold an `owned` or `unique`
+-- value, a mutable container, a runtime token, a slice or a borrow, or when
+-- its shape is not known: a type variable, an unexpanded associated type, a
+-- complement, the top type, or a function value, whose type does not show
+-- what its environment captured. Those parts stay views.
+--
+-- A declared layout's own fields and payloads do not depend on its type
+-- arguments, which every query checks itself, so one decision per layout
+-- serves every application. Recursive declarations are shareable unless a
+-- field outside the recursion is not, so a layout met again while it is
+-- being decided contributes nothing.
+
+use compiler/types/graph.{
+  SemanticArrayNode,
+  SemanticAtomicNode,
+  SemanticBottomNode,
+  SemanticIntersectionNode,
+  SemanticNamedNode,
+  SemanticNominalType,
+  SemanticOpaqueType,
+  SemanticPayloadlessVariantType,
+  SemanticPointerNode,
+  SemanticPrimitiveNode,
+  SemanticRcNode,
+  SemanticRecordNode,
+  SemanticTypeGraph,
+  SemanticTypeId,
+  SemanticTypeListId,
+  SemanticUnionNode,
+  SemanticVariableNode,
+  SemanticVariantNode,
+  SemanticWeakNode,
+  semantic_type_graph_list_type_id,
+  semantic_type_graph_node,
+  semantic_type_graph_record_field_type_id,
+  semantic_type_graph_records_local,
+  semantic_type_graph_type_lists_local,
+  semantic_type_list_edge,
+  semantic_type_list_len,
+  semantic_type_record_field_count,
+  semantic_type_record_field_edge
+}
+use compiler/types/graph/catalog.{SemanticTypeCatalog}
+use compiler/types/graph/declarations.{
+  SemanticDeclaredLayout,
+  SemanticDeclaredRecordLayout,
+  SemanticDeclaredVariantLayout,
+  SemanticRecordDeclarationLayoutMatched,
+  SemanticTypeDeclarationCatalog,
+  SemanticVariantDeclarationLayoutMatched,
+  semantic_type_declaration_catalog_resolve,
+  semantic_type_declared_record_field_count,
+  semantic_type_declared_record_field_type,
+  semantic_type_declared_variant_case_count,
+  semantic_type_declared_variant_payload_count,
+  semantic_type_declared_variant_payload_type
+}
+use compiler/types/graph/sendable.{
+  SemanticSealedMutableContainer,
+  SemanticSealedPersistentCollection,
+  SemanticSealedRuntimeToken,
+  SemanticSendableIdentities,
+  semantic_sealed_kind
+}
+use compiler/types/graph/substitution.{semantic_type_substitution_empty}
+use stdlib/map as map
+use stdlib/map.{Map}
+use stdlib/num/scalar.{num_scalar_usize_to_i64}
+use stdlib/option.{None, Some}
+use stdlib/panic.{panic}
+use stdlib/set as set
+use stdlib/set.{Set}
+
+-- One query's search: the layouts already decided, and the layouts entered.
+-- `decided` maps a layout to whether it is shareable. An entered layout met
+-- again contributes nothing, so a layout judged beneath it is final only
+-- when it is not shareable; a query that finds everything shareable has
+-- entered only shareable layouts.
+type CheckedShareSearch {
+  decided: Map<i64, bool>,
+  entered: Set<i64>
+}
+
+--- Whether a value of this type may be shared out of a borrow: ordinary
+--- immutable managed data all the way down.
+pub(package) fn checked_shareable_type(
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  sealed: borrow SemanticSendableIdentities,
+  value: SemanticTypeId
+) -> bool {
+  let search = CheckedShareSearch { decided: map.new<i64, bool>(), entered: set.new<i64>() }
+  let (_, shareable) = share_type(search, types, declarations, sealed, value)
+  shareable
+}
+
+fn share_layout_key(layout: SemanticDeclaredLayout) -> i64 {
+  let (index, kind) = match layout {
+    SemanticDeclaredRecordLayout(found) -> (found, 0)
+    SemanticDeclaredVariantLayout(found) -> (found, 1)
+  }
+  match num_scalar_usize_to_i64(index) {
+    Some(value) -> value * 2 + kind
+    None -> panic("Declaration layout index is not representable")
+  }
+}
+
+fn share_pair(
+  search: CheckedShareSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  sealed: borrow SemanticSendableIdentities,
+  left: SemanticTypeId,
+  right: SemanticTypeId
+) -> (CheckedShareSearch, bool) {
+  match share_type(search, types, declarations, sealed, left) {
+    (state, true) -> share_type(state, types, declarations, sealed, right)
+    (state, false) -> (state, false)
+  }
+}
+
+-- Whether every type argument of an application is shareable.
+fn share_arguments(
+  search: CheckedShareSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  sealed: borrow SemanticSendableIdentities,
+  graph: borrow SemanticTypeGraph,
+  arguments: SemanticTypeListId
+) -> (CheckedShareSearch, bool) {
+  let lists = semantic_type_graph_type_lists_local(graph)
+  let count = semantic_type_list_len(lists, arguments)
+  let mut state = search
+  let mut index: usize = 0
+  while index < count {
+    let argument = semantic_type_graph_list_type_id(
+      graph,
+      semantic_type_list_edge(lists, arguments, index)
+    )
+    let (next, shareable) = share_type(state, types, declarations, sealed, argument)
+    if not shareable { return (next, false) }
+    state = next
+    index = index + 1
+  }
+  (state, true)
+}
+
+fn share_type(
+  search: CheckedShareSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  sealed: borrow SemanticSendableIdentities,
+  value: SemanticTypeId
+) -> (CheckedShareSearch, bool) {
+  let graph = match types.graph_for(value) {
+    Some(found) -> found
+    None -> return (search, false)
+  }
+  match semantic_type_graph_node(graph, value) {
+    -- Scalars, addresses and the empty type hold nothing to protect.
+    SemanticBottomNode -> (search, true)
+    SemanticPrimitiveNode(_) -> (search, true)
+    SemanticPointerNode(_, _) -> (search, true)
+    -- A value of a union is a value of one side; a value of an intersection
+    -- is a value of both, so either side's guarantee holds.
+    SemanticUnionNode(left, right) -> share_pair(search, types, declarations, sealed, left, right)
+    SemanticIntersectionNode(left, right) -> match share_type(
+      search,
+      types,
+      declarations,
+      sealed,
+      left
+    ) {
+      (state, true) -> (state, true)
+      (state, false) -> share_type(state, types, declarations, sealed, right)
+    }
+    -- A weak reference owns nothing; the managed classes carry their inner.
+    SemanticWeakNode(_) -> (search, true)
+    SemanticRcNode(inner) -> share_type(search, types, declarations, sealed, inner)
+    SemanticAtomicNode(inner) -> share_type(search, types, declarations, sealed, inner)
+    SemanticArrayNode(inner, _) -> share_type(search, types, declarations, sealed, inner)
+    SemanticRecordNode(fields, _, _) -> {
+      let records = semantic_type_graph_records_local(graph)
+      let count = semantic_type_record_field_count(records, fields)
+      let mut state = search
+      let mut index: usize = 0
+      while index < count {
+        let field_type = semantic_type_graph_record_field_type_id(
+          graph,
+          semantic_type_record_field_edge(records, fields, index)
+        )
+        let (next, shareable) = share_type(state, types, declarations, sealed, field_type)
+        if not shareable { return (next, false) }
+        state = next
+        index = index + 1
+      }
+      (state, true)
+    }
+    SemanticVariantNode(_, parent) -> share_type(search, types, declarations, sealed, parent)
+    SemanticNamedNode(declaration, role, representation, arguments) -> {
+      match semantic_sealed_kind(sealed, declaration) {
+        Some(SemanticSealedMutableContainer) -> return (search, false)
+        Some(SemanticSealedRuntimeToken) -> return (search, false)
+        -- An immutable persistent collection is as shareable as what it holds.
+        Some(SemanticSealedPersistentCollection) -> return share_arguments(
+          search,
+          types,
+          declarations,
+          sealed,
+          graph,
+          arguments
+        )
+        None -> nil
+      }
+      match share_arguments(search, types, declarations, sealed, graph, arguments) {
+        (state, false) -> (state, false)
+        (state, true) -> match role {
+          SemanticPayloadlessVariantType -> (state, true)
+          SemanticOpaqueType -> share_type(state, types, declarations, sealed, representation)
+          SemanticNominalType -> share_named(state, types, declarations, sealed, value)
+        }
+      }
+    }
+    -- `owned`, `unique`, borrows, slices, continuations, type variables,
+    -- associated types, complements and the top type are never shared. Nor
+    -- is a function value: its type does not show what its environment holds.
+    _ -> (search, false)
+  }
+}
+
+-- A nominal application's own layout, decided once per query.
+fn share_named(
+  search: CheckedShareSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  sealed: borrow SemanticSendableIdentities,
+  value: SemanticTypeId
+) -> (CheckedShareSearch, bool) {
+  let empty = semantic_type_substitution_empty()
+  let layout = match semantic_type_declaration_catalog_resolve(types, declarations, value, empty) {
+    SemanticRecordDeclarationLayoutMatched(found, _) -> SemanticDeclaredRecordLayout(found)
+    SemanticVariantDeclarationLayoutMatched(found, _) -> SemanticDeclaredVariantLayout(found)
+    -- A declaration with no layout has a shape this check cannot see.
+    _ -> return (search, false)
+  }
+  let key = share_layout_key(layout)
+  match search.decided.get(key) {
+    Some(shareable) -> return (search, shareable)
+    None -> nil
+  }
+  if search.entered.contains(key) { return (search, true) }
+  let { decided, entered } = search
+  let marked = CheckedShareSearch { decided: decided, entered: entered.insert(key) }
+  match share_layout(marked, types, declarations, sealed, layout) {
+    (state, false) -> {
+      let { decided, entered } = state
+      (CheckedShareSearch { decided: decided.insert(key, false), entered: entered }, false)
+    }
+    (state, true) -> (state, true)
+  }
+}
+
+-- Whether every field or payload of a declared layout is shareable.
+fn share_layout(
+  search: CheckedShareSearch,
+  types: borrow SemanticTypeCatalog,
+  declarations: borrow SemanticTypeDeclarationCatalog,
+  sealed: borrow SemanticSendableIdentities,
+  layout: SemanticDeclaredLayout
+) -> (CheckedShareSearch, bool) {
+  let mut state = search
+  match layout {
+    SemanticDeclaredRecordLayout(index) -> {
+      let count = match semantic_type_declared_record_field_count(declarations, index) {
+        Some(found) -> found
+        None -> return (state, false)
+      }
+      let mut field: usize = 0
+      while field < count {
+        match semantic_type_declared_record_field_type(declarations, index, field) {
+          Some(field_type) -> {
+            let (next, shareable) = share_type(state, types, declarations, sealed, field_type)
+            if not shareable { return (next, false) }
+            state = next
+          }
+          None -> return (state, false)
+        }
+        field = field + 1
+      }
+    }
+    SemanticDeclaredVariantLayout(index) -> {
+      let cases = match semantic_type_declared_variant_case_count(declarations, index) {
+        Some(found) -> found
+        None -> return (state, false)
+      }
+      let mut case: usize = 0
+      while case < cases {
+        let payloads = match semantic_type_declared_variant_payload_count(
+          declarations,
+          index,
+          case
+        ) {
+          Some(found) -> found
+          None -> return (state, false)
+        }
+        let mut payload: usize = 0
+        while payload < payloads {
+          match semantic_type_declared_variant_payload_type(declarations, index, case, payload) {
+            Some(payload_type) -> {
+              let (next, shareable) = share_type(
+                state,
+                types,
+                declarations,
+                sealed,
+                payload_type
+              )
+              if not shareable { return (next, false) }
+              state = next
+            }
+            None -> return (state, false)
+          }
+          payload = payload + 1
+        }
+        case = case + 1
+      }
+    }
+  }
+  (state, true)
+}

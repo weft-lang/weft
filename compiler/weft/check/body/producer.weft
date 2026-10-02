@@ -623,6 +623,7 @@ use compiler/weft/syntax/numeric.{
   numeric_float_literal_value,
   numeric_scan
 }
+use compiler/weft/check/body/share.{checked_shareable_type}
 use compiler/weft/check/body/resource.{
   CheckedResourceContext,
   CheckedResourceDropEffectUnavailable,
@@ -11192,6 +11193,8 @@ fn checked_body_input_node(
   }
 }
 
+-- A payload of a borrowed variant is a part read through the borrow, as a
+-- field of a borrowed record is: `access` is the scrutinee's borrow, if any.
 fn checked_body_constructor_pattern_items(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -11199,6 +11202,7 @@ fn checked_body_constructor_pattern_items(
   owner: FunctionIdentity,
   environment: CheckedLexicalEnvironment,
   input_type: SemanticTypeId,
+  access: Option<SemanticMutability>,
   case_index: usize,
   authored: PatternList,
   index: usize,
@@ -11234,44 +11238,56 @@ fn checked_body_constructor_pattern_items(
             checked_body_input_node(catalog, input_type)
           )
         )
-        Some(payload_type) -> match checked_body_pattern(
-          state,
-          source,
-          types,
-          owner,
-          environment,
-          payload_type,
-          item
-        ) {
-          CheckedBodyPatternRejected(state, issue) -> CheckedConstructorPatternItemsRejected(
+        Some(payload_type) -> {
+          let (state, types, seen_type) = match access {
+            None -> (state, types, payload_type)
+            Some(borrowed) -> checked_body_borrowed_field_view(
+              state,
+              types,
+              payload_type,
+              borrowed
+            )
+          }
+          match checked_body_pattern(
             state,
-            issue
-          )
-          CheckedBodyPatternBuilt(state, child, next_environment, coverage, space, child_range) ->
-            {
-              let next_types = checked_body_types_with_catalog(types, state.types())
-              match covering_range(range, child_range) {
-                nil -> CheckedConstructorPatternItemsRejected(
-                  state,
-                  CheckedBodyProducerInvalidRange
-                )
-                next_range: CheckedSourceRange -> checked_body_constructor_pattern_items(
-                  state,
-                  source,
-                  next_types,
-                  owner,
-                  next_environment,
-                  input_type,
-                  case_index,
-                  rest,
-                  index + 1,
-                  ordinals.append(checked_pattern_id_ordinal(child)),
-                  complete and checked_pattern_coverage_complete(coverage),
-                  spaces.append(space),
-                  next_range
-                )
+            source,
+            types,
+            owner,
+            environment,
+            seen_type,
+            item
+          ) {
+            CheckedBodyPatternRejected(state, issue) -> CheckedConstructorPatternItemsRejected(
+              state,
+              issue
+            )
+            CheckedBodyPatternBuilt(state, child, next_environment, coverage, space, child_range) ->
+              {
+                let next_types = checked_body_types_with_catalog(types, state.types())
+                match covering_range(range, child_range) {
+                  nil -> CheckedConstructorPatternItemsRejected(
+                    state,
+                    CheckedBodyProducerInvalidRange
+                  )
+                  next_range: CheckedSourceRange -> checked_body_constructor_pattern_items(
+                    state,
+                    source,
+                    next_types,
+                    owner,
+                    next_environment,
+                    input_type,
+                    access,
+                    case_index,
+                    rest,
+                    index + 1,
+                    ordinals.append(checked_pattern_id_ordinal(child)),
+                    complete and checked_pattern_coverage_complete(coverage),
+                    spaces.append(space),
+                    next_range
+                  )
+                }
               }
-            }
+          }
         }
       }
     }
@@ -11300,11 +11316,24 @@ fn checked_body_opaque_borrowed_payload(
   )
 }
 
--- A field seen through a borrowed record: a scalar, a raw address or an
--- existing borrow as itself, an owned resource and any other value as a borrow
--- with the record's access, as a borrowed opaque wrapper exposes its
--- representation.
-fn checked_body_borrowed_field_view(
+-- Whether a part read through a borrow may be used as the value: its type
+-- is ordinary immutable managed data all the way down.
+fn checked_body_part_shareable(
+  state: borrow CheckedBodyBuild,
+  types: borrow CheckedBodyPrimitiveTypes,
+  part: SemanticTypeId
+) -> bool {
+  let catalog = state.types()
+  let resolution = types.resolution
+  let declarations = resolution.declarations()
+  let sealed = types.sendable
+  checked_shareable_type(catalog, declarations, sealed, part)
+}
+
+-- A part seen only as a view through a borrowed whole: a scalar, a raw
+-- address or an existing borrow as itself, and any other part, an owned
+-- resource included, as a borrow with the whole's access.
+fn checked_body_borrowed_part_view(
   state: owned CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
   field_type: SemanticTypeId,
@@ -11326,6 +11355,18 @@ fn checked_body_borrowed_field_view(
     }
     None -> (state, types, field_type)
   }
+}
+
+-- A part read through a borrowed whole. A shareable part is the value
+-- itself, shared out of the whole; every other part is a view.
+fn checked_body_borrowed_field_view(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  field_type: SemanticTypeId,
+  access: SemanticMutability
+) -> (owned CheckedBodyBuild, CheckedBodyPrimitiveTypes, SemanticTypeId) {
+  if checked_body_part_shareable(state, types, field_type) { (state, types, field_type) }
+  else { checked_body_borrowed_part_view(state, types, field_type, access) }
 }
 
 -- A borrowed wrapper permits inspection of a copyable scalar representation,
@@ -11361,7 +11402,9 @@ fn checked_body_opaque_pattern_payload(
             inner,
             access
           )
-          _ -> checked_body_opaque_borrowed_payload(state, types, representation, access)
+          _ -> if checked_body_part_shareable(state, types, representation) {
+            (state, types, representation)
+          } else { checked_body_opaque_borrowed_payload(state, types, representation, access) }
         }
         None -> (state, types, representation)
       }
@@ -11543,6 +11586,7 @@ fn checked_body_variant_constructor_pattern(
                       owner,
                       environment,
                       shape_type,
+                      checked_body_pattern_scrutinee(catalog, input_type).1,
                       case_index,
                       authored,
                       0,
@@ -12423,10 +12467,11 @@ fn checked_body_typed_binding_pattern(
               CheckedBodyProducerRuntimeDiscriminationUnavailable(input_type, range)
             )
             CheckedTypedArmAdmitted(admitted) -> {
-              -- A borrowed scrutinee binds a view of the narrowed type.
+              -- A typed arm narrows the borrowed value itself rather than
+              -- reading a part of it, so it binds a view whatever its type.
               let (state, _, bound) = match access {
                 None -> (state, next_types, annotation)
-                Some(borrowed) -> checked_body_borrowed_field_view(
+                Some(borrowed) -> checked_body_borrowed_part_view(
                   state,
                   next_types,
                   annotation,
@@ -22041,17 +22086,41 @@ fn checked_body_field_access_value(
   }
 }
 
--- A field projected through a borrow is seen as a borrowed view with the
--- borrow's access, as a pattern over a borrowed record sees it.
+-- Whether a position wants a borrow, so a part filling it is only observed.
+fn checked_body_borrow_expected(
+  catalog: borrow SemanticTypeCatalog,
+  expectation: CheckedBodyExpectation
+) -> bool {
+  match expectation {
+    CheckedInferResult -> false
+    CheckedRequireResult(expected) -> match catalog.graph_for(expected) {
+      Some(graph) -> match semantic_type_graph_node(graph, expected) {
+        SemanticBorrowNode(_, _) -> true
+        _ -> false
+      }
+      None -> false
+    }
+  }
+}
+
+-- A field projected through a borrow, as a pattern over a borrowed record
+-- sees it: shared when it is shareable, and otherwise a view. Where the
+-- position wants a borrow the part is forwarded as a view without sharing it.
 fn checked_body_field_through(
   state: owned CheckedBodyBuild,
   types: CheckedBodyPrimitiveTypes,
   field_type: SemanticTypeId,
-  borrowed: Option<SemanticMutability>
+  borrowed: Option<SemanticMutability>,
+  expectation: CheckedBodyExpectation
 ) -> (owned CheckedBodyBuild, CheckedBodyPrimitiveTypes, SemanticTypeId) {
   match borrowed {
     None -> (state, types, field_type)
-    Some(access) -> checked_body_borrowed_field_view(state, types, field_type, access)
+    Some(access) -> {
+      let catalog = state.types()
+      if checked_body_borrow_expected(catalog, expectation) {
+        checked_body_borrowed_part_view(state, types, field_type, access)
+      } else { checked_body_borrowed_field_view(state, types, field_type, access) }
+    }
   }
 }
 
@@ -22122,7 +22191,13 @@ fn checked_body_project_tuple_item(
   let (tuple_type, borrowed) = checked_body_projection_base(catalog, base_type)
   match semantic_tuple_item_projection(catalog, tuple_type, position) {
     SemanticRecordFieldProjected(stable_key, layout_index, result) -> {
-      let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+      let (state, _, view) = checked_body_field_through(
+        state,
+        types,
+        result,
+        borrowed,
+        expectation
+      )
       checked_body_publish_field(
         state,
         checked_base,
@@ -22166,7 +22241,13 @@ fn checked_body_project_field(
   } else {
     match semantic_record_field_projection(catalog, record_type, field_name) {
       SemanticRecordFieldProjected(stable_key, layout_index, result) -> {
-        let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+        let (state, _, view) = checked_body_field_through(
+          state,
+          types,
+          result,
+          borrowed,
+          expectation
+        )
         checked_body_publish_field(
           state,
           checked_base,
@@ -22180,7 +22261,13 @@ fn checked_body_project_field(
         )
       }
       SemanticRecordFieldUnplaced(stable_key, exact_name, result) -> {
-        let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+        let (state, _, view) = checked_body_field_through(
+          state,
+          types,
+          result,
+          borrowed,
+          expectation
+        )
         checked_body_publish_field(
           state,
           checked_base,
@@ -22203,7 +22290,13 @@ fn checked_body_project_field(
         )
         match projection {
           SemanticDeclaredFieldProjected(declaration, field_index, result) -> {
-            let (state, _, view) = checked_body_field_through(state, types, result, borrowed)
+            let (state, _, view) = checked_body_field_through(
+              state,
+              types,
+              result,
+              borrowed,
+              expectation
+            )
             checked_body_publish_field(
               state,
               checked_base,
@@ -26254,7 +26347,8 @@ fn checked_body_payload_resources(
 }
 
 -- A mismatch whose actual type is a shared borrow of exactly the expected
--- type is the borrow rule's own refusal, not a disagreement about types.
+-- value, qualified or not, is the borrow rule's own refusal, not a
+-- disagreement about types.
 fn checked_body_borrow_issue(
   state: borrow CheckedBodyBuild,
   issue: CheckedBodyProducerIssue
@@ -26265,10 +26359,16 @@ fn checked_body_borrow_issue(
       match catalog.graph_for(actual) {
         None -> issue
         Some(graph) -> match semantic_type_graph_node(graph, actual) {
-          SemanticBorrowNode(inner, SemanticImmutable) ->
-            if semantic_type_catalog_equal(catalog, inner, expected) {
+          SemanticBorrowNode(inner, SemanticImmutable) -> {
+            -- An `owned` or `unique` position wants the same value.
+            let wanted = match fresh_value_expectation(catalog, CheckedRequireResult(expected)) {
+              CheckedRequireResult(value) -> value
+              CheckedInferResult -> expected
+            }
+            if semantic_type_catalog_equal(catalog, inner, wanted) {
               CheckedBodyProducerBorrowNotValue(actual, expected)
             } else { issue }
+          }
           _ -> issue
         }
       }
