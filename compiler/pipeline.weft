@@ -14401,6 +14401,8 @@ pub(package) fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr, src: i64, tt: 
     ArrayLiteral(elements, resolved_ty, span) -> 1
     Match(scrutinee, arms, _) -> 1
     If(cond, then_expr, else_expr) -> 1
+    -- A handle result owns its stake as an if or match result does.
+    Handle(body, clauses, hret) -> 1
     IndexedGet(base, index, element_ty, fixed_len) -> 1
     IndexedSet(base, index, value, fact) -> 0
     IndexedSlice(base, start, end, fact) -> 0
@@ -14422,8 +14424,32 @@ pub(package) fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr, src: i64, tt: 
       src,
       tt
     )
+    Let(ns, nl, value, body) -> pipeline_let_result_owned_typed(body, src, ns, nl, tt)
+    LetMut(ns, nl, value, body) -> pipeline_let_result_owned_typed(body, src, ns, nl, tt)
+    Defer(cleanup, body, source_site) -> pipeline_expr_owned_rvalue_temp_typed(body, src, tt)
+    Resume(value) -> pipeline_expr_owned_rvalue_temp_typed(value, src, tt)
+    WithHandler(config, body, fact, source_site) -> pipeline_expr_owned_rvalue_temp_typed(
+      body,
+      src,
+      tt
+    )
     _ -> 0
   }
+}
+
+-- A binding owns its stake (`pipeline_expr_result_is_borrowed_with_ctx_typed`
+-- states the same rule), so a let whose result is its binding, or is borrowed
+-- from it, hands that stake to its consumer; otherwise its body decides.
+pub(package) fn pipeline_let_result_owned_typed(
+  body: Expr,
+  src: i64,
+  ns: i64,
+  nl: i64,
+  tt: i64
+) -> i64 {
+  if pipeline_expr_final_returns_binding_typed(body, src, ns, nl) == 1 or
+    pipeline_expr_result_borrows_binding_typed(body, src, ns, nl) == 1 { 1 }
+  else { pipeline_expr_owned_rvalue_temp_typed(body, src, tt) }
 }
 
 pub(package) fn pipeline_expr_node_owned_rvalue_temp_typed(expr: i64, src: i64, tt: i64) -> i64 {
@@ -28051,10 +28077,9 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(
               match hret {
                 NoHandleReturn -> {
                   let pop_args = pipeline_ir_value_lane_ids(body_value, 0, body_lanes)
-                  let normalization = if has_abortive == 1 and pipeline_linear_cleanup_plan(
-                    tt,
-                    body_ty
-                  ) == 0 {
+                  -- A managed handle result owns its stake, as an if or match
+                  -- result does, whether or not a clause can abort.
+                  let normalization = if pipeline_linear_cleanup_plan(tt, body_ty) == 0 {
                     pipeline_managed_borrow_retain_arg_typed_with_origin(
                       body_expr,
                       body_value,
@@ -28101,10 +28126,7 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(
                   -- Only normal completion reaches pop_block. Abort exits land
                   -- separately with the complete transformed result shape.
                   let ret_start = pipeline_lowered_blocks_next_block(body_blocks)
-                  let retain_result = if has_abortive == 1 and pipeline_linear_cleanup_plan(
-                    tt,
-                    handle_result_ty
-                  ) == 0 {
+                  let retain_result = if pipeline_linear_cleanup_plan(tt, handle_result_ty) == 0 {
                     pipeline_managed_arm_needs_retain(
                       pipeline_expr_result_is_borrowed_for_ty_typed(
                         Let(rns, rnl, body_expr, rb),
@@ -28238,14 +28260,42 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(
             }
             match hret {
               NoHandleReturn -> {
-                let args = pipeline_ir_value_lane_ids(ir_lowered_expr_value(body), 0, body_lanes)
+                let body_value = ir_lowered_expr_value(body)
+                -- A managed handle result owns its stake, as an if or match
+                -- result does: a borrowed body result is retained as it leaves.
+                let normalization = if pipeline_linear_cleanup_plan(tt, body_ty) == 0 {
+                  pipeline_managed_borrow_retain_arg_typed_with_origin(
+                    body_expr,
+                    body_value,
+                    body_ty,
+                    ir_lowered_expr_next_value(body),
+                    src,
+                    pipeline_lower_module_fns(module),
+                    pipeline_lower_module_subst(module),
+                    tt,
+                    ir_managed_stake_origin_arm_normalization()
+                  )
+                } else {
+                  pipeline_lowered_args(
+                    ir_value_list_empty(),
+                    ir_lowered_expr_next_value(body),
+                    IrInstNil,
+                    1
+                  )
+                }
+                let args = pipeline_ir_value_lane_ids(body_value, 0, body_lanes)
                 let block = ir_block_new_term(
                   start_block,
-                  insts,
+                  ir_inst_list_append(insts, pipeline_lowered_args_insts(normalization)),
                   ir_term_jump_args(target_block, args)
                 )
                 let blocks = ir_block_list_prepend(block, ir_block_list_empty())
-                pipeline_lowered_blocks(next_block, ir_lowered_expr_next_value(body), blocks, 1)
+                pipeline_lowered_blocks(
+                  next_block,
+                  pipeline_lowered_args_next_value(normalization),
+                  blocks,
+                  1
+                )
               }
               HandleReturnClause(rns, rnl, rb) -> {
                 -- Establish the completion binding after the handled frame pops.
@@ -28254,7 +28304,21 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(
                   ir_lowered_expr_next_value(body),
                   insts
                 )
-                pipeline_lower_initialized_binding_typed_to_target_blocks(
+                let retain_result = if pipeline_linear_cleanup_plan(tt, handle_result_ty) == 0 {
+                  pipeline_managed_arm_needs_retain(
+                    pipeline_expr_result_is_borrowed_for_ty_typed(
+                      Let(rns, rnl, body_expr, rb),
+                      handle_result_ty,
+                      src,
+                      pipeline_lower_module_fns(module),
+                      pipeline_lower_module_subst(module),
+                      tt
+                    ),
+                    handle_result_ty
+                  )
+                } else { 0 }
+                let retain_block = if retain_result == 1 { next_block } else { target_block }
+                let raw_ret = pipeline_lower_initialized_binding_typed_to_target_blocks(
                   rns,
                   rnl,
                   body_expr,
@@ -28268,7 +28332,14 @@ pub(package) fn pipeline_lower_handle_typed_to_target_blocks(
                   completed,
                   next_value,
                   start_block,
-                  next_block,
+                  next_block + retain_result,
+                  retain_block
+                )
+                pipeline_managed_arm_retain_append(
+                  raw_ret,
+                  retain_result,
+                  handle_result_ty,
+                  retain_block,
                   target_block
                 )
               }
@@ -48681,30 +48752,9 @@ pub(package) fn pipeline_expr_result_is_borrowed_with_ctx_typed(
       tt
     )
     Resume(value) -> pipeline_expr_result_is_borrowed_with_ctx_typed(value, src, fns, subst, tt)
-    Handle(body, clauses, hret) -> {
-      -- Abort and deferred completion return owned transport stakes. Their
-      -- normal edge is normalized before merging with those outcomes.
-      if handler_clause_list_has_abortive(clauses) == 1 or
-        pipeline_handler_clause_list_has_continuation_handler_typed(clauses) == 1 { 0 }
-      else {
-        match hret {
-          NoHandleReturn -> pipeline_expr_result_is_borrowed_with_ctx_typed(
-            body,
-            src,
-            fns,
-            subst,
-            tt
-          )
-          HandleReturnClause(rns, rnl, rb) -> pipeline_expr_result_is_borrowed_with_ctx_typed(
-            Let(rns, rnl, body, rb),
-            src,
-            fns,
-            subst,
-            tt
-          )
-        }
-      }
-    }
+    -- Every completion of a handle, normal, aborted or deferred, carries its
+    -- own stake: the normal edge is normalized as an if or match arm is.
+    Handle(body, clauses, hret) -> 0
     WithHandler(config, body, fact, source_site) ->
       pipeline_expr_result_is_borrowed_with_ctx_typed(body, src, fns, subst, tt)
     _ -> 0
