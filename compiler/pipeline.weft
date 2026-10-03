@@ -7234,7 +7234,67 @@ pub(package) fn pipeline_return_expr_type_node_typed(
       locals,
       module
     )
+    Loop(body) -> pipeline_loop_break_type_node_typed(body, params, locals, module)
     _ -> pipeline_expr_type_node_typed(expr)
+  }
+}
+
+-- The value a `loop` produces: the join of what its own `break`s carry.
+-- Breaks inside nested loops and lambdas belong to those, and every other
+-- subexpression yields no loop value, so the search starts from `never`.
+pub(package) fn pipeline_loop_break_type_node_typed(
+  expr: Expr,
+  params: i64,
+  locals: PipelineValueEnv,
+  module: PipelineLowerModule
+) -> i64 {
+  match expr {
+    Break(value) -> pipeline_return_expr_type_node_typed(value, params, locals, module)
+    BreakNoValue(_, _) -> ty_nil()
+    Block(first, rest) -> pipeline_control_result_type_join(
+      pipeline_loop_break_type_node_typed(first, params, locals, module),
+      pipeline_loop_break_type_node_typed(rest, params, locals, module)
+    )
+    Let(_, _, value, body) -> pipeline_control_result_type_join(
+      pipeline_loop_break_type_node_typed(value, params, locals, module),
+      pipeline_loop_break_type_node_typed(body, params, locals, module)
+    )
+    LetMut(_, _, value, body) -> pipeline_control_result_type_join(
+      pipeline_loop_break_type_node_typed(value, params, locals, module),
+      pipeline_loop_break_type_node_typed(body, params, locals, module)
+    )
+    LetTyped(inner, _) -> pipeline_loop_break_type_node_typed(inner, params, locals, module)
+    If(cond, then_expr, else_expr) -> pipeline_control_result_type_join(
+      pipeline_loop_break_type_node_typed(cond, params, locals, module),
+      pipeline_control_result_type_join(
+        pipeline_loop_break_type_node_typed(then_expr, params, locals, module),
+        pipeline_loop_break_type_node_typed(else_expr, params, locals, module)
+      )
+    )
+    Match(scrutinee, arms, _) -> {
+      let mut joined = pipeline_loop_break_type_node_typed(scrutinee, params, locals, module)
+      for index in 0..match_arm_list_len(arms) {
+        joined = pipeline_control_result_type_join(
+          joined,
+          pipeline_loop_break_type_node_typed(
+            match_arm_body_expr(match_arm_list_nth(arms, index)),
+            params,
+            locals,
+            module
+          )
+        )
+      }
+      joined
+    }
+    Defer(cleanup, body, _) -> pipeline_loop_break_type_node_typed(body, params, locals, module)
+    Handle(body, _, _) -> pipeline_loop_break_type_node_typed(body, params, locals, module)
+    WithHandler(_, body, _, _) -> pipeline_loop_break_type_node_typed(
+      body,
+      params,
+      locals,
+      module
+    )
+    _ -> ty_never()
   }
 }
 
@@ -14403,6 +14463,8 @@ pub(package) fn pipeline_expr_owned_rvalue_temp_typed(expr: Expr, src: i64, tt: 
     If(cond, then_expr, else_expr) -> 1
     -- A handle result owns its stake as an if or match result does.
     Handle(body, clauses, hret) -> 1
+    -- So does a loop result: each break retains a borrowed value.
+    Loop(body) -> 1
     IndexedGet(base, index, element_ty, fixed_len) -> 1
     IndexedSet(base, index, value, fact) -> 0
     IndexedSlice(base, start, end, fact) -> 0
@@ -29913,6 +29975,8 @@ pub(package) fn pipeline_lower_lexical_loop_exit(
   )
 }
 
+-- A loop result owns its stake, as a return value does: a borrowed break
+-- value is retained before it leaves the loop.
 pub(package) fn pipeline_lower_break_to_target_blocks(
   expr: i64,
   params: i64,
@@ -29953,10 +30017,18 @@ pub(package) fn pipeline_lower_break_to_target_blocks(
           let exit_value = pipeline_lowered_blocks_next_value(value_blocks)
           let exit_params = ir_value_list_prepend(exit_value, ir_value_list_empty())
           let exit_args = ir_value_list_prepend(exit_value, ir_value_list_empty())
+          let transfer = pipeline_lower_return_transfer_from_node(
+            value_expr,
+            exit_value,
+            exit_value + 1,
+            params,
+            locals,
+            module
+          )
           let exit_node = ir_block_new_params(
             break_block,
             exit_params,
-            ir_inst_list_empty(),
+            ir_lowered_expr_insts(transfer),
             ir_term_jump_args(target_block, exit_args)
           )
           let blocks = ir_block_list_append(
@@ -29965,7 +30037,7 @@ pub(package) fn pipeline_lower_break_to_target_blocks(
           )
           pipeline_lowered_loop_blocks(
             pipeline_lowered_blocks_next_block(value_blocks),
-            exit_value + 1,
+            ir_lowered_expr_next_value(transfer),
             blocks,
             1,
             1,
@@ -29983,16 +30055,24 @@ pub(package) fn pipeline_lower_break_to_target_blocks(
         lower_ctx
       )
       if ir_lowered_expr_is_valid(value) == 1 {
+        let transfer = pipeline_lower_return_transfer_from_node(
+          value_expr,
+          ir_lowered_expr_value(value),
+          ir_lowered_expr_next_value(value),
+          params,
+          locals,
+          module
+        )
         let args = ir_value_list_prepend(ir_lowered_expr_value(value), ir_value_list_empty())
         let block = ir_block_new_term(
           start_block,
-          ir_lowered_expr_insts(value),
+          ir_inst_list_append(ir_lowered_expr_insts(value), ir_lowered_expr_insts(transfer)),
           ir_term_jump_args(target_block, args)
         )
         let blocks = ir_block_list_prepend(block, ir_block_list_empty())
         pipeline_lowered_loop_blocks(
           next_block,
-          ir_lowered_expr_next_value(value),
+          ir_lowered_expr_next_value(transfer),
           blocks,
           1,
           1,
@@ -39187,10 +39267,10 @@ pub(package) fn pipeline_ir_block_list_linear_cleanup_count_from(
 }
 
 -- A managed binding keeps its own stake until it leaves scope. Returns,
--- handler resumption and constructions retain what they carry, so only a
--- jump passing the binding itself, directly or through forwarded block
--- parameters, hands that stake to its target. Unlike a linear owner, no
--- construction or call moves it.
+-- breaks, handler resumption and constructions retain what they carry, so
+-- only a fall-through jump passing the binding itself, directly or through
+-- forwarded block parameters, hands that stake to its target. Unlike a
+-- linear owner, no construction or call moves it.
 pub(package) fn pipeline_ir_managed_value_transfers_from_blocks(
   blocks: IrBlockList,
   value: i64,
@@ -39256,10 +39336,11 @@ pub(package) fn pipeline_ir_managed_incoming_transfers(
 pub(package) fn pipeline_ir_managed_exit_transfers(
   term: IrTerminator,
   blocks: IrBlockList,
-  source: i64
+  source: i64,
+  normal_block: i64
 ) -> bool {
   match term {
-    IrTermJump(_, args) -> {
+    IrTermJump(target, args) if target == normal_block -> {
       let mut remaining = args
       let mut transfers = false
       while not transfers {
@@ -39297,7 +39378,9 @@ pub(package) fn pipeline_ir_block_loop_managed_cleanup_applies_in(
       continue_block,
       target_block
     ) ==
-      1 and not pipeline_ir_managed_exit_transfers(term, blocks, bind_value) { 1 } else { 0 }
+      1 and not pipeline_ir_managed_exit_transfers(term, blocks, bind_value, normal_block) { 1 } else {
+        0
+      }
   }
 }
 
@@ -39761,18 +39844,23 @@ pub(package) fn pipeline_ir_block_list_append_exit_slot_cleanup_indexed(
 
 -- Slot-based twin: each patched copy loads the slot into its own value
 -- id and releases through its own dst (two ids per copy).
--- A jump hands the loaded slot value to its target. A return or handler
--- resumption retains a managed result, so only a linear owner (`plan`)
--- leaves its slot through those terminators.
+-- A linear owner (`plan`) leaves its slot with any exit that carries it. A
+-- return, break or handler resumption retains a managed result, so a managed
+-- slot value is handed on only by a fall-through jump.
 pub(package) fn pipeline_ir_term_transfers_slot_obligation(
   term: IrTerminator,
   insts: IrInstList,
   slot: i64,
-  plan: i64
+  plan: i64,
+  normal_block: i64
 ) -> i64 {
-  match term {
-    IrTermJump(_, _) -> pipeline_ir_term_transfers_slot_value(term, insts, slot)
-    _ -> if plan == 0 { 0 } else { pipeline_ir_term_transfers_slot_value(term, insts, slot) }
+  if plan != 0 { pipeline_ir_term_transfers_slot_value(term, insts, slot) }
+  else {
+    match term {
+      IrTermJump(target, _) if target == normal_block ->
+        pipeline_ir_term_transfers_slot_value(term, insts, slot)
+      _ -> 0
+    }
   }
 }
 
@@ -39787,7 +39875,7 @@ pub(package) fn pipeline_ir_block_loop_slot_cleanup_applies(
   match block {
     IrBlock(id, params, insts, term) -> {
       if pipeline_ir_term_leaves_loop_scope(term, normal_block, continue_block, target_block) ==
-        1 and pipeline_ir_term_transfers_slot_obligation(term, insts, slot, plan) ==
+        1 and pipeline_ir_term_transfers_slot_obligation(term, insts, slot, plan, normal_block) ==
         0 { 1 } else {
           0
         }
