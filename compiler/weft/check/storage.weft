@@ -13,6 +13,8 @@ use stdlib/vector as vector
 use stdlib/vector.{
   PersistentVector,
   Vector,
+  frozen_vector_get_in_bounds,
+  frozen_vector_len,
   persistent_vector_empty,
   persistent_vector_get_option,
   persistent_vector_len,
@@ -21,17 +23,26 @@ use stdlib/vector.{
   vector_get_in_bounds,
   vector_len,
   vector_push,
+  vector_freeze,
   vector_set
 }
+use stdlib/vector/handles.{FrozenVector}
 
 pub(package) type DenseIndex = opaque usize
 
 pub(package) type DenseBuilder<T> = opaque owned Vector<T>
 
--- A frozen column. An empty one holds no storage (`nil`): most columns of a
--- small derived graph stay empty, and persistent storage is created only
--- when the first value arrives.
-pub(package) type DenseSegment<T> = opaque PersistentVector<T>?
+-- A frozen column: the builder's own vector storage, frozen in place. An
+-- empty one holds no storage (`nil`): most columns of a small derived graph
+-- stay empty. A frozen column costs one compact allocation; a persistent
+-- vector per column would give every column of every derived graph its own
+-- collection region.
+pub(package) type DenseSegment<T> = opaque FrozenVector<T>?
+
+-- A frozen column that later versions extend: `push` and `set` return a new
+-- column sharing the old one's storage. Only structures that grow by versions,
+-- such as a type catalog, need one.
+pub(package) type PersistentDenseSegment<T> = opaque PersistentVector<T>?
 
 pub(package) fn dense_index_value(index: DenseIndex) -> usize {
   match index { DenseIndex(value) -> value }
@@ -94,6 +105,14 @@ impl<T> DenseBuilder<T> {
     match self {
       DenseBuilder(values) -> if vector_len<T>(values) == 0 {
         DenseSegment<T>(nil)
+      } else { DenseSegment<T>(vector_freeze<T>(values)) }
+    }
+  }
+
+  pub(package) fn freeze_persistent(self: owned Self) -> PersistentDenseSegment<T> {
+    match self {
+      DenseBuilder(values) -> if vector_len<T>(values) == 0 {
+        PersistentDenseSegment<T>(nil)
       } else {
         let mut frozen = persistent_vector_empty<T>()
         for index in 0..vector_len<T>(values) {
@@ -102,7 +121,7 @@ impl<T> DenseBuilder<T> {
             vector_get_in_bounds<T>(values, index)
           )
         }
-        DenseSegment<T>(frozen)
+        PersistentDenseSegment<T>(frozen)
       }
     }
   }
@@ -124,6 +143,49 @@ impl<T> DenseSegment<T> {
     match self {
       DenseSegment(storage) -> match storage {
         nil -> __i64_to_usize(0)
+        values: FrozenVector<T> -> __i64_to_usize(frozen_vector_len<T>(values))
+      }
+    }
+  }
+
+  -- Checked materialisation for cold paths. Managed T values may carry the
+  -- ordinary cost of returning an Option<T>; hot checker traversal uses at
+  -- over scalar columns instead.
+  pub(package) fn get(self: borrow Self, index: DenseIndex) -> Option<T> {
+    let value = dense_index_value(index)
+    match self {
+      DenseSegment(storage) -> match storage {
+        nil -> None<T>()
+        values: FrozenVector<T> -> if value >= __i64_to_usize(frozen_vector_len<T>(values)) {
+          None<T>()
+        } else {
+          Some<T>(frozen_vector_get_in_bounds<T>(values, __u64_to_i64(__usize_to_u64(value))))
+        }
+      }
+    }
+  }
+
+  -- Bounds-checked constant-time access for dense scalar columns.
+  pub(package) fn at(self: borrow Self, index: DenseIndex) -> T {
+    let value = dense_index_value(index)
+    match self {
+      DenseSegment(storage) -> match storage {
+        nil -> panic("Dense checker storage index is out of bounds")
+        values: FrozenVector<T> -> if value >= __i64_to_usize(frozen_vector_len<T>(values)) {
+          panic("Dense checker storage index is out of bounds")
+        } else {
+          frozen_vector_get_in_bounds<T>(values, __u64_to_i64(__usize_to_u64(value)))
+        }
+      }
+    }
+  }
+}
+
+impl<T> PersistentDenseSegment<T> {
+  pub(package) fn len(self: borrow Self) -> usize {
+    match self {
+      PersistentDenseSegment(storage) -> match storage {
+        nil -> __i64_to_usize(0)
         values: PersistentVector<T> -> dense_column_len<T>(values)
       }
     }
@@ -134,7 +196,7 @@ impl<T> DenseSegment<T> {
   -- over scalar columns instead.
   pub(package) fn get(self: borrow Self, index: DenseIndex) -> Option<T> {
     match self {
-      DenseSegment(storage) -> match storage {
+      PersistentDenseSegment(storage) -> match storage {
         nil -> None<T>()
         values: PersistentVector<T> -> match num_scalar_usize_to_i64(dense_index_value(index)) {
           Some(storage_index) -> persistent_vector_get_option<T>(values, storage_index)
@@ -148,7 +210,7 @@ impl<T> DenseSegment<T> {
   pub(package) fn at(self: borrow Self, index: DenseIndex) -> T {
     let value = dense_index_value(index)
     match self {
-      DenseSegment(storage) -> match storage {
+      PersistentDenseSegment(storage) -> match storage {
         nil -> panic("Dense checker storage index is out of bounds")
         values: PersistentVector<T> -> if value >= dense_column_len<T>(values) {
           panic("Dense checker storage index is out of bounds")
@@ -168,25 +230,29 @@ impl<T> DenseSegment<T> {
     }
   }
 
-  pub(package) fn push(self: Self, value: T) -> DenseSegment<T> {
+  pub(package) fn push(self: Self, value: T) -> PersistentDenseSegment<T> {
     match self {
-      DenseSegment(storage) -> match storage {
-        nil -> DenseSegment<T>(persistent_vector_push<T>(persistent_vector_empty<T>(), value))
-        values: PersistentVector<T> -> DenseSegment<T>(persistent_vector_push<T>(values, value))
+      PersistentDenseSegment(storage) -> match storage {
+        nil -> PersistentDenseSegment<T>(
+          persistent_vector_push<T>(persistent_vector_empty<T>(), value)
+        )
+        values: PersistentVector<T> -> PersistentDenseSegment<T>(
+          persistent_vector_push<T>(values, value)
+        )
       }
     }
   }
 
-  pub(package) fn set(self: Self, index: DenseIndex, value: T) -> DenseSegment<T> {
+  pub(package) fn set(self: Self, index: DenseIndex, value: T) -> PersistentDenseSegment<T> {
     let position = dense_index_value(index)
     match self {
-      DenseSegment(storage) -> match storage {
+      PersistentDenseSegment(storage) -> match storage {
         nil -> panic("Dense checker storage index is out of bounds")
         values: PersistentVector<T> -> if position >= values.len() {
           panic("Dense checker storage index is out of bounds")
         } else {
           match num_scalar_usize_to_i64(position) {
-            Some(storage_index) -> DenseSegment<T>(
+            Some(storage_index) -> PersistentDenseSegment<T>(
               persistent_vector_set<T>(values, storage_index, value)
             )
             None -> panic("Dense checker storage index is not representable")
