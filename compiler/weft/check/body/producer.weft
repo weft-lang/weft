@@ -8213,6 +8213,102 @@ fn checked_body_block(
   }
 }
 
+-- The local names a condition proves non-nil when it evaluates to `outcome`,
+-- under the short-circuit contract (kernel §5.3.1): `x != nil` when true and
+-- `x == nil` when false; `a and b` proves both operands' guards when true,
+-- and `a or b` both operands' guards when false.
+fn checked_body_nil_guards(condition: Expr, outcome: bool) -> List<(i64, i64)> {
+  match condition {
+    BinOp(operator, left, right) -> match checked_binary_resolution(operator) {
+      CheckedEqualityBinary(equality) -> {
+        let proves = match equality {
+          CheckedNotEqual -> outcome
+          CheckedEqual -> not outcome
+          _ -> false
+        }
+        if not proves { Nil<(i64, i64)>() }
+        else {
+          match (left, right) {
+            (Ident(start, length), NilExpr) -> Nil<(i64, i64)>().prepend((start, length))
+            (NilExpr, Ident(start, length)) -> Nil<(i64, i64)>().prepend((start, length))
+            _ -> Nil<(i64, i64)>()
+          }
+        }
+      }
+      CheckedBooleanBinary(CheckedLogicalAnd) -> if outcome {
+        checked_body_nil_guards(left, true).concat(checked_body_nil_guards(right, true))
+      } else { Nil<(i64, i64)>() }
+      CheckedBooleanBinary(CheckedLogicalOr) -> if outcome { Nil<(i64, i64)>() } else {
+        checked_body_nil_guards(left, false).concat(checked_body_nil_guards(right, false))
+      }
+      _ -> Nil<(i64, i64)>()
+    }
+    _ -> Nil<(i64, i64)>()
+  }
+}
+
+-- The members of a union, flattened.
+fn checked_body_union_members(
+  catalog: borrow SemanticTypeCatalog,
+  value: SemanticTypeId
+) -> List<SemanticTypeId> {
+  match catalog.graph_for(value) {
+    Some(graph) -> match semantic_type_graph_node(graph, value) {
+      SemanticUnionNode(left, right) -> checked_body_union_members(catalog, left).concat(
+        checked_body_union_members(catalog, right)
+      )
+      _ -> Nil<SemanticTypeId>().prepend(value)
+    }
+    None -> Nil<SemanticTypeId>().prepend(value)
+  }
+}
+
+-- A guarded immutable binding reads as its type without `nil` wherever its
+-- guard holds. The environment entry names the same binding, so moves and
+-- borrows still see one value; only what a reference may be used as narrows.
+fn checked_body_nil_guarded_environment(
+  state: owned CheckedBodyBuild,
+  types: CheckedBodyPrimitiveTypes,
+  source: Source,
+  environment: CheckedLexicalEnvironment,
+  guards: List<(i64, i64)>
+) -> (owned CheckedBodyBuild, CheckedLexicalEnvironment) {
+  match guards {
+    Nil -> (state, environment)
+    Cons(guard, rest) -> {
+      let (start, length) = guard
+      match lexical_lookup(environment, source, start, length) {
+        CheckedLexicalFound(binding, value_type, false) -> {
+          let catalog = state.types()
+          let members = checked_body_union_members(catalog, value_type)
+          let mut kept = Nil<SemanticTypeId>()
+          for member in members {
+            if not semantic_type_catalog_equal(catalog, member, types.nil_type) {
+              kept = kept.prepend(member)
+            } else { nil }
+          }
+          match kept.reverse() {
+            Cons(first, others) -> if kept.len() == members.len() {
+              checked_body_nil_guarded_environment(state, types, source, environment, rest)
+            } else {
+              let (state, narrowed) = checked_body_join_type_list(state, types, first, others)
+              checked_body_nil_guarded_environment(
+                state,
+                types,
+                source,
+                CheckedLexicalBinding(start, length, binding, narrowed, false, environment),
+                rest
+              )
+            }
+            Nil -> checked_body_nil_guarded_environment(state, types, source, environment, rest)
+          }
+        }
+        _ -> checked_body_nil_guarded_environment(state, types, source, environment, rest)
+      }
+    }
+  }
+}
+
 fn checked_body_if(
   state: owned CheckedBodyBuild,
   source: Source,
@@ -8240,73 +8336,93 @@ fn checked_body_if(
     condition,
     CheckedRequireResult(types.boolean)
   ) {
-    CheckedBodyExprBuilt(state, checked_condition) -> match checked_body_expr(
-      state,
-      source,
-      types,
-      owner,
-      function_result,
-      loop_context,
-      environment,
-      then_branch,
-      then_expectation
-    ) {
-      CheckedBodyExprBuilt(state, checked_then) -> match checked_body_expr(
+    CheckedBodyExprBuilt(state, checked_condition) -> {
+      let catalog = state.types()
+      let (state, then_environment) = checked_body_nil_guarded_environment(
+        state,
+        checked_body_types_with_catalog(types, catalog),
+        source,
+        environment,
+        checked_body_nil_guards(condition, true)
+      )
+      let catalog = state.types()
+      let (state, else_environment) = checked_body_nil_guarded_environment(
+        state,
+        checked_body_types_with_catalog(types, catalog),
+        source,
+        environment,
+        checked_body_nil_guards(condition, false)
+      )
+      let catalog = state.types()
+      let types = checked_body_types_with_catalog(types, catalog)
+      match checked_body_expr(
         state,
         source,
         types,
         owner,
         function_result,
         loop_context,
-        environment,
-        else_branch,
-        else_expectation
+        then_environment,
+        then_branch,
+        then_expectation
       ) {
-        CheckedBodyExprBuilt(state, checked_else) -> {
-          let then_type = state.result_type(checked_then)
-          let else_type = state.result_type(checked_else)
-          match checked_branch_result(
-            state,
-            types,
-            result_expectation,
-            then_type,
-            else_type
-          ) {
-            (state, result) -> {
-              let current_catalog = state.types()
-              let then_continuation = semantic_continuation_type(current_catalog, then_type)
-              let else_continuation = semantic_continuation_type(current_catalog, else_type)
-              if then_continuation or else_continuation {
-                let escaping_range = if then_continuation {
-                  state.range(checked_then)
-                } else { state.range(checked_else) }
-                CheckedBodyExprRejected(
-                  state,
-                  CheckedBodyProducerContinuationBranchEscape(escaping_range)
-                )
-              } else {
-                let condition_range = state.range(checked_condition)
-                let else_range = state.range(checked_else)
-                match covering_range(condition_range, else_range) {
-                  range: CheckedSourceRange ->
-                    match state.if_expr(
-                      checked_condition,
-                      checked_then,
-                      checked_else,
-                      result,
-                      range
-                    ) {
-                      (state, expression) -> CheckedBodyExprBuilt(state, expression)
-                    }
-                  nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+        CheckedBodyExprBuilt(state, checked_then) -> match checked_body_expr(
+          state,
+          source,
+          types,
+          owner,
+          function_result,
+          loop_context,
+          else_environment,
+          else_branch,
+          else_expectation
+        ) {
+          CheckedBodyExprBuilt(state, checked_else) -> {
+            let then_type = state.result_type(checked_then)
+            let else_type = state.result_type(checked_else)
+            match checked_branch_result(
+              state,
+              types,
+              result_expectation,
+              then_type,
+              else_type
+            ) {
+              (state, result) -> {
+                let current_catalog = state.types()
+                let then_continuation = semantic_continuation_type(current_catalog, then_type)
+                let else_continuation = semantic_continuation_type(current_catalog, else_type)
+                if then_continuation or else_continuation {
+                  let escaping_range = if then_continuation {
+                    state.range(checked_then)
+                  } else { state.range(checked_else) }
+                  CheckedBodyExprRejected(
+                    state,
+                    CheckedBodyProducerContinuationBranchEscape(escaping_range)
+                  )
+                } else {
+                  let condition_range = state.range(checked_condition)
+                  let else_range = state.range(checked_else)
+                  match covering_range(condition_range, else_range) {
+                    range: CheckedSourceRange ->
+                      match state.if_expr(
+                        checked_condition,
+                        checked_then,
+                        checked_else,
+                        result,
+                        range
+                      ) {
+                        (state, expression) -> CheckedBodyExprBuilt(state, expression)
+                      }
+                    nil -> CheckedBodyExprRejected(state, CheckedBodyProducerInvalidRange)
+                  }
                 }
               }
             }
           }
+          CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
         }
         CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
       }
-      CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
     }
     CheckedBodyExprRejected(state, issue) -> CheckedBodyExprRejected(state, issue)
   }
@@ -9926,6 +10042,7 @@ fn checked_body_homogeneous_binary_in_order(
   function_result: SemanticTypeId,
   loop_context: CheckedLoopContext,
   environment: CheckedLexicalEnvironment,
+  second_environment: CheckedLexicalEnvironment,
   first: Expr,
   second: Expr,
   left_first: bool,
@@ -9965,7 +10082,7 @@ fn checked_body_homogeneous_binary_in_order(
           owner,
           function_result,
           loop_context,
-          environment,
+          second_environment,
           second,
           CheckedRequireResult(first_type)
         ) {
@@ -10049,6 +10166,7 @@ fn checked_body_homogeneous_binary(
       function_result,
       loop_context,
       environment,
+      environment,
       right,
       left,
       false,
@@ -10065,6 +10183,7 @@ fn checked_body_homogeneous_binary(
       function_result,
       loop_context,
       environment,
+      environment,
       left,
       right,
       true,
@@ -10073,6 +10192,59 @@ fn checked_body_homogeneous_binary(
       seed
     )
   }
+}
+
+-- `a and b` evaluates `b` only once `a` is true, and `a or b` only once `a`
+-- is false, so `b` is checked where `a`'s guards for that outcome hold.
+fn checked_body_short_circuit_binary(
+  state: owned CheckedBodyBuild,
+  source: Source,
+  types: CheckedBodyPrimitiveTypes,
+  owner: FunctionIdentity,
+  function_result: SemanticTypeId,
+  loop_context: CheckedLoopContext,
+  environment: CheckedLexicalEnvironment,
+  operator: CheckedBinaryOperator,
+  left: Expr,
+  right: Expr,
+  expectation: CheckedBodyExpectation
+) -[SemanticConformance]> CheckedBodyBinaryBuild {
+  let proved = match operator {
+    CheckedLogicalOr -> false
+    _ -> true
+  }
+  let (state, right_environment) = checked_body_nil_guarded_environment(
+    state,
+    types,
+    source,
+    environment,
+    checked_body_nil_guards(left, proved)
+  )
+  let catalog = state.types()
+  let types = checked_body_types_with_catalog(types, catalog)
+  let seed = checked_body_binary_seed_expectation(
+    catalog,
+    types,
+    CheckedBooleanOperands,
+    CheckedBooleanResult,
+    expectation
+  )
+  checked_body_homogeneous_binary_in_order(
+    state,
+    source,
+    types,
+    owner,
+    function_result,
+    loop_context,
+    environment,
+    right_environment,
+    left,
+    right,
+    true,
+    CheckedBooleanOperands,
+    CheckedBooleanResult,
+    seed
+  )
 }
 
 fn checked_body_standard_declaration(
@@ -10989,7 +11161,7 @@ fn checked_body_binary(
       expectation
     )
     CheckedBooleanBinary(operator) -> checked_body_publish_binary(
-      checked_body_homogeneous_binary(
+      checked_body_short_circuit_binary(
         state,
         source,
         types,
@@ -10997,10 +11169,9 @@ fn checked_body_binary(
         function_result,
         loop_context,
         environment,
+        operator,
         left,
         right,
-        CheckedBooleanOperands,
-        CheckedBooleanResult,
         expectation
       ),
       operator,
