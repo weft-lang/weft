@@ -130501,6 +130501,21 @@ pub(package) fn pipeline_lower_match_body_to_blocks(
                   loop_target_block
                 )
               } else { return_cleaned_blocks }
+              let linear_exits = if loop_target_block >= 0 {
+                PipelineLinearScopeExit(after_arm_target, loop_continue_block, loop_target_block)
+              } else { pipeline_lower_module_scope_exit(module, after_arm_target) }
+              let linear = pipeline_pattern_linear_cleanup(
+                ownership_entries,
+                cleaned_body_blocks,
+                linear_exits,
+                fns,
+                tt,
+                loop_base + loop_count * cleanup_span,
+                pipeline_lower_internal_block_after_target(
+                  pipeline_lowered_blocks_next_block(body_blocks),
+                  target_block
+                )
+              )
               let cleanup_node = if cleanup_needed == 1 and pipeline_lowered_blocks_falls_through(
                 body_blocks
               ) == 1 {
@@ -130517,16 +130532,19 @@ pub(package) fn pipeline_lower_match_body_to_blocks(
               } else { ir_block_list_empty() }
               let entry = ir_block_new_term(
                 start_block,
-                ownership_entry_insts,
+                ir_inst_list_append(ownership_entry_insts, linear.init),
                 ir_term_jump(body_start)
               )
               let blocks = ir_block_list_prepend(
                 entry,
-                ir_block_list_append(cleaned_body_blocks, cleanup_node)
+                ir_block_list_append(linear.blocks, cleanup_node)
               )
               pipeline_lowered_blocks_control(
-                pipeline_lowered_blocks_next_block(body_blocks),
-                loop_base + loop_count * cleanup_span,
+                pipeline_ir_max_i64(
+                  pipeline_lowered_blocks_next_block(body_blocks),
+                  linear.next_block
+                ),
+                linear.next_value,
                 blocks,
                 1,
                 pipeline_lowered_blocks_falls_through(body_blocks)
@@ -130571,21 +130589,40 @@ pub(package) fn pipeline_lower_match_body_to_blocks(
                 pipeline_type_value_lane_count_or_one(body_ty)
               )
               let insts = ir_inst_list_append(
-                ownership_entry_insts,
-                ir_inst_list_append(
-                  ir_lowered_expr_insts(lowered),
-                  ir_inst_list_append(retain_insts, ir_lowered_expr_insts(cleanup))
-                )
+                ir_lowered_expr_insts(lowered),
+                ir_inst_list_append(retain_insts, ir_lowered_expr_insts(cleanup))
               )
               let never_result = pipeline_type_result_never(body_ty)
               let term = if never_result == 1 { ir_term_unreachable() } else {
                 ir_term_jump_args(target_block, args)
               }
-              let block = ir_block_new_term(start_block, insts, term)
-              pipeline_lowered_blocks_control(
+              let linear_start = pipeline_lower_internal_block_after_target(
                 start_block + 1,
+                target_block
+              )
+              let linear = pipeline_pattern_linear_cleanup(
+                ownership_entries,
+                ir_block_list_prepend(
+                  ir_block_new_term(start_block, insts, term),
+                  ir_block_list_empty()
+                ),
+                PipelineLinearScopeExit(target_block, 0 - 1, 0 - 1),
+                fns,
+                tt,
                 ir_lowered_expr_next_value(cleanup),
-                ir_block_list_prepend(block, ir_block_list_empty()),
+                linear_start
+              )
+              let blocks = pipeline_ir_block_list_prepend_entry_insts(
+                linear.blocks,
+                start_block,
+                ir_inst_list_append(ownership_entry_insts, linear.init)
+              )
+              pipeline_lowered_blocks_control(
+                if linear.next_block == linear_start { start_block + 1 } else {
+                  linear.next_block
+                },
+                linear.next_value,
+                blocks,
                 1,
                 1 - never_result
               )
@@ -131866,6 +131903,8 @@ pub(package) fn pipeline_pattern_ownership_commit(
   }
 }
 
+-- Managed stakes retained for pattern bindings. Owned bindings are cleaned
+-- from checked-IR transfers by `pipeline_pattern_linear_cleanup` instead.
 pub(package) fn pipeline_pattern_ownership_cleanup(
   entries: i64,
   body: Expr,
@@ -131878,35 +131917,73 @@ pub(package) fn pipeline_pattern_ownership_cleanup(
   let count = if entries == 0 { 0 } else { nlist_len(entries) }
   for reverse_index in 0..count {
     let entry = nlist_get(entries, count - reverse_index - 1)
-    let kind = node_tag(entry)
     let value = node_f1(entry)
     let ty = node_f2(entry)
     let ns = node_f3(entry)
     let nl = node_f4(entry)
-    let cleanup = if kind == 1 {
-      let plan = pipeline_linear_cleanup_plan(tt, ty)
-      if plan != 0 and pipeline_expr_refs_name_typed(body, src, ns, nl) == 0 {
-        pipeline_linear_cleanup_inst_list(value, plan)
-      } else { ir_inst_list_empty() }
-    } else {
-      if kind == 2 {
-        if pipeline_expr_final_returns_binding_typed(body, src, ns, nl) == 1 {
-          ir_inst_list_empty()
-        }
-        else {
-          pipeline_managed_release_inst_list_with_origin(
-            value,
-            ty,
-            next,
-            ir_managed_stake_origin_binding()
-          )
-        }
-      } else { ir_inst_list_empty() }
-    }
+    let cleanup = if node_tag(entry) == 2 and pipeline_expr_final_returns_binding_typed(
+      body,
+      src,
+      ns,
+      nl
+    ) == 0 {
+      pipeline_managed_release_inst_list_with_origin(
+        value,
+        ty,
+        next,
+        ir_managed_stake_origin_binding()
+      )
+    } else { ir_inst_list_empty() }
     insts = ir_inst_list_append(insts, cleanup)
     next = next + ir_inst_list_len(cleanup)
   }
   ir_lowered_expr(0, next, insts)
+}
+
+-- Owned pattern bindings use the same checked-IR transfer facts as local
+-- resources. A binding moved on some paths is dropped behind a drop flag on
+-- every exit that still owns it; a copied field or a borrow observes it
+-- without moving it. Later bindings are dropped first. `blocks` are the arm
+-- body's own blocks: the entry split that ends the scrutinee's obligation is
+-- not a move of the bindings it produces.
+pub(package) fn pipeline_pattern_linear_cleanup(
+  entries: i64,
+  blocks: IrBlockList,
+  exits: PipelineLinearCleanupExit,
+  fns: i64,
+  tt: i64,
+  next_value: i64,
+  next_block: i64
+) -> PipelineLinearLoopCleanup {
+  let mut cleaned = PipelineLinearLoopCleanup {
+    blocks: blocks,
+    init: ir_inst_list_empty(),
+    next_value: next_value,
+    next_block: next_block
+  }
+  let count = if entries == 0 { 0 } else { nlist_len(entries) }
+  for reverse_index in 0..count {
+    let entry = nlist_get(entries, count - reverse_index - 1)
+    if node_tag(entry) == 1 {
+      let step = pipeline_ir_linear_cleanup(
+        cleaned.blocks,
+        node_f1(entry),
+        pipeline_linear_cleanup_plan(tt, node_f2(entry)),
+        exits,
+        fns,
+        tt,
+        cleaned.next_value,
+        cleaned.next_block
+      )
+      cleaned = PipelineLinearLoopCleanup {
+        blocks: step.blocks,
+        init: ir_inst_list_append(cleaned.init, step.init),
+        next_value: step.next_value,
+        next_block: step.next_block
+      }
+    }
+  }
+  cleaned
 }
 
 pub(package) fn pipeline_pattern_ownership_cleanup_needed(
